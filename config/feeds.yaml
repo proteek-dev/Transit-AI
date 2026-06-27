@@ -1,0 +1,20 @@
+# All TransLink SEQ feed URLs — no authentication required
+
+gtfs_static:
+  seq: "https://gtfsrt.api.translink.com.au/GTFS/SEQ_GTFS.zip"
+
+gtfs_realtime:
+  trip_updates: "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates"
+  vehicle_positions: "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/VehiclePositions"
+  service_alerts: "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/alerts"
+
+# By mode (optional — use when you need mode-specific granularity)
+gtfs_realtime_by_mode:
+  trip_updates_bus:   "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Bus"
+  trip_updates_rail:  "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Rail"
+  trip_updates_tram:  "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Tram"
+  trip_updates_ferry: "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Ferry"
+
+performance_data_portal: "https://www.data.qld.gov.au/dataset/translink-monthly-performance-data"
+
+fetch_interval_seconds: 300  # every 5 minutes — balances freshness vs GitHub repo size
