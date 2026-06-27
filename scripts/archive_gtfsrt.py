@@ -188,6 +188,43 @@ def git_commit() -> None:
         print(f"[git] Commit/push failed (exit {ret}) — will retry next cycle")
 
 
+# ── Performance CSV downloader ────────────────────────────────────────────────
+
+def download_performance_data(config, output_dir="source_files/performance") -> None:
+    """
+    Downloads all performance CSVs defined in config/feeds.yaml.
+    Only re-downloads if file is older than 24 hours.
+    Called once at startup, then every 24 hours in the main loop.
+    """
+    out_path = REPO_ROOT / output_dir
+    out_path.mkdir(parents=True, exist_ok=True)
+    csvs = config.get("performance_csvs", {})
+
+    if not csvs:
+        print("[performance] No performance_csvs found in config. Skipping.")
+        return
+
+    for key, meta in csvs.items():
+        url = meta.get("url", "")
+        filename = meta.get("filename", f"{key}.csv")
+        filepath = out_path / filename
+
+        if filepath.exists():
+            age_hours = (time.time() - filepath.stat().st_mtime) / 3600
+            if age_hours < 24:
+                print(f"[performance] SKIP {filename} — downloaded {age_hours:.1f}h ago")
+                continue
+
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            filepath.write_bytes(resp.content)
+            row_count = len(resp.text.strip().splitlines()) - 1
+            print(f"[performance] OK   {filename} — {row_count} rows — saved to {filepath.relative_to(REPO_ROOT)}")
+        except Exception as e:
+            print(f"[performance] FAIL {filename} — {url} — {e}")
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -207,6 +244,10 @@ def main() -> None:
 
     maybe_download_static_gtfs()
 
+    print("\n=== Downloading performance CSVs at startup ===")
+    download_performance_data(CONFIG)
+    print("=== Performance download complete ===\n")
+
     while True:
         for feed_name, url in FEEDS.items():
             fetch_and_save(feed_name, url)
@@ -216,10 +257,29 @@ def main() -> None:
             git_commit()
             last_commit_time = now
 
+        # Re-check performance CSVs every 24 hours (skips if fresh)
+        download_performance_data(CONFIG)
+
         time.sleep(FETCH_INTERVAL)
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="SEQ TransLink GTFS-Realtime Archiver")
+    parser.add_argument(
+        "--download-performance-only",
+        action="store_true",
+        help="Download performance CSVs once and exit (no GTFS-RT loop)",
+    )
+    args = parser.parse_args()
+
+    if args.download_performance_only:
+        print("=== Downloading performance CSVs (one-off mode) ===")
+        download_performance_data(CONFIG)
+        print("=== Done ===")
+        sys.exit(0)
+
     try:
         main()
     except KeyboardInterrupt:

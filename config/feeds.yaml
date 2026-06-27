@@ -18,3 +18,42 @@ gtfs_realtime_by_mode:
 performance_data_portal: "https://www.data.qld.gov.au/dataset/translink-monthly-performance-data"
 
 fetch_interval_seconds: 300  # every 5 minutes — balances freshness vs GitHub repo size
+
+performance_csvs:
+  # High priority — on-time running, direct ML training signal
+  citytrain_punctuality:
+    url: "https://www.data.qld.gov.au/dataset/b33b4ed9-0db4-4c1b-8f85-664ca0d42a54/resource/d6b9ce31-dd07-4ea2-ac1a-848fa638cd90/download/city-train-punctuality-and-reliability.csv"
+    filename: "citytrain-punctuality.csv"
+    priority: high
+
+  complaints:
+    url: "https://www.data.qld.gov.au/dataset/b33b4ed9-0db4-4c1b-8f85-664ca0d42a54/resource/c4a1cf64-aca9-4447-96eb-55baf5bee31e/download/complaints.csv"
+    filename: "complaints.csv"
+    priority: medium
+
+  customer_experience_overall:
+    url: "https://www.data.qld.gov.au/dataset/b33b4ed9-0db4-4c1b-8f85-664ca0d42a54/resource/c1984b8b-3822-41b0-bf90-b18b4a930072/download/customer-experience-overall.csv"
+    filename: "customer-experience-overall.csv"
+    priority: medium
+
+  customer_experience_train:
+    url: "https://translink.com.au/sites/default/files/assets/resources/about-translink/reporting-and-publications/open-data/customer-experience-train.csv"
+    filename: "customer-experience-train.csv"
+    priority: medium
+
+  customer_experience_tram:
+    url: "https://www.data.qld.gov.au/dataset/b33b4ed9-0db4-4c1b-8f85-664ca0d42a54/resource/d85034af-eea9-47f6-8ab3-5dc297094ba7/download/customer-experience-tram.csv"
+    filename: "customer-experience-tram.csv"
+    priority: medium
+
+  customer_experience_ferry:
+    url: "https://www.data.qld.gov.au/dataset/b33b4ed9-0db4-4c1b-8f85-664ca0d42a54/resource/011c2079-c451-4276-85c9-e89b61a1d120/download/customer-experience-ferry.csv"
+    filename: "customer-experience-ferry.csv"
+    priority: low
+
+  # NOTE: Bus and tram punctuality resource UUIDs were not publicly listed.
+  # Add them here once confirmed from the portal.
+  # seq_bus_punctuality:
+  #   url: "https://www.data.qld.gov.au/dataset/b33b4ed9-0db4-4c1b-8f85-664ca0d42a54/resource/<FIND-UUID>/download/seq-bus-punctuality.csv"
+  #   filename: "seq-bus-punctuality.csv"
+  #   priority: high
