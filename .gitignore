@@ -4,3 +4,8 @@ __pycache__/
 venv/
 .DS_Store
 *.zip
+
+# Local data storage — stored outside repo on Mac
+source_files/gtfs_realtime/
+source_files/gtfs_static/
+source_files/performance/

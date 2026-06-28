@@ -18,9 +18,10 @@ from google.transit import gtfs_realtime_pb2
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 REPO_ROOT = Path(__file__).parent.parent
+BASE_DIR = Path.home() / "transit-ai-data"
 CONFIG_PATH = REPO_ROOT / "config" / "feeds.yaml"
-GTFSRT_DIR = REPO_ROOT / "source_files" / "gtfs_realtime"
-STATIC_DIR = REPO_ROOT / "source_files" / "gtfs_static"
+GTFSRT_DIR = BASE_DIR / "gtfs_realtime"
+STATIC_DIR = BASE_DIR / "gtfs_static"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 with open(CONFIG_PATH) as f:
@@ -134,11 +135,11 @@ def fetch_and_save(feed_name: str, url: str) -> int:
         with open(out_path, "w") as f:
             json.dump(records, f, separators=(",", ":"))
 
-        log(feed_name, len(records), str(out_path.relative_to(REPO_ROOT)), "OK")
+        log(feed_name, len(records), str(out_path.relative_to(BASE_DIR)), "OK")
         return len(records)
 
     except Exception as e:
-        log(feed_name, 0, str(out_path.relative_to(REPO_ROOT)), f"ERROR: {e}")
+        log(feed_name, 0, str(out_path.relative_to(BASE_DIR)), f"ERROR: {e}")
         return 0
 
 
@@ -163,7 +164,7 @@ def maybe_download_static_gtfs() -> None:
         with zipfile.ZipFile(zip_path) as z:
             z.extractall(today_dir)
         zip_path.unlink()
-        print(f"[static] Extracted to {today_dir.relative_to(REPO_ROOT)} OK")
+        print(f"[static] Extracted to {today_dir.relative_to(BASE_DIR)} OK")
     except Exception as e:
         print(f"[static] ERROR downloading static GTFS: {e}")
 
@@ -196,7 +197,7 @@ def download_performance_data(config, output_dir="source_files/performance") -> 
     Only re-downloads if file is older than 24 hours.
     Called once at startup, then every 24 hours in the main loop.
     """
-    out_path = REPO_ROOT / output_dir
+    out_path = BASE_DIR / "performance"
     out_path.mkdir(parents=True, exist_ok=True)
     csvs = config.get("performance_csvs", {})
 
@@ -220,7 +221,7 @@ def download_performance_data(config, output_dir="source_files/performance") -> 
             resp.raise_for_status()
             filepath.write_bytes(resp.content)
             row_count = len(resp.text.strip().splitlines()) - 1
-            print(f"[performance] OK   {filename} — {row_count} rows — saved to {filepath.relative_to(REPO_ROOT)}")
+            print(f"[performance] OK   {filename} — {row_count} rows — saved to {filepath.relative_to(BASE_DIR)}")
         except Exception as e:
             print(f"[performance] FAIL {filename} — {url} — {e}")
 
@@ -235,8 +236,8 @@ def main() -> None:
     print(f"  Source : {', '.join(FEEDS.values())}")
     print(f"  Fetch  : every {FETCH_INTERVAL}s ({FETCH_INTERVAL // 60} min)")
     print(f"  Commit : every {COMMIT_INTERVAL}s ({COMMIT_INTERVAL // 60} min)")
-    print(f"  Output : {GTFSRT_DIR.relative_to(REPO_ROOT)}")
-    print(f"  Static : {STATIC_DIR.relative_to(REPO_ROOT)} (once per day)")
+    print(f"  Output : {GTFSRT_DIR.relative_to(BASE_DIR)}")
+    print(f"  Static : {STATIC_DIR.relative_to(BASE_DIR)} (once per day)")
     print("=" * 70)
     print()
 
