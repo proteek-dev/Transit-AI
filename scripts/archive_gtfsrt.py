@@ -1,9 +1,10 @@
 """
 SEQ TransLink GTFS-Realtime Archiver
-Fetches trip_updates, vehicle_positions, service_alerts every 5 minutes and archives to JSON.
-Commits to git every 30 minutes. Downloads static GTFS once per day.
+Fetches trip_updates, vehicle_positions, service_alerts every 5 minutes and uploads to S3.
+Downloads static GTFS once per day. All data written directly to Amazon S3.
 """
 
+import io
 import json
 import os
 import sys
@@ -12,16 +13,31 @@ import zipfile
 from datetime import datetime, date
 from pathlib import Path
 
+import boto3
 import requests
 import yaml
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
 from google.transit import gtfs_realtime_pb2
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 REPO_ROOT = Path(__file__).parent.parent
-BASE_DIR = Path.home() / "transit-ai-data"
 CONFIG_PATH = REPO_ROOT / "config" / "feeds.yaml"
-GTFSRT_DIR = BASE_DIR / "gtfs_realtime"
-STATIC_DIR = BASE_DIR / "gtfs_static"
+
+# ── AWS ───────────────────────────────────────────────────────────────────────
+AWS_ACCESS_KEY_ID = os.environ["AWS_ACCESS_KEY_ID"]
+AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
+AWS_S3_BUCKET = os.environ["AWS_S3_BUCKET"]
+AWS_REGION = os.environ["AWS_REGION"]
+
+s3 = boto3.client(
+    "s3",
+    region_name=AWS_REGION,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 with open(CONFIG_PATH) as f:
@@ -30,12 +46,11 @@ with open(CONFIG_PATH) as f:
 FEEDS = CONFIG["gtfs_realtime"]
 STATIC_URL = CONFIG["gtfs_static"]["seq"]
 FETCH_INTERVAL = CONFIG["fetch_interval_seconds"]
-COMMIT_INTERVAL = 1800  # 30 minutes
 
 
-def log(feed: str, record_count: int, file_path: str, status: str) -> None:
+def log(feed: str, record_count: int, s3_key: str, status: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} | {feed:<20} | records={record_count:<6} | {file_path} | {status}")
+    print(f"{ts} | {feed:<20} | records={record_count:<6} | {s3_key} | {status}")
 
 
 # ── Protobuf parsers ──────────────────────────────────────────────────────────
@@ -118,10 +133,7 @@ def fetch_and_save(feed_name: str, url: str) -> int:
     now = datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H-%M-%S")
-
-    out_dir = GTFSRT_DIR / feed_name / date_str
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{time_str}.json"
+    s3_key = f"gtfs_realtime/{feed_name}/{date_str}/{time_str}.json"
 
     try:
         resp = requests.get(url, timeout=30)
@@ -131,15 +143,14 @@ def fetch_and_save(feed_name: str, url: str) -> int:
         feed_message.ParseFromString(resp.content)
 
         records = PARSERS[feed_name](feed_message)
+        body = json.dumps(records, separators=(",", ":")).encode()
 
-        with open(out_path, "w") as f:
-            json.dump(records, f, separators=(",", ":"))
-
-        log(feed_name, len(records), str(out_path.relative_to(BASE_DIR)), "OK")
+        s3.put_object(Bucket=AWS_S3_BUCKET, Key=s3_key, Body=body)
+        log(feed_name, len(records), s3_key, "OK")
         return len(records)
 
     except Exception as e:
-        log(feed_name, 0, str(out_path.relative_to(BASE_DIR)), f"ERROR: {e}")
+        log(feed_name, 0, s3_key, f"ERROR: {e}")
         return 0
 
 
@@ -147,58 +158,37 @@ def fetch_and_save(feed_name: str, url: str) -> int:
 
 def maybe_download_static_gtfs() -> None:
     today = date.today().strftime("%Y-%m-%d")
-    today_dir = STATIC_DIR / today
-    if today_dir.exists():
+    prefix = f"gtfs_static/{today}/"
+
+    existing = s3.list_objects_v2(Bucket=AWS_S3_BUCKET, Prefix=prefix, MaxKeys=1)
+    if existing.get("KeyCount", 0) > 0:
         return
 
     print(f"\n[static] Downloading SEQ_GTFS.zip for {today} ...")
-    zip_path = STATIC_DIR / "SEQ_GTFS.zip"
     try:
         resp = requests.get(STATIC_URL, timeout=120, stream=True)
         resp.raise_for_status()
-        with open(zip_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                f.write(chunk)
 
-        today_dir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path) as z:
-            z.extractall(today_dir)
-        zip_path.unlink()
-        print(f"[static] Extracted to {today_dir.relative_to(BASE_DIR)} OK")
+        zip_bytes = io.BytesIO(resp.content)
+        with zipfile.ZipFile(zip_bytes) as z:
+            for name in z.namelist():
+                s3_key = f"gtfs_static/{today}/{name}"
+                s3.put_object(Bucket=AWS_S3_BUCKET, Key=s3_key, Body=z.read(name))
+                print(f"[static] Uploaded {s3_key}")
+
+        print(f"[static] Extracted to s3://{AWS_S3_BUCKET}/{prefix} OK")
     except Exception as e:
         print(f"[static] ERROR downloading static GTFS: {e}")
 
 
-# ── Git commit ────────────────────────────────────────────────────────────────
-
-def git_commit() -> None:
-    now = datetime.now()
-    label = now.strftime("%Y-%m-%d %H:%M")
-    cmd = (
-        f'cd "{REPO_ROOT}" && '
-        f'git add source_files/ && '
-        f'git diff --cached --quiet || ('
-        f'git commit -m "archive: {label} | trip_updates + vehicle_positions + alerts" && '
-        f'git push origin work_ai'
-        f')'
-    )
-    ret = os.system(cmd)
-    if ret == 0:
-        print(f"[git] Committed and pushed at {label}")
-    else:
-        print(f"[git] Commit/push failed (exit {ret}) — will retry next cycle")
-
-
 # ── Performance CSV downloader ────────────────────────────────────────────────
 
-def download_performance_data(config, output_dir="source_files/performance") -> None:
+def download_performance_data(config) -> None:
     """
     Downloads all performance CSVs defined in config/feeds.yaml.
-    Only re-downloads if file is older than 24 hours.
+    Only re-downloads if object is older than 24 hours.
     Called once at startup, then every 24 hours in the main loop.
     """
-    out_path = BASE_DIR / "performance"
-    out_path.mkdir(parents=True, exist_ok=True)
     csvs = config.get("performance_csvs", {})
 
     if not csvs:
@@ -208,20 +198,25 @@ def download_performance_data(config, output_dir="source_files/performance") -> 
     for key, meta in csvs.items():
         url = meta.get("url", "")
         filename = meta.get("filename", f"{key}.csv")
-        filepath = out_path / filename
+        s3_key = f"performance/{filename}"
 
-        if filepath.exists():
-            age_hours = (time.time() - filepath.stat().st_mtime) / 3600
+        try:
+            head = s3.head_object(Bucket=AWS_S3_BUCKET, Key=s3_key)
+            age_hours = (time.time() - head["LastModified"].timestamp()) / 3600
             if age_hours < 24:
-                print(f"[performance] SKIP {filename} — downloaded {age_hours:.1f}h ago")
+                print(f"[performance] SKIP {filename} — uploaded {age_hours:.1f}h ago")
+                continue
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+                print(f"[performance] FAIL {filename} — head_object error: {e}")
                 continue
 
         try:
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
-            filepath.write_bytes(resp.content)
+            s3.put_object(Bucket=AWS_S3_BUCKET, Key=s3_key, Body=resp.content)
             row_count = len(resp.text.strip().splitlines()) - 1
-            print(f"[performance] OK   {filename} — {row_count} rows — saved to {filepath.relative_to(BASE_DIR)}")
+            print(f"[performance] OK   {filename} — {row_count} rows — s3://{AWS_S3_BUCKET}/{s3_key}")
         except Exception as e:
             print(f"[performance] FAIL {filename} — {url} — {e}")
 
@@ -235,13 +230,10 @@ def main() -> None:
     print(f"  Feeds  : {', '.join(FEEDS.keys())}")
     print(f"  Source : {', '.join(FEEDS.values())}")
     print(f"  Fetch  : every {FETCH_INTERVAL}s ({FETCH_INTERVAL // 60} min)")
-    print(f"  Commit : every {COMMIT_INTERVAL}s ({COMMIT_INTERVAL // 60} min)")
-    print(f"  Output : {GTFSRT_DIR.relative_to(BASE_DIR)}")
-    print(f"  Static : {STATIC_DIR.relative_to(BASE_DIR)} (once per day)")
+    print(f"  Output : s3://{AWS_S3_BUCKET}/gtfs_realtime/")
+    print(f"  Static : s3://{AWS_S3_BUCKET}/gtfs_static/ (once per day)")
     print("=" * 70)
     print()
-
-    last_commit_time = 0.0
 
     maybe_download_static_gtfs()
 
@@ -253,12 +245,6 @@ def main() -> None:
         for feed_name, url in FEEDS.items():
             fetch_and_save(feed_name, url)
 
-        now = time.time()
-        if now - last_commit_time >= COMMIT_INTERVAL:
-            git_commit()
-            last_commit_time = now
-
-        # Re-check performance CSVs every 24 hours (skips if fresh)
         download_performance_data(CONFIG)
 
         time.sleep(FETCH_INTERVAL)
