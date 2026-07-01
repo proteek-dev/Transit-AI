@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .DS_Store
 *.zip
+.env
 
 # Local data storage — stored outside repo on Mac
 source_files/gtfs_realtime/
