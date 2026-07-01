@@ -1,76 +1,76 @@
 # SEQ Transit AI — Phase 1: Data Collection & EDA
 
-**Archiving TransLink SEQ GTFS-Realtime feeds to build the historical delay dataset that doesn't exist anywhere else.**
+Archiving TransLink SEQ GTFS-Realtime feeds and performance data to S3
+to build the historical delay dataset that does not exist anywhere else.
 
-## Why This Matters
+## Why This Exists
 
-TransLink has no public stop-level historical delay data. The GTFS-Realtime API gives you a snapshot of live delays right now — but the moment you close the connection, that data is gone forever. This archiver captures every snapshot every 5 minutes and commits it to this repo, creating the first public stop-level delay history for South East Queensland.
+TransLink has no public stop-level historical delay data. The GTFS-Realtime
+API gives a live snapshot of delays — but the moment you close the connection,
+that data is gone forever. This archiver captures every snapshot every 5
+minutes and uploads it to Amazon S3, building the first stop-level delay
+history for South East Queensland.
+
+## Architecture
+
+All data is stored in Amazon S3 (ap-southeast-2). Nothing is written locally
+except logs. Notebooks read and write directly from S3 using s3fs.
+
+S3 bucket structure:
+  gtfs_realtime/
+    trip_updates/        ← JSON per fetch, YYYY-MM-DD/HH-MM-SS.json
+    vehicle_positions/   ← JSON per fetch, YYYY-MM-DD/HH-MM-SS.json
+    service_alerts/      ← JSON per fetch, YYYY-MM-DD/HH-MM-SS.json
+  gtfs_static/
+    YYYY-MM-DD/          ← Extracted CSVs from SEQ_GTFS.zip (daily)
+    parquet/             ← Parquet files from notebook 02
+  performance/           ← TransLink monthly on-time CSVs
+  eda_charts/            ← Chart outputs from notebook 04
 
 ## Data Sources
 
-| Source | What | Auth | URL |
-|---|---|---|---|
-| GTFS-Realtime (SEQ) | Live delays, positions, alerts | None (public) | gtfsrt.api.translink.com.au |
-| GTFS Static (SEQ) | Routes, stops, timetables | None (public) | gtfsrt.api.translink.com.au/GTFS/SEQ_GTFS.zip |
-| Monthly Performance | Historical on-time rates by route | None (public portal) | data.qld.gov.au |
-
-All data is CC-BY licensed. No API key required.
+| Source | What | Auth |
+|---|---|---|
+| GTFS-Realtime (SEQ) | Live delays, positions, alerts | None — fully public |
+| GTFS Static (SEQ) | Routes, stops, timetables | None — fully public |
+| Monthly Performance CSVs | Historical on-time rates | None — fully public |
 
 ## Setup
 
-```bash
 pip install -r requirements.txt
-```
 
-**Start archiving immediately:**
-```bash
-python scripts/archive_gtfsrt.py
-```
+Copy .env.example to .env and fill in your values:
+  AWS_ACCESS_KEY_ID=
+  AWS_SECRET_ACCESS_KEY=
+  AWS_REGION=ap-southeast-2
+  AWS_S3_BUCKET=
 
-**Monthly performance data** — download CSVs manually from the portal and drop them into `source_files/performance/`:
-```
-https://www.data.qld.gov.au/dataset/translink-monthly-performance-data
-```
+## Archiver Daemon (macOS launchd)
 
-## Folder Structure
+Runs every 5 minutes, survives reboots, auto-restarts on crash.
 
-```
-Transit-AI/
-├── source_files/
-│   ├── gtfs_realtime/
-│   │   ├── trip_updates/        ← GTFS-RT protobuf → JSON, every 5 min
-│   │   ├── vehicle_positions/   ← GTFS-RT protobuf → JSON, every 5 min
-│   │   └── service_alerts/      ← GTFS-RT protobuf → JSON, every 5 min
-│   ├── gtfs_static/             ← SEQ_GTFS.zip extracted CSVs + Parquet, refreshed daily
-│   └── performance/             ← TransLink monthly on-time running CSVs (manual download)
-├── notebooks/
-│   ├── 01_archive_gtfsrt.ipynb        ← fetch + archive GTFS-RT feeds (one-off/test)
-│   ├── 02_load_static_gtfs.ipynb      ← parse static GTFS into DataFrames → Parquet
-│   ├── 03_load_performance_data.ipynb ← load + clean monthly on-time running data
-│   └── 04_eda.ipynb                   ← EDA: delay patterns by route, time, mode
-├── scripts/
-│   └── archive_gtfsrt.py              ← continuous archiver (runs indefinitely)
-├── config/
-│   └── feeds.yaml                     ← all feed URLs in one place
-├── requirements.txt
-└── README.md
-```
+  launchctl list | grep transitai          # check status
+  launchctl unload ~/Library/LaunchAgents/com.proteek.transitai.plist
+  launchctl load ~/Library/LaunchAgents/com.proteek.transitai.plist
+  tail -f ~/transit-ai-data/logs/archiver.log
 
 ## Notebook Sequence
 
-Run in order:
+All notebooks read from and write to S3 directly.
 
-1. **`01_archive_gtfsrt.ipynb`** — test fetch and one-off archive (or just run the script)
-2. **`02_load_static_gtfs.ipynb`** — download static GTFS, save as Parquet
-3. **`03_load_performance_data.ipynb`** — load monthly CSVs, standardise, save as Parquet
-4. **`04_eda.ipynb`** — full EDA: worst routes, mode comparison, trends, GTFS-RT delay distribution
+  02_load_static_gtfs.ipynb      — parse static GTFS, save Parquet to S3
+  03_load_performance_data.ipynb — load and validate performance CSVs from S3
+  04_eda.ipynb                   — EDA and charts, saved to S3
 
-## Auto-Commit
+Note: notebook 01 is a legacy test file. Do not run it.
 
-`scripts/archive_gtfsrt.py` runs a `git commit + push` every 30 minutes, keeping this repo as the live archive. Each commit message follows the format:
+## One-Time Backfill
 
-```
-archive: 2024-01-15 14:30 | trip_updates + vehicle_positions + alerts
-```
+To migrate existing local data to S3:
+  python scripts/backfill_s3.py
 
-This means the repo accumulates ~48 commits per day of archiving — one for each 30-minute window.
+## Phase Roadmap
+
+Phase 1 — Data collection and EDA (current)
+Phase 2 — ML delay prediction model + live GTFS-RT integration
+Phase 3 — React/Vite/Tailwind app with Python confidence API
