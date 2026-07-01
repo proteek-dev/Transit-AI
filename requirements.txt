@@ -11,3 +11,5 @@ jupyterlab
 gitpython
 schedule
 pyarrow
+python-dotenv
+boto3
