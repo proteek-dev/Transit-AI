@@ -51,9 +51,12 @@ performance_csvs:
     filename: "customer-experience-ferry.csv"
     priority: low
 
-  # NOTE: Bus and tram punctuality resource UUIDs were not publicly listed.
-  # Add them here once confirmed from the portal.
-  # seq_bus_punctuality:
-  #   url: "https://www.data.qld.gov.au/dataset/b33b4ed9-0db4-4c1b-8f85-664ca0d42a54/resource/<FIND-UUID>/download/seq-bus-punctuality.csv"
-  #   filename: "seq-bus-punctuality.csv"
-  #   priority: high
+  seq_bus_punctuality:
+    url: "https://www.data.qld.gov.au/dataset/b33b4ed9-0db4-4c1b-8f85-664ca0d42a54/resource/e12aa967-e3ca-491f-9b70-60bbea3f296e/download/seq-bus-punctuality.csv"
+    filename: "seq-bus-punctuality.csv"
+    priority: high
+
+  seq_tram_punctuality:
+    url: "https://www.data.qld.gov.au/dataset/b33b4ed9-0db4-4c1b-8f85-664ca0d42a54/resource/549c7dde-ab85-45ba-8b56-ead8f2f31129/download/seq-tram-punctuality-and-reli.csv"
+    filename: "seq-tram-punctuality-and-reli.csv"
+    priority: high
