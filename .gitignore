@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .DS_Store
 *.zip
+*.log
 .env
 
 # Local data storage — stored outside repo on Mac
