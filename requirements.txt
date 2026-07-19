@@ -18,3 +18,4 @@ xgboost
 scikit-learn
 rapidfuzz
 joblib
+streamlit
