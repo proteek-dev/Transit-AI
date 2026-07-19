@@ -8,16 +8,14 @@ into a rider-facing summary.
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import joblib
 import pandas as pd
-import s3fs
 import xgboost as xgb
-from dotenv import find_dotenv, load_dotenv
 
+import config
 import gtfs_data
 import live_gtfs
 
@@ -44,16 +42,50 @@ WELL_REPRESENTED_MIN_ROWS = 1000
 _cache: dict = {}
 
 
+def format_time_ampm(dt: datetime) -> str:
+    """Format a datetime as rider-facing 'HH:MM AM/PM', e.g. '09:20 PM'."""
+    return dt.strftime('%I:%M %p')
+
+
 def _get_env():
-    dotenv_path = find_dotenv(usecwd=True)
-    if dotenv_path:
-        load_dotenv(dotenv_path, override=False)
+    return config.get_s3_bucket(), config.get_s3_filesystem()
 
-    bucket = os.environ.get('AWS_S3_BUCKET', '')
-    if not bucket:
-        raise EnvironmentError('AWS_S3_BUCKET is not set. Check your .env file.')
 
-    return bucket, s3fs.S3FileSystem()
+def _s3_model_paths() -> dict:
+    prefix = f'{config.get_s3_bucket()}/phase3/model'
+    return {
+        'model': f's3://{prefix}/xgb_v0.json',
+        'categories': f's3://{prefix}/categories.joblib',
+        'metadata': f's3://{prefix}/training_metadata.json',
+    }
+
+
+def _download_model_from_s3() -> bool:
+    """Download the saved model files from S3 into MODEL_DIR. Returns True on success."""
+    try:
+        fs = config.get_s3_filesystem()
+        s3_paths = _s3_model_paths()
+        if not all(fs.exists(p) for p in s3_paths.values()):
+            return False
+
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        fs.get(s3_paths['model'], str(MODEL_PATH))
+        fs.get(s3_paths['categories'], str(CATEGORIES_PATH))
+        fs.get(s3_paths['metadata'], str(TRAINING_METADATA_PATH))
+        print(f"Downloaded model files from s3://{config.get_s3_bucket()}/phase3/model/")
+        return True
+    except Exception as e:
+        print(f'Could not load model from S3 ({e}) — will try local files instead.')
+        return False
+
+
+def _upload_model_to_s3() -> None:
+    fs = config.get_s3_filesystem()
+    s3_paths = _s3_model_paths()
+    fs.put(str(MODEL_PATH), s3_paths['model'])
+    fs.put(str(CATEGORIES_PATH), s3_paths['categories'])
+    fs.put(str(TRAINING_METADATA_PATH), s3_paths['metadata'])
+    print(f"Uploaded model files to s3://{config.get_s3_bucket()}/phase3/model/")
 
 
 def _load_training_frames():
@@ -202,13 +234,21 @@ def _train_and_save_model() -> None:
     print(f'Saved categorical mappings to {CATEGORIES_PATH}')
     print(f'Saved training coverage metadata to {TRAINING_METADATA_PATH}')
 
+    _upload_model_to_s3()
 
-def load_model() -> xgb.XGBRegressor:
-    """Load the trained v0 model (training + saving first if needed). Cached in memory."""
-    if 'model' in _cache:
-        return _cache['model']
 
-    if not MODEL_PATH.exists() or not CATEGORIES_PATH.exists() or not TRAINING_METADATA_PATH.exists():
+def _load_model_impl() -> xgb.XGBRegressor:
+    """S3 first (source of truth for Streamlit Cloud, which has no local model
+    files), then local files (local dev fallback), training only if neither
+    is available.
+    """
+    have_model = _download_model_from_s3()
+    if not have_model:
+        have_model = MODEL_PATH.exists() and CATEGORIES_PATH.exists() and TRAINING_METADATA_PATH.exists()
+        if have_model:
+            # Locally trained but not yet mirrored to S3 (e.g. first Cloud deploy prep) — upload now.
+            _upload_model_to_s3()
+    if not have_model:
         _train_and_save_model()
 
     model = xgb.XGBRegressor(enable_categorical=True, tree_method='hist')
@@ -217,10 +257,22 @@ def load_model() -> xgb.XGBRegressor:
     with open(TRAINING_METADATA_PATH) as f:
         training_metadata = json.load(f)
 
-    _cache['model'] = model
     _cache['categories'] = categories
     _cache['training_metadata'] = training_metadata
     return model
+
+
+try:
+    import streamlit as st
+    load_model = st.cache_resource(
+        show_spinner='Loading prediction model (training on first run can take a few minutes)...'
+    )(_load_model_impl)
+except ImportError:
+    def load_model() -> xgb.XGBRegressor:
+        """Load the trained v0 model (training + saving first if needed). Cached in memory."""
+        if 'model' not in _cache:
+            _cache['model'] = _load_model_impl()
+        return _cache['model']
 
 
 def _get_training_metadata() -> dict:
@@ -340,10 +392,11 @@ def predict_delay(trip_info: dict, departure_time: datetime, live_delay: dict | 
 
     summary = (
         f"The {route_label} {mode_noun} is {delay_phrase}. "
-        f"Leave by {leave_by:%H:%M} to catch the {trip_info['origin_departure_time']:%H:%M} "
+        f"Leave by {format_time_ampm(leave_by)} to catch the "
+        f"{format_time_ampm(trip_info['origin_departure_time'])} "
         f"from {trip_info.get('origin_stop_name', 'origin')}. "
         f"Expected arrival at {trip_info.get('dest_stop_name', 'destination')}: "
-        f"{estimated_arrival:%H:%M}. Confidence: {confidence}."
+        f"{format_time_ampm(estimated_arrival)}. Confidence: {confidence}."
     )
 
     return {
@@ -351,9 +404,9 @@ def predict_delay(trip_info: dict, departure_time: datetime, live_delay: dict | 
         'live_delay_minutes': live_delay_minutes,
         'blended_delay_minutes': blended_delay_minutes,
         'confidence': confidence,
-        'scheduled_arrival': f'{scheduled_arrival:%H:%M}',
-        'estimated_arrival': f'{estimated_arrival:%H:%M}',
-        'leave_by': f'{leave_by:%H:%M}',
+        'scheduled_arrival': format_time_ampm(scheduled_arrival),
+        'estimated_arrival': format_time_ampm(estimated_arrival),
+        'leave_by': format_time_ampm(leave_by),
         'summary': summary,
     }
 

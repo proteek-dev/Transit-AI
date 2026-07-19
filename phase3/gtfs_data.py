@@ -6,14 +6,13 @@ on top of it. No Streamlit or model code here — data layer only.
 """
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime, timedelta
 
 import pandas as pd
-import s3fs
-from dotenv import find_dotenv, load_dotenv
 from rapidfuzz import fuzz, process
+
+import config
 
 DATE_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 DAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
@@ -21,17 +20,15 @@ DAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
 STATIC_FILES = ['stops.txt', 'stop_times.txt', 'trips.txt', 'routes.txt',
                 'calendar.txt', 'calendar_dates.txt']
 
+# Sunday/thin-calendar fallback: a query date within this many days of the
+# static snapshot's capture date is where TransLink's calendar_dates.txt
+# additions (e.g. special Sunday services) are least likely to be published
+# yet — see find_trips() fallback below.
+FALLBACK_THIN_COVERAGE_DAYS = 3
+
 
 def _get_env():
-    dotenv_path = find_dotenv(usecwd=True)
-    if dotenv_path:
-        load_dotenv(dotenv_path, override=False)
-
-    bucket = os.environ.get('AWS_S3_BUCKET', '')
-    if not bucket:
-        raise EnvironmentError('AWS_S3_BUCKET is not set. Check your .env file.')
-
-    return bucket, s3fs.S3FileSystem()
+    return config.get_s3_bucket(), config.get_s3_filesystem()
 
 
 def _parse_gtfs_time(series: pd.Series) -> pd.Series:
@@ -203,7 +200,45 @@ def find_trips(
     departure_after: datetime,
     window_minutes: int = 60,
 ) -> list[dict]:
-    """Find trips visiting origin then destination, departing origin within the time window."""
+    """Find trips visiting origin then destination, departing origin within the
+    time window. Each returned dict carries `fallback_schedule` (bool).
+
+    If the direct query comes back empty and the query date falls within
+    FALLBACK_THIN_COVERAGE_DAYS of the static snapshot's capture date — the
+    part of the calendar where day-specific exceptions are least likely to be
+    published yet — retry one week ahead (same day-of-week, same time), then
+    shift the results' times back onto the original date and flag them.
+    """
+    trips = _find_trips_core(origin_stop_ids, dest_stop_ids, departure_after, window_minutes)
+    for trip in trips:
+        trip['fallback_schedule'] = False
+    if trips:
+        return trips
+
+    data = load_gtfs_data()
+    snapshot_date = datetime.strptime(data.snapshot_date, '%Y-%m-%d').date()
+    query_date = departure_after.date()
+    if abs((query_date - snapshot_date).days) > FALLBACK_THIN_COVERAGE_DAYS:
+        return trips
+
+    fallback_departure_after = departure_after + timedelta(days=7)
+    fallback_trips = _find_trips_core(
+        origin_stop_ids, dest_stop_ids, fallback_departure_after, window_minutes
+    )
+    for trip in fallback_trips:
+        trip['origin_departure_time'] -= timedelta(days=7)
+        trip['dest_arrival_time'] -= timedelta(days=7)
+        trip['fallback_schedule'] = True
+    return fallback_trips
+
+
+def _find_trips_core(
+    origin_stop_ids: list[str],
+    dest_stop_ids: list[str],
+    departure_after: datetime,
+    window_minutes: int = 60,
+) -> list[dict]:
+    """Same-day trip search — no fallback. See find_trips() for the public entry point."""
     data = load_gtfs_data()
     query_date = departure_after.date()
     day_midnight = datetime(query_date.year, query_date.month, query_date.day)

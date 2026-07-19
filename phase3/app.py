@@ -147,25 +147,40 @@ if results:
         if live_error:
             st.warning('Live GTFS-RT feed is currently unavailable — showing model predictions only.')
 
+        if any(t.get('fallback_schedule') for t in trips):
+            st.info('Schedule based on projected timetable — times may vary')
+
         stop_names = data.stops.set_index('stop_id')['stop_name']
 
-        for trip in trips[:5]:
-            try:
-                enriched = prediction.enrich_trip_with_dest_stop(trip, results['dest_stop_ids'])
-                raw_update = updates.get(enriched['trip_id'])
-                live_delay = None
-                if raw_update is not None:
-                    live_delay = {
-                        'delay_minutes': raw_update['delay_seconds'] / 60.0,
-                        'timestamp': raw_update['timestamp'],
-                        'stop_id': raw_update['stop_id'],
-                    }
-                pred = prediction.predict_delay(enriched, results['departure_after'], live_delay=live_delay)
-            except Exception as e:
-                st.warning(f'Could not predict this trip ({trip.get("trip_id")}): {e}')
-                continue
+        with st.spinner('Generating predictions...'):
+            predicted_trips = []
+            for trip in trips[:5]:
+                try:
+                    enriched = prediction.enrich_trip_with_dest_stop(trip, results['dest_stop_ids'])
+                    raw_update = updates.get(enriched['trip_id'])
+                    live_delay = None
+                    if raw_update is not None:
+                        live_delay = {
+                            'delay_minutes': raw_update['delay_seconds'] / 60.0,
+                            'timestamp': raw_update['timestamp'],
+                            'stop_id': raw_update['stop_id'],
+                        }
+                    pred = prediction.predict_delay(enriched, results['departure_after'], live_delay=live_delay)
+                except Exception as e:
+                    st.warning(f'Could not predict this trip ({trip.get("trip_id")}): {e}')
+                    continue
+                predicted_trips.append((trip, pred, raw_update))
 
+        for trip, pred, raw_update in predicted_trips:
             with st.container(border=True):
+                st.markdown(
+                    f'<div style="background:#2563eb18;border-radius:10px;padding:10px 16px;'
+                    f'margin-bottom:10px;">'
+                    f'<span style="font-size:1.4em;font-weight:700;color:#2563eb;">'
+                    f'🕒 Leave by {pred["leave_by"]}</span></div>',
+                    unsafe_allow_html=True,
+                )
+
                 head_col, delay_col = st.columns([3, 2])
                 with head_col:
                     st.markdown(f'**{route_badge(trip)}**')
@@ -178,7 +193,11 @@ if results:
 
                 dep_col, arr_col = st.columns(2)
                 with dep_col:
-                    st.metric('Departure', f'{trip["origin_departure_time"]:%H:%M}', help=trip['origin_stop_name'])
+                    st.metric(
+                        'Departure',
+                        prediction.format_time_ampm(trip['origin_departure_time']),
+                        help=trip['origin_stop_name'],
+                    )
                 with arr_col:
                     st.metric('Est. arrival', pred['estimated_arrival'], help=trip['dest_stop_name'])
 
@@ -194,7 +213,9 @@ if results:
                     unsafe_allow_html=True,
                 )
 
-                st.markdown(f'### 🕒 Leave by {pred["leave_by"]}')
+                if trip.get('fallback_schedule'):
+                    st.caption('📅 Schedule based on projected timetable — times may vary')
+
                 st.write(pred['summary'])
 
 # ── Footer ──────────────────────────────────────────────────────────────
