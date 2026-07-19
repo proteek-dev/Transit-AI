@@ -6,7 +6,8 @@ trip search. No business logic lives here — presentation + wiring only.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -15,6 +16,8 @@ import live_gtfs
 import prediction
 
 st.set_page_config(page_title='SEQ Transit AI', page_icon='🚊', layout='centered')
+
+BRISBANE_TZ = ZoneInfo('Australia/Brisbane')
 
 MODE_ICON = {'tram': '🚊', 'rail': '🚆', 'bus': '🚌', 'ferry': '⛴️', 'unknown': '🚏'}
 CONFIDENCE_COLOR = {'High': '#3AA65B', 'Medium': '#E0A526', 'Low': '#8A8A8A'}
@@ -109,11 +112,13 @@ with col1:
 with col2:
     dest = stop_picker('To', 'dest')
 
+now_brisbane = datetime.now(BRISBANE_TZ)
+
 col3, col4 = st.columns(2)
 with col3:
-    travel_date = st.date_input('Date', value=date.today())
+    travel_date = st.date_input('Date', value=now_brisbane.date())
 with col4:
-    travel_time = st.time_input('Departure time', value=datetime.now().time())
+    travel_time = st.time_input('Departure time', value=now_brisbane.time())
 
 search_clicked = st.button('Search', type='primary', use_container_width=True)
 
