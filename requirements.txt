@@ -19,3 +19,4 @@ scikit-learn
 rapidfuzz
 joblib
 streamlit
+streamlit-searchbox

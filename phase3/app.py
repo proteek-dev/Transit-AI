@@ -10,6 +10,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+from streamlit_searchbox import st_searchbox
 
 import gtfs_data
 import live_gtfs
@@ -70,20 +71,21 @@ def badge_html(text: str, color: str) -> str:
     )
 
 
-def stop_picker(label: str, key_prefix: str) -> dict | None:
-    """Text input + selectbox typeahead. Returns the selected stop dict or None."""
-    query = st.text_input(label, key=f'{key_prefix}_query', placeholder='Type a stop name...')
+def _search_stops(query: str) -> list[tuple[str, dict]]:
+    """search_function for st_searchbox: (display_label, stop_data) tuples."""
     if len(query.strip()) < 2:
-        return None
+        return []
+    return [(m['stop_name'], m) for m in gtfs_data.search_stops(query, limit=10)]
 
-    matches = gtfs_data.search_stops(query, limit=10)
-    if not matches:
-        st.caption('No matching stops.')
-        return None
 
-    names = [m['stop_name'] for m in matches]
-    choice = st.selectbox(f'Matching stops', names, key=f'{key_prefix}_select', label_visibility='collapsed')
-    return next(m for m in matches if m['stop_name'] == choice)
+def stop_picker(label: str, key_prefix: str) -> dict | None:
+    """Live typeahead stop search. Returns the selected stop dict or None."""
+    return st_searchbox(
+        _search_stops,
+        label=label,
+        placeholder='Type a stop name...',
+        key=f'{key_prefix}_searchbox',
+    )
 
 
 # ── Header ────────────────────────────────────────────────────────────────
