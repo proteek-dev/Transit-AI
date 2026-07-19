@@ -24,6 +24,7 @@ import live_gtfs
 MODEL_DIR = Path(__file__).parent / 'model'
 MODEL_PATH = MODEL_DIR / 'xgb_v0.json'
 CATEGORIES_PATH = MODEL_DIR / 'categories.joblib'
+TRAINING_METADATA_PATH = MODEL_DIR / 'training_metadata.json'
 
 # Must match notebook 07 Cell 5 exactly (feature_cols after EXCLUDE_COLS).
 FEATURE_COLS = ['route_id', 'stop_id', 'mode', 'stop_sequence',
@@ -35,6 +36,10 @@ CATEGORICAL_COLS = ['route_id', 'stop_id', 'mode', 'day_of_week']
 # the same string the model was trained on.
 MODE_BY_ROUTE_TYPE = {0: 'tram', 2: 'rail', 3: 'bus', 4: 'ferry'}
 MODE_NOUN = {'tram': 'tram', 'rail': 'train', 'bus': 'bus', 'ferry': 'ferry', 'unknown': 'service'}
+
+# A (route_short_name, mode) combo with at least this many training rows is
+# considered "well represented" for the coverage check in predict_delay().
+WELL_REPRESENTED_MIN_ROWS = 1000
 
 _cache: dict = {}
 
@@ -123,6 +128,56 @@ def _load_training_frames():
     return X_train, y_train, categories
 
 
+def _find_best_matching_static_snapshot(train_route_ids: set):
+    """route_id carries a version suffix that changes between static GTFS
+    snapshots (e.g. '100-4799' vs '100-4948'), so the snapshot whose
+    routes.txt matches the *training* data's route_id vocabulary is not
+    necessarily the latest one — it has to be located by checking each
+    available snapshot's overlap with train_route_ids.
+    """
+    bucket, fs = _get_env()
+    static_prefix = f'{bucket}/gtfs_static'
+    entries = fs.ls(static_prefix)
+    snapshot_dates = sorted(
+        [e.rstrip('/').split('/')[-1] for e in entries if gtfs_data.DATE_PATTERN.match(e.rstrip('/').split('/')[-1])],
+        reverse=True,
+    )
+
+    best_date, best_routes, best_match = None, None, -1
+    for snap in snapshot_dates:
+        routes = pd.read_csv(f's3://{static_prefix}/{snap}/routes.txt', dtype=str)
+        match = len(train_route_ids & set(routes['route_id']))
+        if match > best_match:
+            best_date, best_routes, best_match = snap, routes, match
+        if match == len(train_route_ids):
+            break  # perfect match — no need to check older snapshots
+
+    print(f'Best static snapshot match for training route_ids: {best_date} '
+          f'({best_match}/{len(train_route_ids)} route_ids matched)')
+    return best_date, best_routes
+
+
+def _build_training_metadata(X_train: pd.DataFrame) -> dict:
+    """Coverage counts per (route_short_name, mode), used by predict_delay()
+    to judge whether a live route was well represented in training — keyed
+    on route_short_name rather than the version-drifting route_id.
+    """
+    train_route_ids = set(X_train['route_id'].astype(str).unique())
+    snapshot_date, routes = _find_best_matching_static_snapshot(train_route_ids)
+    short_name_by_id = routes.set_index('route_id')['route_short_name']
+
+    lookup = X_train[['route_id', 'mode']].astype(str).copy()
+    lookup['route_short_name'] = lookup['route_id'].map(short_name_by_id).fillna('UNKNOWN')
+
+    counts = lookup.groupby(['route_short_name', 'mode'], observed=True).size()
+    coverage_counts = {f'{name}|{mode}': int(n) for (name, mode), n in counts.items()}
+
+    return {
+        'static_snapshot_used_for_route_names': snapshot_date,
+        'coverage_counts': coverage_counts,
+    }
+
+
 def _train_and_save_model() -> None:
     print('No saved model found — training v0 XGBoost model from the S3 feature snapshot...')
     X_train, y_train, categories = _load_training_frames()
@@ -136,11 +191,16 @@ def _train_and_save_model() -> None:
     model.fit(X_train, y_train)
     print('Training complete.')
 
+    training_metadata = _build_training_metadata(X_train)
+
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     model.save_model(str(MODEL_PATH))
     joblib.dump(categories, CATEGORIES_PATH)
+    with open(TRAINING_METADATA_PATH, 'w') as f:
+        json.dump(training_metadata, f)
     print(f'Saved model to {MODEL_PATH}')
     print(f'Saved categorical mappings to {CATEGORIES_PATH}')
+    print(f'Saved training coverage metadata to {TRAINING_METADATA_PATH}')
 
 
 def load_model() -> xgb.XGBRegressor:
@@ -148,16 +208,25 @@ def load_model() -> xgb.XGBRegressor:
     if 'model' in _cache:
         return _cache['model']
 
-    if not MODEL_PATH.exists() or not CATEGORIES_PATH.exists():
+    if not MODEL_PATH.exists() or not CATEGORIES_PATH.exists() or not TRAINING_METADATA_PATH.exists():
         _train_and_save_model()
 
     model = xgb.XGBRegressor(enable_categorical=True, tree_method='hist')
     model.load_model(str(MODEL_PATH))
     categories = joblib.load(CATEGORIES_PATH)
+    with open(TRAINING_METADATA_PATH) as f:
+        training_metadata = json.load(f)
 
     _cache['model'] = model
     _cache['categories'] = categories
+    _cache['training_metadata'] = training_metadata
     return model
+
+
+def _get_training_metadata() -> dict:
+    if 'training_metadata' not in _cache:
+        load_model()
+    return _cache['training_metadata']
 
 
 def _get_categories() -> dict:
@@ -234,13 +303,15 @@ def predict_delay(trip_info: dict, departure_time: datetime, live_delay: dict | 
     the v0 model prediction with live GTFS-RT data when available.
     """
     model = load_model()
-    categories = _get_categories()
+    training_metadata = _get_training_metadata()
 
     X = build_features(trip_info, departure_time)
     predicted_delay_minutes = float(model.predict(X)[0])
 
-    seen_route = trip_info['route_id'] in categories['route_id']
-    seen_stop = trip_info['stop_id'] in categories['stop_id']
+    mode = trip_info.get('mode') or MODE_BY_ROUTE_TYPE.get(trip_info.get('route_type'), 'unknown')
+    route_short_name = trip_info.get('route_short_name') or trip_info['route_id']
+    coverage_count = training_metadata['coverage_counts'].get(f'{route_short_name}|{mode}', 0)
+    well_represented = coverage_count >= WELL_REPRESENTED_MIN_ROWS
 
     if live_delay is not None:
         live_delay_minutes = float(live_delay['delay_minutes'])
@@ -250,7 +321,7 @@ def predict_delay(trip_info: dict, departure_time: datetime, live_delay: dict | 
     else:
         live_delay_minutes = None
         blended_delay_minutes = predicted_delay_minutes
-        confidence = 'Medium' if (seen_route and seen_stop) else 'Low'
+        confidence = 'Medium' if well_represented else 'Low'
 
     scheduled_arrival = trip_info['dest_arrival_time']
     estimated_arrival = scheduled_arrival + timedelta(minutes=blended_delay_minutes)
@@ -326,3 +397,23 @@ if __name__ == '__main__':
     result_with_live = predict_delay(trip, now, live_delay=live_delay)
     for k, v in result_with_live.items():
         print(f'  {k}: {v}')
+    print()
+
+    print('=== Finding a trip: Helensvale -> Roma Street (Citytrain, route_short_name+mode coverage check) ===')
+    next_monday = now + timedelta(days=(7 - now.weekday()) % 7 or 7)
+    next_monday = next_monday.replace(hour=9, minute=0, second=0, microsecond=0)
+    origin_candidates = gtfs_data.search_stops('Helensvale station', limit=50)
+    dest_candidates = gtfs_data.search_stops('Roma Street station', limit=50)
+    origin = next(r for r in origin_candidates if r['stop_name'] == 'Helensvale station')
+    dest = next(r for r in dest_candidates if r['stop_name'] == 'Roma Street station')
+    print(f'  origin: {origin["stop_name"]}  dest: {dest["stop_name"]}  departure_after: {next_monday}')
+
+    trips = gtfs_data.find_trips(origin['stop_ids'], dest['stop_ids'], next_monday, window_minutes=120)
+    print(f'  {len(trips)} trip(s) found in the next 120 min')
+    if trips:
+        trip = enrich_trip_with_dest_stop(trips[0], dest['stop_ids'])
+        print(f'  using trip: {trip}')
+        result = predict_delay(trip, next_monday)
+        print(f"  confidence (no live data): {result['confidence']}")
+        for k, v in result.items():
+            print(f'  {k}: {v}')
