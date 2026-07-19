@@ -6,7 +6,7 @@ trip search. No business logic lives here — presentation + wiring only.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 import streamlit as st
@@ -71,6 +71,25 @@ def badge_html(text: str, color: str) -> str:
     )
 
 
+def _time_slot_options() -> list[time]:
+    """15-minute time slots spanning a full day, as time objects."""
+    return [time(hour=h, minute=m) for h in range(24) for m in (0, 15, 30, 45)]
+
+
+def _format_time_ampm_short(t: time) -> str:
+    """'h:MM AM/PM' without a leading zero on the hour, e.g. '10:15 PM'."""
+    hour_12 = t.hour % 12 or 12
+    period = 'AM' if t.hour < 12 else 'PM'
+    return f'{hour_12}:{t.minute:02d} {period}'
+
+
+def _closest_slot_index(slots: list[time], target: time) -> int:
+    """Index of the slot with the smallest minutes-of-day distance to target."""
+    target_minutes = target.hour * 60 + target.minute
+    diffs = [abs((s.hour * 60 + s.minute) - target_minutes) for s in slots]
+    return diffs.index(min(diffs))
+
+
 def _search_stops(query: str) -> list[tuple[str, dict]]:
     """search_function for st_searchbox: (display_label, stop_data) tuples."""
     if len(query.strip()) < 2:
@@ -116,11 +135,17 @@ with col2:
 
 now_brisbane = datetime.now(BRISBANE_TZ)
 
+time_slots = _time_slot_options()
+label_to_time = {_format_time_ampm_short(t): t for t in time_slots}
+time_labels = list(label_to_time.keys())
+default_time_index = _closest_slot_index(time_slots, now_brisbane.time())
+
 col3, col4 = st.columns(2)
 with col3:
-    travel_date = st.date_input('Date', value=now_brisbane.date())
+    travel_date = st.date_input('Date', value=now_brisbane.date(), format='DD/MM/YYYY')
 with col4:
-    travel_time = st.time_input('Departure time', value=now_brisbane.time())
+    selected_time_label = st.selectbox('Departure time', time_labels, index=default_time_index)
+    travel_time = label_to_time[selected_time_label]
 
 search_clicked = st.button('Search', type='primary', use_container_width=True)
 
