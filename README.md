@@ -4,7 +4,7 @@
 
 A transport **confidence layer** for the Gold Coast ↔ Brisbane corridor — built on a self-collected archive of TransLink's GTFS-Realtime feeds that doesn't exist anywhere else publicly.
 
-**Status:** Phase 1 complete · Phase 2 (feature engineering) in progress · Phase 3 (app) not started
+**Status:** Phase 1 complete · Phase 2 v0 model trained (enrichment deferred pending more archive data) · Phase 3 (app) not started
 
 ---
 
@@ -43,17 +43,44 @@ TransLink publishes system-wide monthly on-time averages, but no stop-level or p
               │   (ap-southeast-2)                      │
               │  gtfs_realtime/ · gtfs_static/           │
               │  performance/ · ml_features/             │
-              └───────┬─────────────────────┬───────────┘
-                      │                     │
-                      ▼                     ▼
-      notebooks 02–04 (Phase 1 EDA)   notebook 05 (Phase 2 pipeline)
-      static GTFS + performance CSVs  join + feature engineering
-      → charts, LinkedIn insights     → versioned parquet + _latest.json
-                                              │
-                                              ▼
-                                     notebook 06 (Phase 2 EDA)
-                                     reads _latest.json only — fast,
-                                     no re-ingest / re-join
+              │  alerts/ (service_alerts archive)        │
+              └───┬─────────────┬─────────────┬──────────┘
+                  │             │             │
+                  ▼             ▼             ▼
+      notebooks 02–04   notebook 05      notebook 05b
+      (Phase 1 EDA)      (Phase 2         (alert features)
+      static GTFS +      pipeline)        service_alerts →
+      performance CSVs   join + feature   route-hourly +
+      → charts,          eng. → versioned stop-hourly parquet
+      LinkedIn insights  parquet +        → S3 alerts/features/
+                         _latest.json               │
+                              │                      │
+              ┌───────────────┼──────────┐           │
+              ▼               ▼          │           │
+      notebook 06       notebook 07      │           │
+      (Phase 2 EDA)      (baseline       │           │
+      reads              model)          │           │
+      _latest.json       loads           │           │
+      only — fast,       _latest.json,   │           │
+      no re-ingest       trains XGBoost  │           │
+      / re-join          v0 baseline     │           │
+                                         ▼           ▼
+                              notebook 08 (enrichment A/B)
+                              loads _latest.json + 05b + 05c
+                              output via enrich.py (shared
+                              helper); trains 4 XGBoost variants:
+                              baseline / +weather / +alerts / +both
+                                                   ▲
+                                                   │
+                    ┌──────────────────┐          │
+                    │ Open-Meteo ERA5   │          │
+                    │ API (external,    │          │
+                    │ no auth)          │          │
+                    └────────┬──────────┘          │
+                             ▼                      │
+                       notebook 05c ─────────────────┘
+                       (weather dimension)
+                       → S3 weather/era5/hourly.parquet
 ```
 
 **Key principle:** raw archive data is immutable. All enrichment (joins, features) happens on copies, written to separate, versioned S3 prefixes.
@@ -76,11 +103,16 @@ TransLink publishes system-wide monthly on-time averages, but no stop-level or p
 ```
 Transit-AI/
 ├── notebooks/
-│   ├── 02_load_static_gtfs.ipynb        # static GTFS → S3 parquet
-│   ├── 03_load_performance_data.ipynb   # performance CSVs → S3
-│   ├── 04_eda.ipynb                     # Phase 1 EDA (on performance CSVs)
-│   ├── 05_phase2_feature_pipeline.ipynb # GTFS-RT archive + static join → ML features (S3, versioned)
-│   └── 06_phase2_eda.ipynb              # Phase 2 EDA — reads latest feature snapshot only, no re-ingest
+│   ├── 02_load_static_gtfs.ipynb          # Parse static GTFS → S3 parquet
+│   ├── 03_load_performance_data.ipynb     # Download + validate performance CSVs → S3
+│   ├── 04_eda.ipynb                       # Phase 1 EDA on performance CSVs (charts → S3)
+│   ├── 05_phase2_feature_pipeline.ipynb   # GTFS-RT archive + static GTFS join → versioned ML features (S3)
+│   ├── 05b_alert_features.ipynb           # Service alerts archive → route-hourly + stop-hourly tables (S3)
+│   ├── 05c_weather_dimension.ipynb        # Open-Meteo ERA5 historical weather → hourly parquet (S3)
+│   ├── 06_phase2_eda.ipynb                # Phase 2 EDA — reads _latest.json only, no re-ingest
+│   ├── 07_phase2_baseline_model.ipynb     # XGBoost v0 baseline — leakage-filtered, temporal split
+│   ├── 08_enrichment_ab.ipynb             # Four-way A/B: baseline vs +weather vs +alerts vs +both
+│   └── enrich.py                          # Shared load/join/split helper for notebook 08
 ├── scripts/
 │   └── archive_gtfsrt.py                # continuous daemon — GTFS-RT, static GTFS, performance → S3
 ├── config/
@@ -92,6 +124,35 @@ Transit-AI/
 
 > Notebook `01` (a pre-daemon manual test fetch) has been removed — the daemon fully replaced its purpose.
 > All data lives in S3 (`seq-transit-ai-data-ps`, `ap-southeast-2`). The local machine holds only logs and code — there is no local or in-repo data storage.
+
+---
+
+## Notebook Run Order
+
+The notebooks have a strict dependency chain. Run them in this order:
+
+### Phase 1 — Data & EDA (one-time setup)
+
+| Step | Notebook | Input | Output | Notes |
+|------|----------|-------|--------|-------|
+| 1 | `02_load_static_gtfs` | S3 static GTFS CSVs | S3 parquet files | Run once; re-run if static GTFS changes |
+| 2 | `03_load_performance_data` | S3 performance CSVs | Validated DataFrames | Run once to confirm CSVs load cleanly |
+| 3 | `04_eda` | Output from 02 + 03 | Charts → S3 `eda_charts/` | Phase 1 analysis — Citytrain/Bus/Tram on-time trends |
+
+### Phase 2 — Feature Engineering + Model
+
+| Step | Notebook | Input | Output | Notes |
+|------|----------|-------|--------|-------|
+| 4 | `05_phase2_feature_pipeline` | S3 GTFS-RT archive + static GTFS | Versioned parquet → S3 `ml_features/` + `_latest.json` | **Long-running** — use `nohup` (see Setup). Has `DATE_LIMIT` for single-day validation. |
+| 5a | `05b_alert_features` | S3 service_alerts archive | `alerts/features/route_hourly.parquet` + `stop_hourly.parquet` | Independent of 05. Can run in any order relative to 05c. |
+| 5b | `05c_weather_dimension` | Open-Meteo API (no auth) | `weather/era5/hourly.parquet` | Independent of 05. Cached; skips fetch unless `REFRESH=True`. |
+| 6 | `06_phase2_eda` | `_latest.json` from step 4 | Charts + summary stats | Fast — reads finished parquet only, no re-ingest |
+| 7 | `07_phase2_baseline_model` | `_latest.json` from step 4 | Trained XGBoost model + residual analysis | v0 baseline — no weather or alert features |
+| 8 | `08_enrichment_ab` | `_latest.json` + 05b output + 05c output | Four-way A/B comparison JSON → S3 | Uses `enrich.py` for shared load/split logic. Currently inconclusive — needs more archive data. |
+
+Steps 5a and 5b are independent of each other and of step 4 — they can
+run in parallel. Steps 6, 7, and 8 all depend on step 4's output
+(`_latest.json`) but are independent of each other.
 
 ---
 
@@ -139,7 +200,7 @@ The daemon is designed to run indefinitely via `launchd` so it survives reboots 
 ### Now — Done
 
 **Phase 1 — Data & EDA**
-Historical on-time performance for Citytrain, pulled from TransLink's public monthly CSVs (Dec 2023 – Mar 2026, 28 months):
+Historical on-time performance from TransLink's public monthly CSVs (Dec 2023 – Mar 2026, 28 months):
 
 | Mode | Average on-time rate |
 |---|---|
@@ -149,24 +210,24 @@ Historical on-time performance for Citytrain, pulled from TransLink's public mon
 
 TransLink's own data is system-wide and aggregate only — no per-route or per-time-of-day breakdown is published anywhere. That gap is exactly what the self-collected GTFS-RT archive is built to close.
 
-**Phase 2 v0 — Feature pipeline infrastructure**
-- GTFS-RT trip-update archive joined against a static GTFS snapshot, engineered into ML-ready features (route, stop, hour of day, day of week, `is_weekend`, `is_peak`, mode, delay)
-- Feature snapshots versioned by `run_date` in S3, with a `_latest.json` manifest written only after a verified, complete write
-- Verified end-to-end on a single-day test run with no regression after the versioning changes
+**Phase 2 v0 — Feature pipeline + baseline model**
+- GTFS-RT trip-update archive joined against static GTFS, engineered into ML-ready features (route, stop, hour, day, peak flag, mode, delay)
+- Feature snapshots versioned by `run_date` in S3, with `_latest.json` manifest written only after verified write
+- XGBoost v0 baseline trained: MAE 2.26 minutes (20.4% improvement over naive median), temporal train/test split, leakage-filtered
+- Enrichment A/B (weather + service alerts) built and tested — results inconclusive with 21 days of archive; deferred until more data accumulates (daemon runs passively)
 
-### Next — In progress
+### Next — Phase 3 (the app)
 
-- Re-run the full multi-day feature range under the versioned pipeline
-- Validate the `is_peak` feature path against a weekday (only tested on a weekend so far)
-- Decide the minimum data volume needed before model training starts
+- Confidence API: Python backend wrapping v0 model + live GTFS-RT feed
+- NL query parser: "Varsity Lakes to Broadbeach" → route resolution (LLM-assisted)
+- Weather-app-style React/Vite/Tailwind frontend
+- AWS deployment (Console-first)
 
-### Later — Directional, not yet scoped
+### Later — Revisit with more data
 
-Deliberately kept light here — these depend on decisions above and are likely to change shape once made:
-
-- Weather data as a model feature
-- Per-date-matched static GTFS snapshot joins (v0 uses a single snapshot for the whole archive)
-- Phase 3 (the app itself) — not started, scope to be defined once Phase 2 has a validated model
+- Re-run enrichment A/B once archive covers 3+ months (ideally including Nov–Mar wet season)
+- Weather as a model feature (currently inconclusive — one Brisbane CBD point across 21 dry winter days)
+- Per-date-matched static GTFS snapshot joins (v0 uses single most-recent snapshot)
 
 ---
 
