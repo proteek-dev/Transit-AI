@@ -220,19 +220,21 @@ def attach_weather(X, scheduled_arrival_dt, S3_BUCKET, fs):
     return X_out, float(match_rate)
 
 
-def attach_alerts(X, scheduled_arrival_dt, S3_BUCKET, fs):
+def attach_alerts(X, scheduled_arrival_dt, snapshot_timestamp, S3_BUCKET, fs):
     """Left-join BOTH alert tables — route_hourly on route_id, stop_hourly on
-    stop_id — each on date+hour from scheduled_arrival_dt. Fill misses with
-    0 / 'NONE'. Route-level and stop-level columns are kept separate.
-    Returns (X_with_alerts, route_match_rate, stop_match_rate).
+    stop_id — each on date+hour from snapshot_timestamp (prediction time, not
+    arrival time — joining on arrival time would leak alert state that had
+    not happened yet as of the moment the prediction would actually be made).
+    Fill misses with 0 / 'NONE'. Route-level and stop-level columns are kept
+    separate. Returns (X_with_alerts, route_match_rate, stop_match_rate).
     """
     route_path = f's3://{S3_BUCKET}/alerts/features/route_hourly.parquet'
     stop_path = f's3://{S3_BUCKET}/alerts/features/stop_hourly.parquet'
     route_alerts = pd.read_parquet(route_path, filesystem=fs)
     stop_alerts = pd.read_parquet(stop_path, filesystem=fs)
 
-    alert_date = scheduled_arrival_dt.dt.strftime('%Y-%m-%d')
-    alert_hour = scheduled_arrival_dt.dt.hour.astype('int64')
+    alert_date = snapshot_timestamp.dt.strftime('%Y-%m-%d')
+    alert_hour = snapshot_timestamp.dt.hour.astype('int64')
 
     route_key = pd.DataFrame({
         'route_id': X['route_id'].astype(str),
