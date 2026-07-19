@@ -11,3 +11,7 @@ venv/
 source_files/gtfs_realtime/
 source_files/gtfs_static/
 source_files/performance/
+
+# Generated model artifacts — reproducible via phase3/prediction.py (trains
+# + saves automatically if missing), not committed to keep the repo lean.
+phase3/model/
