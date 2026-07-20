@@ -53,6 +53,12 @@ class GTFSData:
         self.calendar = None
         self.calendar_dates = None
         self._stop_index = None  # one row per unique stop_name, built at load time
+        self.stop_to_routes = None   # stop_id -> set of route_id, built at load time
+        self.route_to_stops = None   # route_id -> ordered list of stop_id, built at load time
+        self.route_trip_counts = None  # route_id -> trip count, used for fan-out ranking
+        self.stop_to_cluster = None    # stop_id -> canonical station name
+        self.cluster_to_routes = None  # canonical station name -> set of route_id
+        self.cluster_stop_ids = None   # canonical station name -> list of stop_id
 
     def load(self):
         bucket, fs = _get_env()
@@ -95,6 +101,7 @@ class GTFSData:
         self.calendar_dates = frames['calendar_dates.txt']
 
         self._build_stop_index()
+        self._build_route_indexes()
 
         print(
             f'Loaded snapshot {self.snapshot_date}: '
@@ -120,6 +127,49 @@ class GTFSData:
             stop_lon=('stop_lon', 'mean'),
         ).reset_index().rename(columns={'canonical_name': 'stop_name'})
         self._stop_index = grouped
+        # stop_id -> canonical station name, reused by _build_route_indexes()
+        # so transfer detection recognizes same-station platforms that carry
+        # different stop_ids per mode (e.g. a tram platform and a train
+        # platform at the same interchange).
+        self._stop_id_to_canonical_name = dict(zip(stops['stop_id'], canonical_name))
+
+    def _build_route_indexes(self):
+        """stop_to_routes / route_to_stops / route_trip_counts — the route
+        graph find_multi_leg_trips() BFSes over to find transfer chains.
+
+        Also builds cluster_to_routes / cluster_stop_ids / stop_to_cluster:
+        real interchanges often split platforms across stop_ids with no stop_id
+        in common (a tram platform and a train platform at the same station),
+        so two routes are also considered "connected" if they serve the same
+        canonical station name, not just the same literal stop_id.
+        """
+        merged = self.stop_times[['trip_id', 'stop_id', 'stop_sequence']].merge(
+            self.trips[['trip_id', 'route_id']], on='trip_id', how='left'
+        ).dropna(subset=['route_id'])
+
+        self.route_trip_counts = self.trips.groupby('route_id')['trip_id'].nunique().to_dict()
+
+        stop_to_routes = {}
+        pairs = merged[['stop_id', 'route_id']].drop_duplicates()
+        for stop_id, route_id in pairs.itertuples(index=False):
+            stop_to_routes.setdefault(stop_id, set()).add(route_id)
+        self.stop_to_routes = stop_to_routes
+
+        route_to_stops = {}
+        ordered = merged.sort_values('stop_sequence')[['route_id', 'stop_id']].drop_duplicates()
+        for route_id, group in ordered.groupby('route_id', sort=False):
+            route_to_stops[route_id] = list(dict.fromkeys(group['stop_id']))
+        self.route_to_stops = route_to_stops
+
+        stop_to_cluster = self._stop_id_to_canonical_name
+        self.stop_to_cluster = stop_to_cluster
+        self.cluster_stop_ids = dict(zip(self._stop_index['stop_name'], self._stop_index['stop_ids']))
+
+        cluster_to_routes = {}
+        for stop_id, routes in stop_to_routes.items():
+            cluster = stop_to_cluster.get(stop_id, stop_id)
+            cluster_to_routes.setdefault(cluster, set()).update(routes)
+        self.cluster_to_routes = cluster_to_routes
 
     def active_service_ids(self, query_date) -> set:
         date_int = int(query_date.strftime('%Y%m%d'))
@@ -314,6 +364,254 @@ def _find_trips_core(
         }
         for row in merged.itertuples(index=False)
     ]
+
+
+# Performance guards for find_multi_leg_trips()'s route-graph BFS — see
+# _expand_route_frontier(). Without these, a hub like Roma Street (served by
+# dozens of routes) makes the frontier explode combinatorially by depth 2.
+_ROUTE_FAN_OUT_CAP = 15
+_STOP_CLUSTER_CAP = 50
+
+
+def _expand_route_frontier(
+    data: GTFSData, frontier: list[dict], dest_routes: set, visited_routes: set,
+) -> tuple[list[dict], list[dict]]:
+    """One BFS hop over the route-intersection graph.
+
+    `frontier` entries are {'routes': [route_id, ...], 'transfer_stops': [[stop_id, ...], ...]}
+    chains that haven't reached a route serving the destination yet (each
+    transfer_stops entry is the full list of stop_ids at that hop's station,
+    not a single stop_id — see cluster note below). Returns (completed_chains,
+    next_frontier) where completed_chains are chains whose newly-added route
+    is in dest_routes.
+
+    Two routes are considered "connected" at a *station cluster* — same
+    canonical station name — not just a literal shared stop_id, because real
+    interchanges often split platforms across stop_ids with nothing in common
+    (e.g. a tram platform and a train platform at the same station). Without
+    this, transfers at exactly those interchanges are invisible to the BFS.
+
+    `visited_routes` is a global set of every route_id already reached by an
+    earlier or the current hop, mutated in place. Without it, the same route
+    gets re-discovered via every path that leads to it and the frontier grows
+    combinatorially (this previously made a 3-hop BFS at a busy hub run for
+    30+ minutes); with it, each route is expanded from at most once, so total
+    work is bounded by the size of the route network, not the number of paths
+    through it.
+    """
+    route_to_stops = data.route_to_stops
+    route_trip_counts = data.route_trip_counts
+    stop_to_cluster = data.stop_to_cluster
+    cluster_to_routes = data.cluster_to_routes
+    cluster_stop_ids = data.cluster_stop_ids
+
+    # Cap 1: pool every station cluster the frontier's routes visit, keep the
+    # 50 clusters served by the most routes (the interchanges most likely to
+    # yield a transfer).
+    pooled_clusters = set()
+    for chain in frontier:
+        for stop in route_to_stops.get(chain['routes'][-1], []):
+            pooled_clusters.add(stop_to_cluster.get(stop, stop))
+    candidate_clusters = sorted(
+        pooled_clusters, key=lambda c: -len(cluster_to_routes.get(c, ()))
+    )[:_STOP_CLUSTER_CAP]
+    candidate_cluster_set = set(candidate_clusters)
+
+    completed, next_frontier = [], []
+
+    for chain in frontier:
+        last_route = chain['routes'][-1]
+        clusters_here = {
+            stop_to_cluster.get(s, s) for s in route_to_stops.get(last_route, [])
+        } & candidate_cluster_set
+
+        for cluster in clusters_here:
+            candidate_routes = cluster_to_routes.get(cluster, set()) - visited_routes
+            if not candidate_routes:
+                continue
+
+            def _chain_to(next_route):
+                return {
+                    'routes': chain['routes'] + [next_route],
+                    'transfer_stops': chain['transfer_stops'] + [cluster_stop_ids.get(cluster, [cluster])],
+                }
+
+            # A route that already reaches the destination is a free win —
+            # recognize it regardless of the fan-out cap below. GTFS feeds
+            # that version route_ids per direction/pattern (e.g. dozens of
+            # near-duplicate rail route_ids at one interchange) can otherwise
+            # rank the exact direction needed well outside the top 15 by
+            # trip count, hiding a real connection.
+            for next_route in candidate_routes & dest_routes:
+                if next_route in visited_routes:
+                    continue
+                visited_routes.add(next_route)
+                completed.append(_chain_to(next_route))
+
+            # Cap 2: only the exploratory (non-destination) routes are capped
+            # to the 15 busiest — this is what actually bounds how much
+            # deeper BFS work a hub like Roma Street can generate.
+            exploratory = candidate_routes - dest_routes - visited_routes
+            if len(exploratory) > _ROUTE_FAN_OUT_CAP:
+                exploratory = set(
+                    sorted(exploratory, key=lambda r: -route_trip_counts.get(r, 0))[:_ROUTE_FAN_OUT_CAP]
+                )
+
+            for next_route in exploratory:
+                if next_route in visited_routes:
+                    continue
+                visited_routes.add(next_route)
+                next_frontier.append(_chain_to(next_route))
+
+    return completed, next_frontier
+
+
+def _resolve_chain(
+    chain: dict,
+    origin_stop_ids: list[str],
+    dest_stop_ids: list[str],
+    departure_after: datetime,
+    window_minutes: int,
+    min_connection: int,
+    max_connection: int,
+) -> dict | None:
+    """Resolve a route-graph chain into a timed journey by calling find_trips()
+    leg-by-leg. Returns None if any leg has no timed trip within its window, or
+    any connection falls outside [min_connection, max_connection].
+    """
+    routes = chain['routes']
+    leg_stop_bounds = [origin_stop_ids] + list(chain['transfer_stops']) + [dest_stop_ids]
+    connection_window = max(max_connection - min_connection, 1)
+
+    legs = []
+    transfer_points = []
+    next_departure_after = departure_after
+    next_window = window_minutes
+
+    for i, route_id in enumerate(routes):
+        from_stops = leg_stop_bounds[i]
+        to_stops = leg_stop_bounds[i + 1]
+        candidates = find_trips(from_stops, to_stops, next_departure_after, next_window)
+        candidates = [t for t in candidates if t['route_id'] == route_id]
+        if not candidates:
+            return None
+        trip = candidates[0]
+
+        if i > 0:
+            prev_arrival = legs[i - 1]['trip']['dest_arrival_time']
+            connection_minutes = int((trip['origin_departure_time'] - prev_arrival).total_seconds() // 60)
+            if not (min_connection <= connection_minutes <= max_connection):
+                return None
+            transfer_points.append({
+                'stop_name': legs[i - 1]['trip']['dest_stop_name'],
+                'connection_minutes': connection_minutes,
+            })
+
+        legs.append({
+            'trip': trip,
+            'board_stop_name': trip['origin_stop_name'],
+            'alight_stop_name': trip['dest_stop_name'],
+            'dest_stop_ids': to_stops,
+            'search_departure_after': next_departure_after,
+        })
+
+        next_departure_after = trip['dest_arrival_time'] + timedelta(minutes=min_connection)
+        next_window = connection_window
+
+    total_minutes = int(
+        (legs[-1]['trip']['dest_arrival_time'] - legs[0]['trip']['origin_departure_time']).total_seconds() // 60
+    )
+    return {
+        'legs': legs,
+        'transfer_points': transfer_points,
+        'total_minutes': total_minutes,
+        'num_transfers': len(legs) - 1,
+    }
+
+
+def _direct_journey(trip: dict, dest_stop_ids: list[str], departure_after: datetime) -> dict:
+    """Wrap a single find_trips() result in the same journey shape find_multi_leg_trips() returns."""
+    total_minutes = int((trip['dest_arrival_time'] - trip['origin_departure_time']).total_seconds() // 60)
+    return {
+        'legs': [{
+            'trip': trip,
+            'board_stop_name': trip['origin_stop_name'],
+            'alight_stop_name': trip['dest_stop_name'],
+            'dest_stop_ids': dest_stop_ids,
+            'search_departure_after': departure_after,
+        }],
+        'transfer_points': [],
+        'total_minutes': total_minutes,
+        'num_transfers': 0,
+    }
+
+
+def find_multi_leg_trips(
+    origin_stop_ids: list[str],
+    dest_stop_ids: list[str],
+    departure_after: datetime,
+    window_minutes: int = 60,
+    min_connection: int = 5,
+    max_connection: int = 45,
+    max_transfers: int = 3,
+    max_results: int = 5,
+) -> list[dict]:
+    """Find journeys (direct or with transfers) from origin to destination via
+    route-intersection BFS over the static GTFS network.
+
+    Depth 0 checks for a route serving both origin and destination directly
+    (delegating to find_trips()). Depth 1+ BFSes the route graph — two routes
+    are "connected" if they share a stop — expanding one hop per depth and
+    resolving newly-completed chains into timed journeys via find_trips() per
+    leg. BFS stops deepening as soon as `max_results` timed journeys have been
+    found, so shorter-transfer-count journeys are always preferred.
+    """
+    data = load_gtfs_data()
+    stop_to_routes = data.stop_to_routes
+
+    origin_routes = set()
+    for sid in origin_stop_ids:
+        origin_routes |= stop_to_routes.get(sid, set())
+    dest_routes = set()
+    for sid in dest_stop_ids:
+        dest_routes |= stop_to_routes.get(sid, set())
+
+    journeys = []
+
+    # Depth 0: direct trips on a route serving both origin and destination.
+    if origin_routes & dest_routes:
+        for trip in find_trips(origin_stop_ids, dest_stop_ids, departure_after, window_minutes):
+            journeys.append(_direct_journey(trip, dest_stop_ids, departure_after))
+
+    if len(journeys) >= max_results:
+        return sorted(journeys, key=lambda j: j['total_minutes'])[:max_results]
+
+    # Depth 1+: transfer chains via route-intersection BFS. `visited_routes`
+    # is global across the whole search (see _expand_route_frontier) so each
+    # route is only ever expanded from once, keeping the BFS tractable at
+    # busy hubs like Roma Street.
+    visited_routes = set(origin_routes)
+    frontier = [{'routes': [r], 'transfer_stops': []} for r in origin_routes]
+
+    for _depth in range(1, max_transfers + 1):
+        if not frontier:
+            break
+        completed, frontier = _expand_route_frontier(data, frontier, dest_routes, visited_routes)
+
+        for chain in completed:
+            if len(journeys) >= max_results:
+                break
+            journey = _resolve_chain(
+                chain, origin_stop_ids, dest_stop_ids, departure_after, window_minutes,
+                min_connection, max_connection,
+            )
+            if journey is not None:
+                journeys.append(journey)
+
+        if len(journeys) >= max_results:
+            break
+
+    return sorted(journeys, key=lambda j: j['total_minutes'])[:max_results]
 
 
 def _pick_stop_group(query: str) -> dict | None:

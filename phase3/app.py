@@ -107,6 +107,119 @@ def stop_picker(label: str, key_prefix: str) -> dict | None:
     )
 
 
+def _predict_leg(trip: dict, dest_stop_ids: list[str], search_departure_after: datetime, updates: dict):
+    """Enrich + predict_delay() one leg's trip. Returns (trip, pred, raw_update), or None on failure."""
+    try:
+        enriched = prediction.enrich_trip_with_dest_stop(trip, dest_stop_ids)
+        raw_update = updates.get(enriched['trip_id'])
+        live_delay = None
+        if raw_update is not None:
+            live_delay = {
+                'delay_minutes': raw_update['delay_seconds'] / 60.0,
+                'timestamp': raw_update['timestamp'],
+                'stop_id': raw_update['stop_id'],
+            }
+        pred = prediction.predict_delay(enriched, search_departure_after, live_delay=live_delay)
+    except Exception as e:
+        st.warning(f'Could not predict this leg ({trip.get("trip_id")}): {e}')
+        return None
+    return trip, pred, raw_update
+
+
+def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names) -> None:
+    """Render one leg's prediction card: leave-by banner, route badge, delay
+    badge, departure/arrival metrics, live tracking caption, confidence, summary.
+    """
+    st.markdown(
+        f'<div style="background:#2563eb18;border-radius:10px;padding:10px 16px;'
+        f'margin-bottom:10px;">'
+        f'<span style="font-size:1.4em;font-weight:700;color:#2563eb;">'
+        f'🕒 Leave by {pred["leave_by"]}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    head_col, delay_col = st.columns([3, 2])
+    with head_col:
+        st.markdown(f'**{route_badge(trip)}**')
+    with delay_col:
+        color = delay_color(pred['blended_delay_minutes'])
+        st.markdown(
+            badge_html(f'{pred["blended_delay_minutes"]:+.0f} min', color),
+            unsafe_allow_html=True,
+        )
+
+    dep_col, arr_col = st.columns(2)
+    with dep_col:
+        st.metric(
+            'Departure',
+            prediction.format_time_ampm(trip['origin_departure_time']),
+            help=trip['origin_stop_name'],
+        )
+    with arr_col:
+        st.metric('Est. arrival', pred['estimated_arrival'], help=trip['dest_stop_name'])
+
+    if raw_update is not None:
+        live_stop_name = stop_names.get(raw_update['stop_id'], raw_update['stop_id'])
+        st.caption(f'📡 Live: currently {raw_update["delay_seconds"] / 60:.0f} min late at {live_stop_name}')
+    else:
+        st.caption('📡 No live tracking yet')
+
+    conf = pred['confidence']
+    st.markdown(
+        badge_html(f'Confidence: {conf}', CONFIDENCE_COLOR.get(conf, '#8A8A8A')),
+        unsafe_allow_html=True,
+    )
+
+    if trip.get('fallback_schedule'):
+        st.caption('📅 Schedule based on projected timetable — times may vary')
+
+    st.write(pred['summary'])
+
+
+def render_direct_trips(trips: list[dict], dest_stop_ids: list[str], departure_after: datetime,
+                         updates: dict, stop_names) -> None:
+    if any(t.get('fallback_schedule') for t in trips):
+        st.info('Schedule based on projected timetable — times may vary')
+
+    with st.spinner('Generating predictions...'):
+        predicted = []
+        for trip in trips[:5]:
+            result = _predict_leg(trip, dest_stop_ids, departure_after, updates)
+            if result is not None:
+                predicted.append(result)
+
+    for trip, pred, raw_update in predicted:
+        with st.container(border=True):
+            render_trip_card(trip, pred, raw_update, stop_names)
+
+
+def render_transfer_journeys(journeys: list[dict], updates: dict, stop_names) -> None:
+    with st.spinner('Generating predictions...'):
+        for idx, journey in enumerate(journeys, start=1):
+            with st.container(border=True):
+                n = journey['num_transfers']
+                st.markdown(f"### Journey {idx} ({n} transfer{'' if n == 1 else 's'})")
+                st.caption(f"Total: ~{journey['total_minutes']} min")
+
+                for leg_idx, leg in enumerate(journey['legs']):
+                    st.divider()
+                    st.markdown(f'**Leg {leg_idx + 1}**')
+                    trip = leg['trip']
+                    st.write(f"Board: {leg['board_stop_name']} {prediction.format_time_ampm(trip['origin_departure_time'])}")
+                    st.write(f"Alight: {leg['alight_stop_name']} {prediction.format_time_ampm(trip['dest_arrival_time'])}")
+
+                    result = _predict_leg(trip, leg['dest_stop_ids'], leg['search_departure_after'], updates)
+                    if result is None:
+                        continue
+                    _, pred, raw_update = result
+                    render_trip_card(trip, pred, raw_update, stop_names)
+
+                    if leg_idx < len(journey['transfer_points']):
+                        tp = journey['transfer_points'][leg_idx]
+                        st.divider()
+                        st.markdown(f"🔄 **Transfer at {tp['stop_name']}** — {tp['connection_minutes']} min connection")
+
+
 # ── Header ────────────────────────────────────────────────────────────────
 
 st.title('SEQ Transit AI')
@@ -156,99 +269,49 @@ if search_clicked:
         st.warning('Pick both a "From" and a "To" stop first.')
     else:
         departure_after = datetime.combine(travel_date, travel_time)
+        window_minutes = 60
         with st.spinner('Searching for trips...'):
-            trips = gtfs_data.find_trips(origin['stop_ids'], dest['stop_ids'], departure_after, window_minutes=60)
+            trips = gtfs_data.find_trips(origin['stop_ids'], dest['stop_ids'], departure_after, window_minutes=window_minutes)
+            transfer_journeys = []
+            if not trips:
+                transfer_journeys = gtfs_data.find_multi_leg_trips(
+                    origin['stop_ids'], dest['stop_ids'], departure_after, window_minutes=window_minutes,
+                )
         st.session_state['results'] = {
             'trips': trips,
+            'transfer_journeys': transfer_journeys,
             'dest_stop_ids': dest['stop_ids'],
             'departure_after': departure_after,
+            'window_minutes': window_minutes,
         }
 
 results = st.session_state.get('results')
 if results:
     trips = results['trips']
+    transfer_journeys = results.get('transfer_journeys', [])
     st.divider()
 
-    if not trips:
+    if not trips and not transfer_journeys:
         st.info(
-            'No direct services found between these stops in the next 60 minutes. '
-            'Try a different time or check if a transfer is needed.'
+            f'No services found between these stops within the next {results["window_minutes"]} minutes, '
+            'even with transfers. Try a different time or check nearby stops.'
         )
     else:
         updates, live_error = get_live_updates()
         if live_error:
             st.warning('Live GTFS-RT feed is currently unavailable — showing model predictions only.')
 
-        if any(t.get('fallback_schedule') for t in trips):
-            st.info('Schedule based on projected timetable — times may vary')
-
         stop_names = data.stops.set_index('stop_id')['stop_name']
 
-        with st.spinner('Generating predictions...'):
-            predicted_trips = []
-            for trip in trips[:5]:
-                try:
-                    enriched = prediction.enrich_trip_with_dest_stop(trip, results['dest_stop_ids'])
-                    raw_update = updates.get(enriched['trip_id'])
-                    live_delay = None
-                    if raw_update is not None:
-                        live_delay = {
-                            'delay_minutes': raw_update['delay_seconds'] / 60.0,
-                            'timestamp': raw_update['timestamp'],
-                            'stop_id': raw_update['stop_id'],
-                        }
-                    pred = prediction.predict_delay(enriched, results['departure_after'], live_delay=live_delay)
-                except Exception as e:
-                    st.warning(f'Could not predict this trip ({trip.get("trip_id")}): {e}')
-                    continue
-                predicted_trips.append((trip, pred, raw_update))
+        if trips:
+            if transfer_journeys:
+                st.subheader('Direct services')
+            render_direct_trips(trips, results['dest_stop_ids'], results['departure_after'], updates, stop_names)
 
-        for trip, pred, raw_update in predicted_trips:
-            with st.container(border=True):
-                st.markdown(
-                    f'<div style="background:#2563eb18;border-radius:10px;padding:10px 16px;'
-                    f'margin-bottom:10px;">'
-                    f'<span style="font-size:1.4em;font-weight:700;color:#2563eb;">'
-                    f'🕒 Leave by {pred["leave_by"]}</span></div>',
-                    unsafe_allow_html=True,
-                )
-
-                head_col, delay_col = st.columns([3, 2])
-                with head_col:
-                    st.markdown(f'**{route_badge(trip)}**')
-                with delay_col:
-                    color = delay_color(pred['blended_delay_minutes'])
-                    st.markdown(
-                        badge_html(f'{pred["blended_delay_minutes"]:+.0f} min', color),
-                        unsafe_allow_html=True,
-                    )
-
-                dep_col, arr_col = st.columns(2)
-                with dep_col:
-                    st.metric(
-                        'Departure',
-                        prediction.format_time_ampm(trip['origin_departure_time']),
-                        help=trip['origin_stop_name'],
-                    )
-                with arr_col:
-                    st.metric('Est. arrival', pred['estimated_arrival'], help=trip['dest_stop_name'])
-
-                if raw_update is not None:
-                    live_stop_name = stop_names.get(raw_update['stop_id'], raw_update['stop_id'])
-                    st.caption(f'📡 Live: currently {raw_update["delay_seconds"] / 60:.0f} min late at {live_stop_name}')
-                else:
-                    st.caption('📡 No live tracking yet')
-
-                conf = pred['confidence']
-                st.markdown(
-                    badge_html(f'Confidence: {conf}', CONFIDENCE_COLOR.get(conf, '#8A8A8A')),
-                    unsafe_allow_html=True,
-                )
-
-                if trip.get('fallback_schedule'):
-                    st.caption('📅 Schedule based on projected timetable — times may vary')
-
-                st.write(pred['summary'])
+        if transfer_journeys:
+            if trips:
+                st.subheader('Services with transfers')
+            render_transfer_journeys(transfer_journeys, updates, stop_names)
 
 # ── Footer ──────────────────────────────────────────────────────────────
 
