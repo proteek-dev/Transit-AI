@@ -47,6 +47,11 @@ FEEDS = CONFIG["gtfs_realtime"]
 STATIC_URL = CONFIG["gtfs_static"]["seq"]
 FETCH_INTERVAL = CONFIG["fetch_interval_seconds"]
 
+# TransLink's combined SEQ/TripUpdates feed does not include tram entities —
+# tram is only published via this dedicated per-mode endpoint. Polled
+# separately, alongside the combined feed, in the main loop below.
+TRAM_TRIP_UPDATES_URL = CONFIG.get("gtfs_realtime_by_mode", {}).get("trip_updates_tram")
+
 
 def log(feed: str, record_count: int, s3_key: str, status: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -154,6 +159,41 @@ def fetch_and_save(feed_name: str, url: str) -> int:
         return 0
 
 
+def fetch_and_save_tram(url: str) -> int:
+    """Belt-and-suspenders poll of the dedicated TripUpdates/Tram endpoint —
+    the combined feed above doesn't carry tram entities. Same fetch/parse/save
+    pattern as fetch_and_save(), archived alongside the combined trip_updates
+    output (same date folder, "_tram" filename suffix) rather than a separate
+    prefix, and never crashes the daemon on failure or an empty response.
+    """
+    if not url:
+        log("trip_updates_tram", 0, "-", "WARNING: no tram endpoint configured in feeds.yaml")
+        return 0
+
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H-%M-%S")
+    s3_key = f"gtfs_realtime/trip_updates/{date_str}/{time_str}_tram.json"
+
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+
+        feed_message = gtfs_realtime_pb2.FeedMessage()
+        feed_message.ParseFromString(resp.content)
+
+        records = parse_trip_updates(feed_message)
+        body = json.dumps(records, separators=(",", ":")).encode()
+
+        s3.put_object(Bucket=AWS_S3_BUCKET, Key=s3_key, Body=body)
+        log("trip_updates_tram", len(records), s3_key, "OK")
+        return len(records)
+
+    except Exception as e:
+        log("trip_updates_tram", 0, s3_key, f"WARNING: {e}")
+        return 0
+
+
 # ── Static GTFS ───────────────────────────────────────────────────────────────
 
 def maybe_download_static_gtfs() -> None:
@@ -244,6 +284,8 @@ def main() -> None:
     while True:
         for feed_name, url in FEEDS.items():
             fetch_and_save(feed_name, url)
+
+        fetch_and_save_tram(TRAM_TRIP_UPDATES_URL)
 
         download_performance_data(CONFIG)
 
