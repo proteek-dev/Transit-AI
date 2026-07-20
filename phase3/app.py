@@ -6,7 +6,7 @@ trip search. No business logic lives here — presentation + wiring only.
 """
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import streamlit as st
@@ -279,6 +279,16 @@ col3, col4 = st.columns(2)
 with col3:
     travel_date = st.date_input('Date', value=now_brisbane.date(), format='DD/MM/YYYY')
 with col4:
+    departure_mode = st.segmented_control(
+        'Departure', ['Now', 'Later', 'Custom'], default='Now',
+    )
+    # segmented_control returns None if the user clicks the selected pill
+    # again (deselecting it) — fall back to the "Now" default rather than
+    # leaving departure_mode unset.
+    departure_mode = departure_mode or 'Now'
+
+travel_time = None
+if departure_mode == 'Custom':
     selected_time_label = st.selectbox('Departure time', time_labels, index=default_time_index)
     travel_time = label_to_time[selected_time_label]
 
@@ -290,7 +300,14 @@ if search_clicked:
     if origin is None or dest is None:
         st.warning('Pick both a "From" and a "To" stop first.')
     else:
-        departure_after = datetime.combine(travel_date, travel_time)
+        if departure_mode == 'Now':
+            now_at_click = datetime.now(BRISBANE_TZ)
+            departure_after = datetime.combine(now_at_click.date(), now_at_click.time())
+        elif departure_mode == 'Later':
+            later_at_click = datetime.now(BRISBANE_TZ) + timedelta(minutes=30)
+            departure_after = datetime.combine(later_at_click.date(), later_at_click.time())
+        else:
+            departure_after = datetime.combine(travel_date, travel_time)
         window_minutes = 60
         with st.spinner('Searching for trips...'):
             trips = gtfs_data.find_trips(origin['stop_ids'], dest['stop_ids'], departure_after, window_minutes=window_minutes)
