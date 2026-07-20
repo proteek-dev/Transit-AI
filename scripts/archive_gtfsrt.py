@@ -47,10 +47,24 @@ FEEDS = CONFIG["gtfs_realtime"]
 STATIC_URL = CONFIG["gtfs_static"]["seq"]
 FETCH_INTERVAL = CONFIG["fetch_interval_seconds"]
 
-# TransLink's combined SEQ/TripUpdates feed does not include tram entities —
-# tram is only published via this dedicated per-mode endpoint. Polled
-# separately, alongside the combined feed, in the main loop below.
-TRAM_TRIP_UPDATES_URL = CONFIG.get("gtfs_realtime_by_mode", {}).get("trip_updates_tram")
+# TransLink's combined SEQ feeds do not include tram entities for
+# TripUpdates or VehiclePositions — tram is only published via these
+# dedicated per-mode endpoints, polled separately below alongside the
+# combined feeds. Keyed by feed_name so the loop below can reuse PARSERS
+# and the "{feed_name}/{date}/{time}_tram.json" S3 layout.
+#
+# No working per-mode tram ServiceAlerts endpoint exists (confirmed by
+# direct testing 2026-07-20): "ServiceAlerts/Tram" 400s as an invalid
+# entityType, and "Alerts/Tram" — the correct entityType, with "Tram"
+# accepted as a valid routeType — still 404s with BlobNotFound. Not
+# included here. See config/feeds.yaml for other per-mode endpoints
+# TransLink exposes (bus/rail/ferry TripUpdates) that aren't needed
+# because the combined feeds already carry those modes.
+_BY_MODE = CONFIG.get("gtfs_realtime_by_mode", {})
+TRAM_FEEDS = {
+    "trip_updates": _BY_MODE.get("trip_updates_tram"),
+    "vehicle_positions": _BY_MODE.get("vehicle_positions_tram"),
+}
 
 
 def log(feed: str, record_count: int, s3_key: str, status: str) -> None:
@@ -159,21 +173,25 @@ def fetch_and_save(feed_name: str, url: str) -> int:
         return 0
 
 
-def fetch_and_save_tram(url: str) -> int:
-    """Belt-and-suspenders poll of the dedicated TripUpdates/Tram endpoint —
-    the combined feed above doesn't carry tram entities. Same fetch/parse/save
-    pattern as fetch_and_save(), archived alongside the combined trip_updates
-    output (same date folder, "_tram" filename suffix) rather than a separate
-    prefix, and never crashes the daemon on failure or an empty response.
+def fetch_and_save_tram(feed_name: str, url: str) -> int:
+    """Belt-and-suspenders poll of a dedicated per-mode tram endpoint — the
+    combined feeds above don't carry tram entities for trip_updates or
+    vehicle_positions. Same fetch/parse/save pattern as fetch_and_save(),
+    archived alongside the matching combined feed's output (same date
+    folder, "_tram" filename suffix) rather than a separate prefix. Each
+    tram feed is fetched independently here — one failing (or not being
+    configured in feeds.yaml) never blocks another or crashes the daemon.
     """
+    tram_label = f"{feed_name}_tram"
+
     if not url:
-        log("trip_updates_tram", 0, "-", "WARNING: no tram endpoint configured in feeds.yaml")
+        log(tram_label, 0, "-", "WARNING: no tram endpoint configured in feeds.yaml")
         return 0
 
     now = datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H-%M-%S")
-    s3_key = f"gtfs_realtime/trip_updates/{date_str}/{time_str}_tram.json"
+    s3_key = f"gtfs_realtime/{feed_name}/{date_str}/{time_str}_tram.json"
 
     try:
         resp = requests.get(url, timeout=30)
@@ -182,15 +200,15 @@ def fetch_and_save_tram(url: str) -> int:
         feed_message = gtfs_realtime_pb2.FeedMessage()
         feed_message.ParseFromString(resp.content)
 
-        records = parse_trip_updates(feed_message)
+        records = PARSERS[feed_name](feed_message)
         body = json.dumps(records, separators=(",", ":")).encode()
 
         s3.put_object(Bucket=AWS_S3_BUCKET, Key=s3_key, Body=body)
-        log("trip_updates_tram", len(records), s3_key, "OK")
+        log(tram_label, len(records), s3_key, "OK")
         return len(records)
 
     except Exception as e:
-        log("trip_updates_tram", 0, s3_key, f"WARNING: {e}")
+        log(tram_label, 0, s3_key, f"WARNING: {e}")
         return 0
 
 
@@ -285,7 +303,8 @@ def main() -> None:
         for feed_name, url in FEEDS.items():
             fetch_and_save(feed_name, url)
 
-        fetch_and_save_tram(TRAM_TRIP_UPDATES_URL)
+        for feed_name, url in TRAM_FEEDS.items():
+            fetch_and_save_tram(feed_name, url)
 
         download_performance_data(CONFIG)
 
