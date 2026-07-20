@@ -73,6 +73,20 @@ def route_badge(trip: dict) -> str:
     return label
 
 
+def route_label_plain(trip: dict) -> str:
+    """'[mode] [route_short_name] towards [trip_headsign]', no emoji — used
+    in expander labels that already carry their own leading emoji.
+    """
+    _, mode_label = ROUTE_TYPE_MODE.get(trip.get('route_type'), DEFAULT_ROUTE_TYPE_MODE)
+    route_name = trip.get('route_short_name') or trip['route_id']
+    direction = trip.get('trip_headsign') or trip.get('route_long_name')
+
+    label = f'{mode_label} {route_name}'
+    if direction:
+        label += f' towards {direction}'
+    return label
+
+
 def delay_color(minutes: float) -> str:
     if minutes > 5:
         return '#D64545'  # red
@@ -143,15 +157,7 @@ def _predict_leg(trip: dict, dest_stop_ids: list[str], search_departure_after: d
     return trip, pred, raw_update
 
 
-def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names,
-                      label_prefix: tuple[str, str] = ('From', 'To')) -> None:
-    """Render one leg's prediction card: leave-by banner, route badge,
-    from/to (or board/alight) stops, delay badge, departure/arrival metrics,
-    live tracking caption, confidence, summary.
-
-    `label_prefix` distinguishes a direct trip ('From'/'To') from a transfer
-    journey leg ('Board'/'Alight') — same card layout either way.
-    """
+def render_leave_by_banner(pred: dict) -> None:
     st.markdown(
         f'<div style="background:#2563eb18;border-radius:10px;padding:10px 16px;'
         f'margin-bottom:10px;">'
@@ -160,6 +166,16 @@ def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names
         unsafe_allow_html=True,
     )
 
+
+def render_card_detail(trip: dict, pred: dict, raw_update: dict | None, stop_names,
+                        label_prefix: tuple[str, str] = ('From', 'To')) -> None:
+    """Route badge, from/to (or board/alight) stops, delay badge, live
+    tracking caption, confidence, and departure/arrival — the detail
+    revealed once a card's expander is opened.
+
+    `label_prefix` distinguishes a direct trip ('From'/'To') from a transfer
+    journey leg ('Board'/'Alight') — same layout either way.
+    """
     head_col, delay_col = st.columns([3, 2])
     with head_col:
         st.markdown(f'**{route_badge(trip)}**')
@@ -171,16 +187,6 @@ def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names
         )
 
     st.write(f"{label_prefix[0]}: {trip['origin_stop_name']} → {label_prefix[1]}: {trip['dest_stop_name']}")
-
-    dep_col, arr_col = st.columns(2)
-    with dep_col:
-        st.metric(
-            'Departure',
-            prediction.format_time_ampm(trip['origin_departure_time']),
-            help=trip['origin_stop_name'],
-        )
-    with arr_col:
-        st.metric('Est. arrival', pred['estimated_arrival'], help=trip['dest_stop_name'])
 
     if raw_update is not None:
         live_stop_name = stop_names.get(raw_update['stop_id'], raw_update['stop_id'])
@@ -197,7 +203,28 @@ def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names
     if trip.get('fallback_schedule'):
         st.caption('📅 Schedule based on projected timetable — times may vary')
 
+    st.caption(
+        f"Departs {prediction.format_time_ampm(trip['origin_departure_time'])} "
+        f"→ Arrives {pred['estimated_arrival']}"
+    )
+
+
+def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names,
+                      label_prefix: tuple[str, str] = ('From', 'To'), expanded: bool = False) -> None:
+    """Render one leg's prediction card. The leave-by banner and plain
+    English summary are always visible; everything else (route badge,
+    from/to, live tracking, confidence, departure/arrival) lives inside an
+    expander so collapsed cards stay compact.
+
+    `expanded` controls the expander's initial state — True only for the
+    first card in a results list.
+    """
+    render_leave_by_banner(pred)
     st.write(pred['summary'])
+
+    label = f'🕐 Leave by {pred["leave_by"]} — {route_label_plain(trip)}'
+    with st.expander(label, expanded=expanded):
+        render_card_detail(trip, pred, raw_update, stop_names, label_prefix)
 
 
 def render_direct_trips(trips: list[dict], dest_stop_ids: list[str], departure_after: datetime,
@@ -212,34 +239,58 @@ def render_direct_trips(trips: list[dict], dest_stop_ids: list[str], departure_a
             if result is not None:
                 predicted.append(result)
 
-    for trip, pred, raw_update in predicted:
+    for idx, (trip, pred, raw_update) in enumerate(predicted):
         with st.container(border=True):
-            render_trip_card(trip, pred, raw_update, stop_names)
+            render_trip_card(trip, pred, raw_update, stop_names, expanded=(idx == 0))
 
 
 def render_transfer_journeys(journeys: list[dict], updates: dict, stop_names) -> None:
+    """Same collapsible pattern as render_trip_card, applied to a whole
+    journey: leave-by banner + journey summary (built from the first leg's
+    plain-English summary) are always visible; per-leg detail and transfer
+    connections live inside one expander per journey.
+    """
     with st.spinner('Generating predictions...'):
         for idx, journey in enumerate(journeys, start=1):
+            # Aligned 1:1 with journey['legs'] (None for a leg whose
+            # prediction failed) so transfer_points indexing below still
+            # lines up correctly even if a leg is skipped.
+            leg_predictions = [
+                _predict_leg(leg['trip'], leg['dest_stop_ids'], leg['search_departure_after'], updates)
+                for leg in journey['legs']
+            ]
+
+            first_result = next((r for r in leg_predictions if r is not None), None)
+            if first_result is None:
+                continue
+            first_trip, first_pred, _ = first_result
+
+            n = journey['num_transfers']
+            transfer_note = f"{n} transfer{'' if n == 1 else 's'}, ~{journey['total_minutes']} min total"
+
             with st.container(border=True):
-                n = journey['num_transfers']
-                st.markdown(f"### Journey {idx} ({n} transfer{'' if n == 1 else 's'})")
-                st.caption(f"Total: ~{journey['total_minutes']} min")
+                render_leave_by_banner(first_pred)
+                st.write(f"{first_pred['summary']} ({transfer_note}.)")
 
-                for leg_idx, leg in enumerate(journey['legs']):
-                    st.divider()
-                    st.markdown(f'**Leg {leg_idx + 1}**')
-                    trip = leg['trip']
+                label = (
+                    f'Journey {idx} · 🕐 Leave by {first_pred["leave_by"]} — '
+                    f'{route_label_plain(first_trip)} ({transfer_note})'
+                )
+                with st.expander(label, expanded=(idx == 1)):
+                    for leg_idx, result in enumerate(leg_predictions):
+                        if result is None:
+                            continue
+                        trip, pred, raw_update = result
+                        st.markdown(f'**Leg {leg_idx + 1}**')
+                        render_card_detail(trip, pred, raw_update, stop_names, label_prefix=('Board', 'Alight'))
 
-                    result = _predict_leg(trip, leg['dest_stop_ids'], leg['search_departure_after'], updates)
-                    if result is None:
-                        continue
-                    _, pred, raw_update = result
-                    render_trip_card(trip, pred, raw_update, stop_names, label_prefix=('Board', 'Alight'))
-
-                    if leg_idx < len(journey['transfer_points']):
-                        tp = journey['transfer_points'][leg_idx]
-                        st.divider()
-                        st.markdown(f"🔄 **Transfer at {tp['stop_name']}** — {tp['connection_minutes']} min connection")
+                        if leg_idx < len(journey['transfer_points']):
+                            tp = journey['transfer_points'][leg_idx]
+                            st.divider()
+                            st.markdown(
+                                f"🔄 **Transfer at {tp['stop_name']}** — {tp['connection_minutes']} min connection"
+                            )
+                            st.divider()
 
 
 # ── Header ────────────────────────────────────────────────────────────────
