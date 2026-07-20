@@ -332,9 +332,13 @@ def _find_trips_core(
     if merged.empty:
         return []
 
-    merged = merged.merge(
-        trips_today[['trip_id', 'route_id']], on='trip_id', how='left'
-    )
+    trip_cols = ['trip_id', 'route_id']
+    if 'trip_headsign' in trips_today.columns:
+        trip_cols.append('trip_headsign')
+    merged = merged.merge(trips_today[trip_cols], on='trip_id', how='left')
+    if 'trip_headsign' not in merged.columns:
+        merged['trip_headsign'] = None
+
     merged = merged.merge(
         data.routes[['route_id', 'route_short_name', 'route_long_name', 'route_type']],
         on='route_id', how='left',
@@ -356,6 +360,7 @@ def _find_trips_core(
             'route_short_name': row.route_short_name,
             'route_long_name': row.route_long_name,
             'route_type': row.route_type,
+            'trip_headsign': row.trip_headsign if isinstance(row.trip_headsign, str) and row.trip_headsign.strip() else None,
             'origin_stop_name': row.origin_stop_name,
             'origin_departure_time': row.origin_departure_dt.to_pydatetime(),
             'dest_stop_name': row.dest_stop_name,

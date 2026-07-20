@@ -20,8 +20,18 @@ st.set_page_config(page_title='SEQ Transit AI', page_icon='🚊', layout='center
 
 BRISBANE_TZ = ZoneInfo('Australia/Brisbane')
 
-MODE_ICON = {'tram': '🚊', 'rail': '🚆', 'bus': '🚌', 'ferry': '⛴️', 'unknown': '🚏'}
 CONFIDENCE_COLOR = {'High': '#3AA65B', 'Medium': '#E0A526', 'Low': '#8A8A8A'}
+
+# GTFS route_type -> (emoji, human-readable mode label), per the GTFS spec's
+# extended route types 0-4 (SEQ doesn't run metro, but route_type 1 is handled).
+ROUTE_TYPE_MODE = {
+    0: ('🚊', 'Tram'),
+    1: ('🚇', 'Metro'),
+    2: ('🚆', 'Train'),
+    3: ('🚌', 'Bus'),
+    4: ('⛴', 'Ferry'),
+}
+DEFAULT_ROUTE_TYPE_MODE = ('🚍', 'Transit')
 
 
 # ── Cached loaders ──────────────────────────────────────────────────────────
@@ -48,12 +58,19 @@ def get_live_updates():
 # ── Presentation helpers ─────────────────────────────────────────────────────
 
 def route_badge(trip: dict) -> str:
-    mode = prediction.MODE_BY_ROUTE_TYPE.get(trip.get('route_type'), 'unknown')
-    icon = MODE_ICON.get(mode, '🚏')
-    short_name = trip.get('route_short_name') or trip['route_id']
-    if mode == 'bus':
-        return f'{icon} Route {short_name} Bus'
-    return f'{icon} {short_name} · {mode.title()}'
+    """'[emoji] [mode] [route_short_name] towards [trip_headsign]'.
+
+    Falls back to route_long_name if trip_headsign is missing, and drops the
+    "towards ..." suffix entirely if both are missing.
+    """
+    emoji, mode_label = ROUTE_TYPE_MODE.get(trip.get('route_type'), DEFAULT_ROUTE_TYPE_MODE)
+    route_name = trip.get('route_short_name') or trip['route_id']
+    direction = trip.get('trip_headsign') or trip.get('route_long_name')
+
+    label = f'{emoji} {mode_label} {route_name}'
+    if direction:
+        label += f' towards {direction}'
+    return label
 
 
 def delay_color(minutes: float) -> str:
@@ -126,9 +143,14 @@ def _predict_leg(trip: dict, dest_stop_ids: list[str], search_departure_after: d
     return trip, pred, raw_update
 
 
-def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names) -> None:
-    """Render one leg's prediction card: leave-by banner, route badge, delay
-    badge, departure/arrival metrics, live tracking caption, confidence, summary.
+def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names,
+                      label_prefix: tuple[str, str] = ('From', 'To')) -> None:
+    """Render one leg's prediction card: leave-by banner, route badge,
+    from/to (or board/alight) stops, delay badge, departure/arrival metrics,
+    live tracking caption, confidence, summary.
+
+    `label_prefix` distinguishes a direct trip ('From'/'To') from a transfer
+    journey leg ('Board'/'Alight') — same card layout either way.
     """
     st.markdown(
         f'<div style="background:#2563eb18;border-radius:10px;padding:10px 16px;'
@@ -147,6 +169,8 @@ def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names
             badge_html(f'{pred["blended_delay_minutes"]:+.0f} min', color),
             unsafe_allow_html=True,
         )
+
+    st.write(f"{label_prefix[0]}: {trip['origin_stop_name']} → {label_prefix[1]}: {trip['dest_stop_name']}")
 
     dep_col, arr_col = st.columns(2)
     with dep_col:
@@ -205,14 +229,12 @@ def render_transfer_journeys(journeys: list[dict], updates: dict, stop_names) ->
                     st.divider()
                     st.markdown(f'**Leg {leg_idx + 1}**')
                     trip = leg['trip']
-                    st.write(f"Board: {leg['board_stop_name']} {prediction.format_time_ampm(trip['origin_departure_time'])}")
-                    st.write(f"Alight: {leg['alight_stop_name']} {prediction.format_time_ampm(trip['dest_arrival_time'])}")
 
                     result = _predict_leg(trip, leg['dest_stop_ids'], leg['search_departure_after'], updates)
                     if result is None:
                         continue
                     _, pred, raw_update = result
-                    render_trip_card(trip, pred, raw_update, stop_names)
+                    render_trip_card(trip, pred, raw_update, stop_names, label_prefix=('Board', 'Alight'))
 
                     if leg_idx < len(journey['transfer_points']):
                         tp = journey['transfer_points'][leg_idx]
