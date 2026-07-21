@@ -130,16 +130,6 @@ def _search_stops(query: str) -> list[tuple[str, dict]]:
     return [(m['stop_name'], m) for m in gtfs_data.search_stops(query, limit=10)]
 
 
-def stop_picker(label: str, key_prefix: str) -> dict | None:
-    """Live typeahead stop search. Returns the selected stop dict or None."""
-    return st_searchbox(
-        _search_stops,
-        label=label,
-        placeholder='Type a stop name...',
-        key=f'{key_prefix}_searchbox',
-    )
-
-
 def _attach_route_types(stops: list[dict]) -> list[dict]:
     """Enrich search_stops()-shaped dicts with route_types, so typed-search
     results can be color-coded by mode_picker the same way nearest_stops()
@@ -162,8 +152,8 @@ def _attach_route_types(stops: list[dict]) -> list[dict]:
 def render_from_picker() -> dict | None:
     """The 'From' field: 'Use my location' + map picker, with a typed-search
     fallback rendered through the same map picker. Returns the confirmed stop
-    dict (same shape stop_picker() returns -- has stop_id/stop_ids/stop_name)
-    once the user has tapped a candidate, or None beforehand. Confirms into
+    dict (has stop_id/stop_ids/stop_name/stop_lat/stop_lon) once the user has
+    tapped a candidate, or None beforehand. Confirms into
     st.session_state['origin_confirmed'] and offers a "Change origin" reset.
     """
     confirmed = st.session_state.get('origin_confirmed')
@@ -218,6 +208,46 @@ def render_from_picker() -> dict | None:
                 if chosen:
                     st.session_state['origin_confirmed'] = chosen
                     st.rerun()
+
+    return None
+
+
+def render_to_picker(origin_confirmed: dict) -> dict | None:
+    """The 'To' field: typed search producing destination candidates, shown
+    on the SAME map as the already-confirmed origin (rendered as a locked,
+    non-tappable pin for context). Returns the confirmed destination dict
+    (same shape render_from_picker() returns) once the user has tapped a
+    candidate, or None beforehand. Confirms into
+    st.session_state['dest_confirmed'] and offers a "Change destination"
+    reset. Click resolution goes through the same tooltip-lookup mechanism
+    as the origin picker -- no lat/lng matching.
+    """
+    confirmed = st.session_state.get('dest_confirmed')
+    if confirmed:
+        st.success(f"To: {confirmed['stop_name']} ✓")
+        if st.button('Change destination', key='dest_change_btn'):
+            st.session_state['dest_confirmed'] = None
+            st.rerun()
+        return confirmed
+
+    typed = st_searchbox(
+        _search_stops,
+        label='Search for your destination',
+        placeholder='Type a stop name...',
+        key='dest_typed_searchbox',
+    )
+    if typed:
+        candidates = _attach_route_types([typed])
+        picked_id = map_picker.render_stop_picker(
+            candidates, origin_confirmed['stop_lat'], origin_confirmed['stop_lon'], key='dest_typed_map',
+            mode_map=ROUTE_TYPE_MODE, default_mode=DEFAULT_ROUTE_TYPE_MODE,
+            locked_marker=origin_confirmed,
+        )
+        if picked_id:
+            chosen = next((c for c in candidates if c['stop_id'] == picked_id), None)
+            if chosen:
+                st.session_state['dest_confirmed'] = chosen
+                st.rerun()
 
     return None
 
@@ -400,7 +430,12 @@ except Exception as e:
 st.subheader('📍 From')
 origin = render_from_picker()
 
-dest = stop_picker('To', 'dest')
+st.subheader('🎯 To')
+if origin:
+    dest = render_to_picker(origin)
+else:
+    st.info('Set your origin first.')
+    dest = None
 
 now_brisbane = datetime.now(BRISBANE_TZ)
 
