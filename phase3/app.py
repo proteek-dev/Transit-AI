@@ -159,24 +159,22 @@ def _attach_route_types(stops: list[dict]) -> list[dict]:
     return enriched
 
 
-def render_origin_capture() -> None:
-    """Standalone origin-capture section: 'Use my location' + map picker, with
-    a typed-search fallback rendered through the same map picker. Confirms a
-    stop into st.session_state['origin_confirmed'] and offers a "Change
-    origin" reset. Does not feed into the existing search flow below it — for
-    verification only until wired in a later stage.
+def render_from_picker() -> dict | None:
+    """The 'From' field: 'Use my location' + map picker, with a typed-search
+    fallback rendered through the same map picker. Returns the confirmed stop
+    dict (same shape stop_picker() returns -- has stop_id/stop_ids/stop_name)
+    once the user has tapped a candidate, or None beforehand. Confirms into
+    st.session_state['origin_confirmed'] and offers a "Change origin" reset.
     """
-    st.subheader('📍 Origin (testing)')
-
     confirmed = st.session_state.get('origin_confirmed')
     if confirmed:
-        st.success(f"Origin: {confirmed['stop_name']} ✓")
+        st.success(f"From: {confirmed['stop_name']} ✓")
         if st.button('Change origin', key='origin_change_btn'):
             st.session_state['origin_confirmed'] = None
             st.session_state['origin_candidates'] = None
             st.session_state.pop('origin_center', None)
             st.rerun()
-        return
+        return confirmed
 
     st.caption('Use my location')
     location = streamlit_geolocation()
@@ -220,6 +218,8 @@ def render_origin_capture() -> None:
                 if chosen:
                     st.session_state['origin_confirmed'] = chosen
                     st.rerun()
+
+    return None
 
 
 def _predict_leg(trip: dict, dest_stop_ids: list[str], search_departure_after: datetime, updates: dict):
@@ -395,18 +395,12 @@ except Exception as e:
     st.error(f'Could not load the prediction model: {e}')
     st.stop()
 
-# ── Origin capture (standalone, not yet wired into search below) ───────────
-
-render_origin_capture()
-st.divider()
-
 # ── Input section ─────────────────────────────────────────────────────────
 
-col1, col2 = st.columns(2)
-with col1:
-    origin = stop_picker('From', 'origin')
-with col2:
-    dest = stop_picker('To', 'dest')
+st.subheader('📍 From')
+origin = render_from_picker()
+
+dest = stop_picker('To', 'dest')
 
 now_brisbane = datetime.now(BRISBANE_TZ)
 
