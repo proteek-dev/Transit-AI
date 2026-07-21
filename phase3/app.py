@@ -10,10 +10,12 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+from streamlit_geolocation import streamlit_geolocation
 from streamlit_searchbox import st_searchbox
 
 import gtfs_data
 import live_gtfs
+import map_picker
 import prediction
 
 st.set_page_config(page_title='SEQ Transit AI', page_icon='🚊', layout='centered')
@@ -136,6 +138,88 @@ def stop_picker(label: str, key_prefix: str) -> dict | None:
         placeholder='Type a stop name...',
         key=f'{key_prefix}_searchbox',
     )
+
+
+def _attach_route_types(stops: list[dict]) -> list[dict]:
+    """Enrich search_stops()-shaped dicts with route_types, so typed-search
+    results can be color-coded by mode_picker the same way nearest_stops()
+    candidates are.
+    """
+    data = get_gtfs_data()
+    route_type_by_route = data.routes.set_index('route_id')['route_type'].to_dict()
+    enriched = []
+    for s in stops:
+        route_types = set()
+        for sid in s['stop_ids']:
+            for r in data.stop_to_routes.get(sid, set()):
+                rt = route_type_by_route.get(r)
+                if rt is not None:
+                    route_types.add(rt)
+        enriched.append({**s, 'route_types': sorted(route_types)})
+    return enriched
+
+
+def render_origin_capture() -> None:
+    """Standalone origin-capture section: 'Use my location' + map picker, with
+    a typed-search fallback rendered through the same map picker. Confirms a
+    stop into st.session_state['origin_confirmed'] and offers a "Change
+    origin" reset. Does not feed into the existing search flow below it — for
+    verification only until wired in a later stage.
+    """
+    st.subheader('📍 Origin (testing)')
+
+    confirmed = st.session_state.get('origin_confirmed')
+    if confirmed:
+        st.success(f"Origin: {confirmed['stop_name']} ✓")
+        if st.button('Change origin', key='origin_change_btn'):
+            st.session_state['origin_confirmed'] = None
+            st.session_state['origin_candidates'] = None
+            st.session_state.pop('origin_center', None)
+            st.rerun()
+        return
+
+    st.caption('Use my location')
+    location = streamlit_geolocation()
+    has_location = location and location.get('latitude') is not None and location.get('longitude') is not None
+
+    if has_location:
+        lat, lon = location['latitude'], location['longitude']
+        if st.session_state.get('origin_center') != (lat, lon):
+            st.session_state['origin_center'] = (lat, lon)
+            st.session_state['origin_candidates'] = gtfs_data.nearest_stops(lat, lon, limit=15)
+
+        candidates = st.session_state.get('origin_candidates') or []
+        if not candidates:
+            st.info('No nearby stops found — search for your stop instead.')
+        else:
+            picked_id = map_picker.render_stop_picker(
+                candidates, lat, lon, key='origin_location_map',
+                mode_map=ROUTE_TYPE_MODE, default_mode=DEFAULT_ROUTE_TYPE_MODE,
+            )
+            if picked_id:
+                chosen = next((c for c in candidates if c['stop_id'] == picked_id), None)
+                if chosen:
+                    st.session_state['origin_confirmed'] = chosen
+                    st.rerun()
+    else:
+        st.info('Location unavailable — search for your stop instead.')
+        typed = st_searchbox(
+            _search_stops,
+            label='Search for your stop',
+            placeholder='Type a stop name...',
+            key='origin_typed_searchbox',
+        )
+        if typed:
+            candidates = _attach_route_types([typed])
+            picked_id = map_picker.render_stop_picker(
+                candidates, typed['stop_lat'], typed['stop_lon'], key='origin_typed_map',
+                mode_map=ROUTE_TYPE_MODE, default_mode=DEFAULT_ROUTE_TYPE_MODE,
+            )
+            if picked_id:
+                chosen = next((c for c in candidates if c['stop_id'] == picked_id), None)
+                if chosen:
+                    st.session_state['origin_confirmed'] = chosen
+                    st.rerun()
 
 
 def _predict_leg(trip: dict, dest_stop_ids: list[str], search_departure_after: datetime, updates: dict):
@@ -310,6 +394,11 @@ try:
 except Exception as e:
     st.error(f'Could not load the prediction model: {e}')
     st.stop()
+
+# ── Origin capture (standalone, not yet wired into search below) ───────────
+
+render_origin_capture()
+st.divider()
 
 # ── Input section ─────────────────────────────────────────────────────────
 

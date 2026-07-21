@@ -20,3 +20,6 @@ rapidfuzz
 joblib
 streamlit
 streamlit-searchbox
+streamlit-folium
+folium
+streamlit-geolocation
