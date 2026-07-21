@@ -9,8 +9,6 @@ stays usable from any origin/destination flow without a dependency on app.py.
 """
 from __future__ import annotations
 
-from math import atan2, cos, radians, sin, sqrt
-
 import folium
 from streamlit_folium import st_folium
 
@@ -24,19 +22,6 @@ _FOLIUM_COLOR_BY_MODE = {
     4: 'cadetblue',  # ferry
 }
 _DEFAULT_FOLIUM_COLOR = 'gray'
-
-# A click landing within this many km of the center marker is treated as a
-# click on "You are here", not on a candidate pin.
-_CENTER_CLICK_RADIUS_KM = 0.01
-
-
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    r = 6371.0
-    phi1, phi2 = radians(lat1), radians(lat2)
-    dphi = radians(lat2 - lat1)
-    dlambda = radians(lon2 - lon1)
-    a = sin(dphi / 2) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2) ** 2
-    return 2 * r * atan2(sqrt(a), sqrt(1 - a))
 
 
 def render_stop_picker(
@@ -63,15 +48,30 @@ def render_stop_picker(
         icon=folium.Icon(color='red', icon='user', prefix='fa'),
     ).add_to(fmap)
 
+    # Each marker's tooltip (mode + name) is unique within this candidate
+    # list and doubles as the click -> stop_id lookup key, rather than
+    # nearest-matching the click's lat/lng back to a candidate.
+    # last_object_clicked's coordinates come from Leaflet's *rendering* of the
+    # marker, and a distance-based "is this actually the center pin" guard
+    # around them is fragile: it also swallows a genuine click on the single
+    # most useful candidate whenever that candidate is very close to the
+    # user's own position (the "You are here" pin) -- exactly the stop most
+    # likely to be tapped. Reading the tooltip directly sidesteps both
+    # problems, since 'You are here' just isn't a key in this lookup.
+    tooltip_to_stop_id: dict[str, str] = {}
+
     for cand in candidates:
         route_types = cand.get('route_types') or []
         primary_mode = route_types[0] if route_types else None
         emoji, _ = mode_map.get(primary_mode, default_mode)
         mode_labels = [mode_map.get(rt, default_mode)[1] for rt in route_types] or [default_mode[1]]
 
+        tooltip = f"{emoji} {cand['stop_name']} ({'/'.join(mode_labels)})"
+        tooltip_to_stop_id[tooltip] = cand['stop_id']
+
         folium.Marker(
             [cand['stop_lat'], cand['stop_lon']],
-            tooltip=f"{emoji} {cand['stop_name']} ({'/'.join(mode_labels)})",
+            tooltip=tooltip,
             icon=folium.Icon(color=_FOLIUM_COLOR_BY_MODE.get(primary_mode, _DEFAULT_FOLIUM_COLOR), icon='info-sign'),
         ).add_to(fmap)
 
@@ -80,18 +80,8 @@ def render_stop_picker(
     if not candidates:
         return None
 
-    clicked = (map_data or {}).get('last_object_clicked')
-    if not clicked or clicked.get('lat') is None or clicked.get('lng') is None:
+    clicked_tooltip = (map_data or {}).get('last_object_clicked_tooltip')
+    if clicked_tooltip is None:
         return None
 
-    if _haversine_km(clicked['lat'], clicked['lng'], center_lat, center_lon) < _CENTER_CLICK_RADIUS_KM:
-        return None
-
-    # Candidate list is capped at ~15, so a simple nearest-match against the
-    # click's lat/lng is enough to resolve it back to a stop_id — no need for
-    # a real spatial index.
-    best = min(
-        candidates,
-        key=lambda c: _haversine_km(clicked['lat'], clicked['lng'], c['stop_lat'], c['stop_lon']),
-    )
-    return best['stop_id']
+    return tooltip_to_stop_id.get(clicked_tooltip)
