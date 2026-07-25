@@ -230,9 +230,9 @@ def _train_and_save_model() -> None:
     joblib.dump(categories, CATEGORIES_PATH)
     with open(TRAINING_METADATA_PATH, 'w') as f:
         json.dump(training_metadata, f)
-    print(f'Saved model to {MODEL_PATH}')
-    print(f'Saved categorical mappings to {CATEGORIES_PATH}')
-    print(f'Saved training coverage metadata to {TRAINING_METADATA_PATH}')
+    print(f'Saved model to {MODEL_PATH.name}')
+    print(f'Saved categorical mappings to {CATEGORIES_PATH.name}')
+    print(f'Saved training coverage metadata to {TRAINING_METADATA_PATH.name}')
 
     _upload_model_to_s3()
 

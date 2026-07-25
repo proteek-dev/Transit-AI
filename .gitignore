@@ -1,10 +1,12 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+.ruff_cache/
 venv/
 .DS_Store
 *.zip
 *.log
+logs/*.log
 .env
 
 # Local data storage — stored outside repo on Mac

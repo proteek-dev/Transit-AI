@@ -462,6 +462,20 @@ def _find_trips_core(
 _ROUTE_FAN_OUT_CAP = 15
 _STOP_CLUSTER_CAP = 50
 
+# Cap 3: at most this many alternative connecting chains are kept PER
+# destination-serving route (see _expand_route_frontier's docstring on why
+# more than one alternative must be tried at all). Without this cap, a hub
+# whose destination is served by dozens of near-duplicate route_id variants
+# (e.g. one GTFS route_id per direction/pattern on the same physical rail
+# line) combined with several independent connecting routes at the origin
+# makes the number of candidate chains grow combinatorially with BFS depth
+# (observed: 67 -> 2,014 -> 15,195 across 3 depths for one real origin/dest
+# pair) — each candidate requires a full _resolve_chain() call, so this
+# alone can make a query take minutes. Capping to the busiest few
+# alternatives per destination route keeps the fix for the premature-
+# visited-routes bug from reintroducing that blowup.
+_DEST_ROUTE_ALTERNATIVES_CAP = 3
+
 
 def _expand_route_frontier(
     data: GTFSData, frontier: list[dict], dest_routes: set, visited_routes: set,
@@ -482,12 +496,25 @@ def _expand_route_frontier(
     this, transfers at exactly those interchanges are invisible to the BFS.
 
     `visited_routes` is a global set of every route_id already reached by an
-    earlier or the current hop, mutated in place. Without it, the same route
-    gets re-discovered via every path that leads to it and the frontier grows
-    combinatorially (this previously made a 3-hop BFS at a busy hub run for
-    30+ minutes); with it, each route is expanded from at most once, so total
-    work is bounded by the size of the route network, not the number of paths
-    through it.
+    earlier or the current hop, mutated in place *for exploratory routes
+    only* (see below). Without it, the same route gets re-discovered via
+    every path that leads to it and the frontier grows combinatorially (this
+    previously made a 3-hop BFS at a busy hub run for 30+ minutes); with it,
+    each route is expanded from at most once, so total work is bounded by the
+    size of the route network, not the number of paths through it.
+
+    Completing routes (routes already in `dest_routes`) are handled
+    differently: `visited_routes` is deliberately NOT updated for them here.
+    Reaching a destination-serving route topologically doesn't guarantee
+    find_trips() can actually build a timed trip through it (wrong direction,
+    no schedule overlap, connection window too tight) — and several distinct
+    connecting routes/stations can independently reach the same destination
+    route. If the first one discovered claimed it here, an unlucky (hash-
+    randomized set iteration) processing order could permanently discard a
+    reachable destination in favor of one that fails to resolve. So every
+    chain that reaches a `dest_routes` member is returned in `completed`
+    (ranked, not deduped) and it is the *caller's* job to try them in order
+    and only mark the route settled once one resolves or all have failed.
     """
     route_to_stops = data.route_to_stops
     route_trip_counts = data.route_trip_counts
@@ -507,7 +534,12 @@ def _expand_route_frontier(
     )[:_STOP_CLUSTER_CAP]
     candidate_cluster_set = set(candidate_clusters)
 
-    completed, next_frontier = [], []
+    next_frontier = []
+    # next_route -> list of candidate chains reaching it, capped per-route at
+    # the end (Cap 3) rather than during collection, so the cap keeps the
+    # busiest few candidates regardless of which cluster/chain happens to be
+    # processed first (still not hash-order-dependent).
+    completed_by_route: dict[str, list[dict]] = {}
 
     for chain in frontier:
         last_route = chain['routes'][-1]
@@ -532,11 +564,14 @@ def _expand_route_frontier(
             # near-duplicate rail route_ids at one interchange) can otherwise
             # rank the exact direction needed well outside the top 15 by
             # trip count, hiding a real connection.
+            #
+            # Every alternative chain reaching a dest route is kept (not just
+            # the first found) — see the visited_routes note in the
+            # docstring above for why first-reach-wins is wrong here. Cap 3
+            # (applied after this loop, once all candidates are collected)
+            # bounds how many alternatives per route actually get resolved.
             for next_route in candidate_routes & dest_routes:
-                if next_route in visited_routes:
-                    continue
-                visited_routes.add(next_route)
-                completed.append(_chain_to(next_route))
+                completed_by_route.setdefault(next_route, []).append(_chain_to(next_route))
 
             # Cap 2: only the exploratory (non-destination) routes are capped
             # to the 15 busiest — this is what actually bounds how much
@@ -552,6 +587,19 @@ def _expand_route_frontier(
                     continue
                 visited_routes.add(next_route)
                 next_frontier.append(_chain_to(next_route))
+
+    # Cap 3 + deterministic trial order: per destination route, keep only the
+    # _DEST_ROUTE_ALTERNATIVES_CAP candidates with the busiest connecting
+    # route, ranked busiest-first. Bounds how many _resolve_chain() calls the
+    # caller makes per route (see the constant's comment for why this is
+    # needed) while still trying multiple alternatives, and makes trial order
+    # reproducible run to run rather than dependent on Python's hash-
+    # randomized set iteration order.
+    completed = []
+    for candidates in completed_by_route.values():
+        candidates.sort(key=lambda c: -route_trip_counts.get(c['routes'][-2], 0))
+        completed.extend(candidates[:_DEST_ROUTE_ALTERNATIVES_CAP])
+    completed.sort(key=lambda c: -route_trip_counts.get(c['routes'][-2], 0))
 
     return completed, next_frontier
 
@@ -688,15 +736,33 @@ def find_multi_leg_trips(
             break
         completed, frontier = _expand_route_frontier(data, frontier, dest_routes, visited_routes)
 
+        # `completed` may hold several competing chains that all end on the
+        # same destination-serving route (different connecting routes or
+        # transfer stations reaching it — see _expand_route_frontier's
+        # docstring). Try each, in the ranked order _expand_route_frontier
+        # already sorted them into, until one resolves; only then treat that
+        # destination route as settled for this depth, so an early candidate
+        # that fails to resolve doesn't shadow a later one that would have
+        # worked.
+        settled_routes = set()
         for chain in completed:
             if len(journeys) >= max_results:
                 break
+            terminal_route = chain['routes'][-1]
+            if terminal_route in settled_routes:
+                continue
             journey = _resolve_chain(
                 chain, origin_stop_ids, dest_stop_ids, departure_after, window_minutes,
                 min_connection, max_connection,
             )
             if journey is not None:
                 journeys.append(journey)
+                settled_routes.add(terminal_route)
+
+        # Whether or not it resolved, every destination route seen at this
+        # depth has now had every currently-known alternative tried — mark
+        # it visited so deeper depths don't keep re-attempting it.
+        visited_routes.update(chain['routes'][-1] for chain in completed)
 
         if len(journeys) >= max_results:
             break
@@ -705,18 +771,30 @@ def find_multi_leg_trips(
 
 
 def _pick_stop_group(query: str) -> dict | None:
-    """Demo helper: from search_stops results, prefer a 'station' entry (a real
-    transit hub) over a generic street stop that happens to share the name.
+    """Demo/diagnostic helper only — not used by app.py or map_picker.py.
+
+    Prefers an exact stop_name match first. Only when there's no exact match
+    does it fall back to preferring a 'station'-named result, and even then
+    only among results that are actual PREFIX matches of the query (e.g.
+    'Broadbeach South' -> 'Broadbeach South station' — a real multi-platform
+    ambiguity). Earlier this station-preference applied to ANY result
+    containing 'station', including unrelated fuzzy matches far down the
+    list (e.g. querying 'Robina Town Centre' — which has its own exact
+    match — incorrectly returned 'Indooroopilly Shopping Centre station', a
+    same-word fuzzy match with no relation to the query).
     """
     results = search_stops(query, limit=50)
     if not results:
         return None
-    exact_station = f'{query.strip().lower()} station'
+    query_lower = query.strip().lower()
     for r in results:
-        if r['stop_name'].lower() == exact_station:
+        if r['stop_name'].lower() == query_lower:
             return r
-    station_matches = [r for r in results if 'station' in r['stop_name'].lower()]
-    return station_matches[0] if station_matches else results[0]
+    prefix_matches = [r for r in results if r['stop_name'].lower().startswith(query_lower)]
+    station_matches = [r for r in prefix_matches if 'station' in r['stop_name'].lower()]
+    if station_matches:
+        return station_matches[0]
+    return prefix_matches[0] if prefix_matches else results[0]
 
 
 def _print_trip_search(label: str, origin_query: str, dest_query: str, departure_after: datetime):

@@ -13,16 +13,25 @@ from gtfs_data import find_multi_leg_trips, find_trips, search_stops
 
 
 def _pick_stop_group(query: str) -> dict | None:
-    """Prefer a 'station' entry over a generic street stop sharing the name."""
+    """Prefer an exact stop_name match; only fall back to preferring a
+    'station'-named result among genuine PREFIX matches of the query (e.g.
+    'Broadbeach South' -> 'Broadbeach South station'), never among unrelated
+    fuzzy matches further down search_stops()'s results (previously, e.g.,
+    'Robina Town Centre' incorrectly matched 'Indooroopilly Shopping Centre
+    station' via this fallback, despite an exact match existing).
+    """
     results = search_stops(query, limit=50)
     if not results:
         return None
-    exact_station = f'{query.strip().lower()} station'
+    query_lower = query.strip().lower()
     for r in results:
-        if r['stop_name'].lower() == exact_station:
+        if r['stop_name'].lower() == query_lower:
             return r
-    station_matches = [r for r in results if 'station' in r['stop_name'].lower()]
-    return station_matches[0] if station_matches else results[0]
+    prefix_matches = [r for r in results if r['stop_name'].lower().startswith(query_lower)]
+    station_matches = [r for r in prefix_matches if 'station' in r['stop_name'].lower()]
+    if station_matches:
+        return station_matches[0]
+    return prefix_matches[0] if prefix_matches else results[0]
 
 
 def run_case(label: str, origin_query: str, dest_query: str, departure_after: datetime) -> None:

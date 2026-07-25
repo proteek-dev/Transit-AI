@@ -180,6 +180,7 @@ run in parallel. Steps 6, 7, and 8 all depend on step 4's output
 ```bash
 pip install -r requirements.txt
 cp .env.example .env   # fill in AWS_S3_BUCKET, AWS_REGION, and credentials/profile
+nbstripout --install --attributes .gitattributes   # re-run once per fresh clone: registers a local git filter, not stored in the repo
 ```
 
 **Start the archiver** (or install it as a background service — see below):

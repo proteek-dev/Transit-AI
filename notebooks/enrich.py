@@ -53,7 +53,7 @@ def get_env():
     _dotenv_path = find_dotenv(usecwd=True)
     if _dotenv_path:
         load_dotenv(_dotenv_path, override=False)
-        print(f'Loaded .env from: {_dotenv_path}')
+        print('.env loaded')
     else:
         print('No .env file found — using defaults.')
 
@@ -256,19 +256,19 @@ def attach_alerts(X, scheduled_arrival_dt, snapshot_timestamp, S3_BUCKET, fs):
 
     X_out = X.copy()
 
-    X_out['route_has_alert'] = route_merged['route_has_alert'].fillna(0).astype('int8')
-    X_out['route_n_alerts'] = route_merged['route_n_alerts'].fillna(0).astype('int32')
-    X_out['route_alert_effect'] = route_merged['route_alert_effect'].fillna('NONE').astype('category')
-    X_out['is_construction_routelevel'] = route_merged['is_construction_routelevel'].fillna(False).astype('int8')
-    X_out['is_maintenance_routelevel'] = route_merged['is_maintenance_routelevel'].fillna(False).astype('int8')
-    X_out['is_rail_replacement_routelevel'] = route_merged['is_rail_replacement_routelevel'].fillna(False).astype('int8')
+    X_out['route_has_alert'] = route_merged['route_has_alert'].fillna(0).infer_objects(copy=False).astype('int8')
+    X_out['route_n_alerts'] = route_merged['route_n_alerts'].fillna(0).infer_objects(copy=False).astype('int32')
+    X_out['route_alert_effect'] = route_merged['route_alert_effect'].fillna('NONE').infer_objects(copy=False).astype('category')
+    X_out['is_construction_routelevel'] = route_merged['is_construction_routelevel'].fillna(False).infer_objects(copy=False).astype('int8')
+    X_out['is_maintenance_routelevel'] = route_merged['is_maintenance_routelevel'].fillna(False).infer_objects(copy=False).astype('int8')
+    X_out['is_rail_replacement_routelevel'] = route_merged['is_rail_replacement_routelevel'].fillna(False).infer_objects(copy=False).astype('int8')
 
-    X_out['stop_has_alert'] = stop_merged['stop_has_alert'].fillna(0).astype('int8')
-    X_out['stop_n_alerts'] = stop_merged['stop_n_alerts'].fillna(0).astype('int32')
-    X_out['stop_alert_effect'] = stop_merged['stop_alert_effect'].fillna('NONE').astype('category')
-    X_out['is_construction_stoplevel'] = stop_merged['is_construction_stoplevel'].fillna(False).astype('int8')
-    X_out['is_maintenance_stoplevel'] = stop_merged['is_maintenance_stoplevel'].fillna(False).astype('int8')
-    X_out['is_rail_replacement_stoplevel'] = stop_merged['is_rail_replacement_stoplevel'].fillna(False).astype('int8')
+    X_out['stop_has_alert'] = stop_merged['stop_has_alert'].fillna(0).infer_objects(copy=False).astype('int8')
+    X_out['stop_n_alerts'] = stop_merged['stop_n_alerts'].fillna(0).infer_objects(copy=False).astype('int32')
+    X_out['stop_alert_effect'] = stop_merged['stop_alert_effect'].fillna('NONE').infer_objects(copy=False).astype('category')
+    X_out['is_construction_stoplevel'] = stop_merged['is_construction_stoplevel'].fillna(False).infer_objects(copy=False).astype('int8')
+    X_out['is_maintenance_stoplevel'] = stop_merged['is_maintenance_stoplevel'].fillna(False).infer_objects(copy=False).astype('int8')
+    X_out['is_rail_replacement_stoplevel'] = stop_merged['is_rail_replacement_stoplevel'].fillna(False).infer_objects(copy=False).astype('int8')
 
     route_match_rate = float(X_out['route_has_alert'].mean())
     stop_match_rate = float(X_out['stop_has_alert'].mean())

@@ -8,6 +8,7 @@ matplotlib
 seaborn
 notebook
 jupyterlab
+nbstripout
 gitpython
 schedule
 pyarrow
@@ -23,3 +24,4 @@ streamlit-searchbox
 streamlit-folium
 folium
 streamlit-geolocation
+papermill
