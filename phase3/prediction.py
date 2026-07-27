@@ -11,6 +11,7 @@ import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import joblib
 import pandas as pd
@@ -21,7 +22,13 @@ import config
 import gtfs_data
 import live_gtfs
 
-MODEL_DIR = Path(__file__).parent / 'model'
+# The live app always reads/writes phase3/model/latest/. pipeline/02_train_model.sh
+# points a training run at an isolated phase3/model/_staging_{date}_{time}/
+# subdir instead via MODEL_SUBDIR_OVERRIDE, so a live model.predict() call can
+# never observe a partially-written retrain -- it promotes staging to latest/
+# only after all three artifact files are confirmed present.
+MODEL_SUBDIR = os.environ.get('MODEL_SUBDIR_OVERRIDE', 'latest')
+MODEL_DIR = Path(__file__).parent / 'model' / MODEL_SUBDIR
 MODEL_PATH = MODEL_DIR / 'xgb_v0.json'
 CATEGORIES_PATH = MODEL_DIR / 'categories.joblib'
 TRAINING_METADATA_PATH = MODEL_DIR / 'training_metadata.json'
@@ -60,8 +67,12 @@ def _get_env():
     return config.get_s3_bucket(), config.get_s3_filesystem()
 
 
+def _s3_model_prefix() -> str:
+    return f'{config.get_s3_bucket()}/phase3/model/{MODEL_SUBDIR}'
+
+
 def _s3_model_paths() -> dict:
-    prefix = f'{config.get_s3_bucket()}/phase3/model'
+    prefix = _s3_model_prefix()
     return {
         'model': f's3://{prefix}/xgb_v0.json',
         'categories': f's3://{prefix}/categories.joblib',
@@ -81,7 +92,7 @@ def _download_model_from_s3() -> bool:
         fs.get(s3_paths['model'], str(MODEL_PATH))
         fs.get(s3_paths['categories'], str(CATEGORIES_PATH))
         fs.get(s3_paths['metadata'], str(TRAINING_METADATA_PATH))
-        print(f"Downloaded model files from s3://{config.get_s3_bucket()}/phase3/model/")
+        print(f"Downloaded model files from s3://{_s3_model_prefix()}/")
         return True
     except Exception as e:
         print(f'Could not load model from S3 ({e}) — will try local files instead.')
@@ -94,7 +105,7 @@ def _upload_model_to_s3() -> None:
     fs.put(str(MODEL_PATH), s3_paths['model'])
     fs.put(str(CATEGORIES_PATH), s3_paths['categories'])
     fs.put(str(TRAINING_METADATA_PATH), s3_paths['metadata'])
-    print(f"Uploaded model files to s3://{config.get_s3_bucket()}/phase3/model/")
+    print(f"Uploaded model files to s3://{_s3_model_prefix()}/")
 
 
 def _load_training_frames():
@@ -277,6 +288,7 @@ def _build_training_metadata(X_train: pd.DataFrame) -> dict:
     coverage_counts = {f'{name}|{mode}': int(n) for (name, mode), n in counts.items()}
 
     return {
+        'trained_at': datetime.now(ZoneInfo('Australia/Brisbane')).isoformat(),
         'static_snapshot_used_for_route_names': snapshot_date,
         'coverage_counts': coverage_counts,
     }
