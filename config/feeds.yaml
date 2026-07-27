@@ -8,12 +8,28 @@ gtfs_realtime:
   vehicle_positions: "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/VehiclePositions"
   service_alerts: "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/alerts"
 
-# By mode (optional — use when you need mode-specific granularity)
+# By mode (optional — use when you need mode-specific granularity).
+# The combined feeds above already include bus/rail/ferry entities for
+# TripUpdates and VehiclePositions — tram is the one mode missing from
+# them, which is why trip_updates_tram / vehicle_positions_tram are the
+# only per-mode entries actually polled by the archiver (see
+# scripts/archive_gtfsrt.py TRAM_FEEDS). The rest are documented here for
+# reference, confirmed to exist but not currently needed.
+#
+# Confirmed NOT to exist (tested 2026-07-20): a per-mode tram ServiceAlerts
+# endpoint. "ServiceAlerts/Tram" and "alert/Tram" 400 with "not a valid
+# entityType" (the real entityType name is "Alerts", matching the combined
+# feed's lowercase "alerts" path). "Alerts/Tram" uses a valid entityType
+# and "Tram" is accepted as a valid routeType (confirmed via the distinct
+# "not a valid routeType" error for bogus values like "GCL"/"LightRail"),
+# but still 404s with BlobNotFound — no alerts blob is published for tram.
+# TransLink also has no per-mode ServiceAlerts for bus/rail/ferry either.
 gtfs_realtime_by_mode:
-  trip_updates_bus:   "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Bus"
-  trip_updates_rail:  "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Rail"
-  trip_updates_tram:  "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Tram"
-  trip_updates_ferry: "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Ferry"
+  trip_updates_bus:        "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Bus"
+  trip_updates_rail:       "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Rail"
+  trip_updates_tram:       "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Tram"
+  trip_updates_ferry:      "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates/Ferry"
+  vehicle_positions_tram:  "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/VehiclePositions/Tram"
 
 performance_data_portal: "https://www.data.qld.gov.au/dataset/translink-monthly-performance-data"
 

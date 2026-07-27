@@ -10,8 +10,9 @@ import os
 import sys
 import time
 import zipfile
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import boto3
 import requests
@@ -25,6 +26,11 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 # ── Paths ─────────────────────────────────────────────────────────────────────
 REPO_ROOT = Path(__file__).parent.parent
 CONFIG_PATH = REPO_ROOT / "config" / "feeds.yaml"
+
+# S3 date/time partitioning must stay pinned to Brisbane local time regardless
+# of the host's system timezone (was Australia/Brisbane on the old Mac, is UTC
+# on the current EC2 instance).
+TZ = ZoneInfo("Australia/Brisbane")
 
 # ── AWS ───────────────────────────────────────────────────────────────────────
 AWS_ACCESS_KEY_ID = os.environ["AWS_ACCESS_KEY_ID"]
@@ -47,9 +53,28 @@ FEEDS = CONFIG["gtfs_realtime"]
 STATIC_URL = CONFIG["gtfs_static"]["seq"]
 FETCH_INTERVAL = CONFIG["fetch_interval_seconds"]
 
+# TransLink's combined SEQ feeds do not include tram entities for
+# TripUpdates or VehiclePositions — tram is only published via these
+# dedicated per-mode endpoints, polled separately below alongside the
+# combined feeds. Keyed by feed_name so the loop below can reuse PARSERS
+# and the "{feed_name}/{date}/{time}_tram.json" S3 layout.
+#
+# No working per-mode tram ServiceAlerts endpoint exists (confirmed by
+# direct testing 2026-07-20): "ServiceAlerts/Tram" 400s as an invalid
+# entityType, and "Alerts/Tram" — the correct entityType, with "Tram"
+# accepted as a valid routeType — still 404s with BlobNotFound. Not
+# included here. See config/feeds.yaml for other per-mode endpoints
+# TransLink exposes (bus/rail/ferry TripUpdates) that aren't needed
+# because the combined feeds already carry those modes.
+_BY_MODE = CONFIG.get("gtfs_realtime_by_mode", {})
+TRAM_FEEDS = {
+    "trip_updates": _BY_MODE.get("trip_updates_tram"),
+    "vehicle_positions": _BY_MODE.get("vehicle_positions_tram"),
+}
+
 
 def log(feed: str, record_count: int, s3_key: str, status: str) -> None:
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     print(f"{ts} | {feed:<20} | records={record_count:<6} | {s3_key} | {status}")
 
 
@@ -57,7 +82,7 @@ def log(feed: str, record_count: int, s3_key: str, status: str) -> None:
 
 def parse_trip_updates(feed_message) -> list[dict]:
     records = []
-    ts = int(datetime.now().timestamp())
+    ts = int(datetime.now(TZ).timestamp())
     for entity in feed_message.entity:
         if not entity.HasField("trip_update"):
             continue
@@ -77,7 +102,7 @@ def parse_trip_updates(feed_message) -> list[dict]:
 
 def parse_vehicle_positions(feed_message) -> list[dict]:
     records = []
-    ts = int(datetime.now().timestamp())
+    ts = int(datetime.now(TZ).timestamp())
     for entity in feed_message.entity:
         if not entity.HasField("vehicle"):
             continue
@@ -95,7 +120,7 @@ def parse_vehicle_positions(feed_message) -> list[dict]:
 
 def parse_service_alerts(feed_message) -> list[dict]:
     records = []
-    ts = int(datetime.now().timestamp())
+    ts = int(datetime.now(TZ).timestamp())
     for entity in feed_message.entity:
         if not entity.HasField("alert"):
             continue
@@ -130,7 +155,7 @@ PARSERS = {
 # ── Fetch + save ──────────────────────────────────────────────────────────────
 
 def fetch_and_save(feed_name: str, url: str) -> int:
-    now = datetime.now()
+    now = datetime.now(TZ)
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H-%M-%S")
     s3_key = f"gtfs_realtime/{feed_name}/{date_str}/{time_str}.json"
@@ -154,27 +179,102 @@ def fetch_and_save(feed_name: str, url: str) -> int:
         return 0
 
 
+def fetch_and_save_tram(feed_name: str, url: str) -> int:
+    """Belt-and-suspenders poll of a dedicated per-mode tram endpoint — the
+    combined feeds above don't carry tram entities for trip_updates or
+    vehicle_positions. Same fetch/parse/save pattern as fetch_and_save(),
+    archived alongside the matching combined feed's output (same date
+    folder, "_tram" filename suffix) rather than a separate prefix. Each
+    tram feed is fetched independently here — one failing (or not being
+    configured in feeds.yaml) never blocks another or crashes the daemon.
+    """
+    tram_label = f"{feed_name}_tram"
+
+    if not url:
+        log(tram_label, 0, "-", "WARNING: no tram endpoint configured in feeds.yaml")
+        return 0
+
+    now = datetime.now(TZ)
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H-%M-%S")
+    s3_key = f"gtfs_realtime/{feed_name}/{date_str}/{time_str}_tram.json"
+
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+
+        feed_message = gtfs_realtime_pb2.FeedMessage()
+        feed_message.ParseFromString(resp.content)
+
+        records = PARSERS[feed_name](feed_message)
+        body = json.dumps(records, separators=(",", ":")).encode()
+
+        s3.put_object(Bucket=AWS_S3_BUCKET, Key=s3_key, Body=body)
+        log(tram_label, len(records), s3_key, "OK")
+        return len(records)
+
+    except Exception as e:
+        log(tram_label, 0, s3_key, f"WARNING: {e}")
+        return 0
+
+
 # ── Static GTFS ───────────────────────────────────────────────────────────────
 
+# What a complete SEQ_GTFS.zip extraction actually contains — confirmed by
+# listing every complete gtfs_static/{date}/ snapshot currently in S3
+# (2026-06-28, 07-01, 07-08, 07-19, 07-20: all 9, consistently). Used to
+# tell a genuinely-complete snapshot apart from a partial one left behind by
+# an interrupted upload (e.g. a mid-loop service restart) — the old check
+# only tested whether ANY file existed under the date prefix, so a partial
+# snapshot looked "already downloaded" and was never retried.
+STATIC_GTFS_FILES = [
+    "agency.txt", "calendar.txt", "calendar_dates.txt", "feed_info.txt",
+    "routes.txt", "shapes.txt", "stop_times.txt", "stops.txt", "trips.txt",
+]
+
+
 def maybe_download_static_gtfs() -> None:
-    today = date.today().strftime("%Y-%m-%d")
+    today = datetime.now(TZ).date().strftime("%Y-%m-%d")
     prefix = f"gtfs_static/{today}/"
 
-    existing = s3.list_objects_v2(Bucket=AWS_S3_BUCKET, Prefix=prefix, MaxKeys=1)
-    if existing.get("KeyCount", 0) > 0:
+    existing_keys = {
+        obj["Key"].rsplit("/", 1)[-1]
+        for obj in s3.list_objects_v2(Bucket=AWS_S3_BUCKET, Prefix=prefix).get("Contents", [])
+    }
+    missing = [name for name in STATIC_GTFS_FILES if name not in existing_keys]
+    if not missing:
         return
+    if existing_keys:
+        print(f"[static] {today} snapshot is incomplete (missing {missing}) -- re-downloading")
 
     print(f"\n[static] Downloading SEQ_GTFS.zip for {today} ...")
+    staging_prefix = f"gtfs_static/_staging_{today}/"
     try:
         resp = requests.get(STATIC_URL, timeout=120, stream=True)
         resp.raise_for_status()
 
         zip_bytes = io.BytesIO(resp.content)
         with zipfile.ZipFile(zip_bytes) as z:
-            for name in z.namelist():
-                s3_key = f"gtfs_static/{today}/{name}"
-                s3.put_object(Bucket=AWS_S3_BUCKET, Key=s3_key, Body=z.read(name))
-                print(f"[static] Uploaded {s3_key}")
+            names = z.namelist()
+            for name in names:
+                staging_key = f"{staging_prefix}{name}"
+                s3.put_object(Bucket=AWS_S3_BUCKET, Key=staging_key, Body=z.read(name))
+                print(f"[static] Staged {staging_key}")
+
+        # Only promote into the real prefix once every file has staged
+        # successfully -- an interruption (e.g. a service restart) above
+        # this point leaves only the (unread-by-anyone) staging prefix
+        # incomplete, never gtfs_static/{today}/ itself.
+        for name in names:
+            s3.copy_object(
+                Bucket=AWS_S3_BUCKET,
+                CopySource={"Bucket": AWS_S3_BUCKET, "Key": f"{staging_prefix}{name}"},
+                Key=f"{prefix}{name}",
+            )
+            print(f"[static] Promoted {prefix}{name}")
+
+        for name in names:
+            s3.delete_object(Bucket=AWS_S3_BUCKET, Key=f"{staging_prefix}{name}")
 
         print(f"[static] Extracted to s3://{AWS_S3_BUCKET}/{prefix} OK")
     except Exception as e:
@@ -244,6 +344,9 @@ def main() -> None:
     while True:
         for feed_name, url in FEEDS.items():
             fetch_and_save(feed_name, url)
+
+        for feed_name, url in TRAM_FEEDS.items():
+            fetch_and_save_tram(feed_name, url)
 
         download_performance_data(CONFIG)
 

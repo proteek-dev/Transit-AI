@@ -8,6 +8,7 @@ matplotlib
 seaborn
 notebook
 jupyterlab
+nbstripout
 gitpython
 schedule
 pyarrow
@@ -15,4 +16,13 @@ python-dotenv
 boto3
 s3fs==2025.10.0
 xgboost
+psutil
 scikit-learn
+rapidfuzz
+joblib
+streamlit
+streamlit-searchbox
+streamlit-folium
+folium
+streamlit-geolocation
+papermill
