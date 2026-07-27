@@ -36,6 +36,8 @@ log "=========================================="
 # ── Step 1/2: clear stale model artifacts (forces a real retrain) ───────────
 log "STEP 1/2: Clearing old model artifacts"
 
+# rm -rf treats a missing directory as success (that's what -f means), so
+# this is already idempotent whether or not phase3/model/ exists locally.
 rm -rf phase3/model/ && log "  Cleared local phase3/model/"
 
 python3 -c "
@@ -51,8 +53,17 @@ import config
 # creds live only in .env, not the shell environment.
 fs = config.get_s3_filesystem()
 bucket = config.get_s3_bucket()
-fs.rm(f'{bucket}/phase3/model/', recursive=True)
-print(f'Cleared S3 model artifacts at s3://{bucket}/phase3/model/')
+prefix = f'{bucket}/phase3/model/'
+
+# fs.rm() raises FileNotFoundError if the prefix doesn't exist, rather than
+# treating 'nothing to delete' as success -- a legitimate state whenever a
+# previous run's retrain step failed after this clearing step already ran.
+# Check first and skip the rm() call entirely if there's nothing there.
+if fs.exists(prefix):
+    fs.rm(prefix, recursive=True)
+    print(f'Cleared S3 model artifacts at s3://{prefix}')
+else:
+    print(f'S3 model artifacts already absent at s3://{prefix} -- nothing to clear')
 " >> "$LOG" 2>&1 || fail "clearing S3 model artifacts"
 
 log "STEP 1/2 complete."

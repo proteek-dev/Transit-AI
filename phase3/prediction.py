@@ -8,11 +8,13 @@ into a rider-facing summary.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import joblib
 import pandas as pd
+import psutil
 import xgboost as xgb
 
 import config
@@ -45,6 +47,13 @@ _cache: dict = {}
 def format_time_ampm(dt: datetime) -> str:
     """Format a datetime as rider-facing 'HH:MM AM/PM', e.g. '09:20 PM'."""
     return dt.strftime('%I:%M %p')
+
+
+def _log_mem(label: str) -> None:
+    """Debug checkpoint: current process RSS, so a slow/OOM-prone training
+    run can be narrowed down to a specific stage without a profiler."""
+    rss_mb = psutil.Process().memory_info().rss / 1e6
+    print(f'[MEM] {label}: {rss_mb:,.1f} MB RSS')
 
 
 def _get_env():
@@ -106,22 +115,79 @@ def _load_training_frames():
 
     df = pd.read_parquet(load_path)
     print(f'Loaded {len(df):,} rows x {df.shape[1]} cols')
+    _log_mem('after data load')
+
+    # --- Debug-only: sample down before any dtype conversion so the entire
+    # downstream path (dtype optimization, DMatrix construction, fit, save)
+    # runs against a small dataset in seconds instead of the full ~62M-row
+    # snapshot. Unset (or 1.0) means full data -- the default, normal path.
+    debug_sample_frac = float(os.environ.get('DEBUG_SAMPLE_FRAC', 1.0))
+    if debug_sample_frac < 1.0:
+        n_before_sample = len(df)
+        df = df.sample(frac=debug_sample_frac, random_state=42)
+        print(f'[DEBUG_SAMPLE_FRAC={debug_sample_frac}] Sampling active -- '
+              f'{n_before_sample:,} rows -> {len(df):,} rows')
+
+    # --- Memory footprint reduction: downcast float64 -> float32, and
+    # convert repeating low-cardinality string/object columns to category
+    # dtype. Pure memory optimization on the raw ~62M-row snapshot -- no
+    # modeling logic, feature selection, or hyperparameters change here.
+    # Columns XGBoost needs as true numeric for splitting (delay_minutes,
+    # stop_sequence) are downcast in place but never categorized;
+    # scheduled_arrival_time stays a string (parsed via .str below, and
+    # never reaches XGBoost -- dropped before X is built).
+    mem_before = df.memory_usage(deep=True).sum()
+
+    float64_cols = df.select_dtypes(include='float64').columns
+    for c in float64_cols:
+        df[c] = df[c].astype('float32')
+
+    category_cols = ['route_id', 'stop_id', 'mode', 'day_of_week', 'source_date', 'trip_id']
+    for c in category_cols:
+        if c in df.columns and df[c].dtype == object:
+            df[c] = df[c].astype('category')
+
+    mem_after = df.memory_usage(deep=True).sum()
+    print(f'Memory usage: {mem_before / 1e6:,.1f} MB -> {mem_after / 1e6:,.1f} MB '
+          f'({(1 - mem_after / mem_before) * 100:.1f}% reduction)')
+    _log_mem('after dtype optimization')
 
     # --- Cell 3: leakage filter ---
-    time_parts = df['scheduled_arrival_time'].str.split(':', expand=True).astype(int)
-    offset = (
-        pd.to_timedelta(time_parts[0], unit='h')
-        + pd.to_timedelta(time_parts[1], unit='m')
-        + pd.to_timedelta(time_parts[2], unit='s')
-    )
+    _log_mem('before leakage filter')
+    # pd.to_datetime with an explicit format parses in vectorized C code with
+    # no per-row Python objects, unlike .str.split(), which allocates a
+    # Python list + string per row at 50M+ row scale. GTFS times can have
+    # hours >= 24 for past-midnight trips, which %H (00-23) rejects --
+    # errors='coerce' turns those rows into NaT for free, which doubles as
+    # the mask for a small divmod-based fallback on just that subset.
+    raw_time = df['scheduled_arrival_time']
+    parsed = pd.to_datetime(raw_time, format='%H:%M:%S', errors='coerce')
+    offset = parsed - parsed.dt.normalize()
+
+    past_midnight = parsed.isna()
+    if past_midnight.any():
+        hh = raw_time.loc[past_midnight].str.slice(0, 2).astype(int)
+        rest = raw_time.loc[past_midnight].str.slice(2)
+        days, hh_mod = divmod(hh, 24)
+        wrapped_time = hh_mod.astype(str).str.zfill(2) + rest
+        fixed_parsed = pd.to_datetime(wrapped_time, format='%H:%M:%S')
+        # `days` is added back as a standalone Timedelta rather than folded
+        # into fixed_parsed's date -- .dt.normalize() would otherwise
+        # re-derive midnight from the shifted date and cancel it out.
+        offset.loc[past_midnight] = (
+            (fixed_parsed - fixed_parsed.dt.normalize()) + pd.to_timedelta(days, unit='D')
+        )
+
     source_date_midnight = pd.to_datetime(df['source_date'].astype(str)).dt.tz_localize('Australia/Brisbane')
     scheduled_arrival_dt = source_date_midnight + offset
+    _log_mem('after scheduled_arrival_dt construction')
 
     leak_mask = df['snapshot_timestamp'] >= scheduled_arrival_dt
     n_dropped = int(leak_mask.sum())
     df = df.loc[~leak_mask].copy()
     scheduled_arrival_dt = scheduled_arrival_dt.loc[~leak_mask]
     print(f'Leakage filter: dropped {n_dropped:,} rows (post-arrival captures)')
+    _log_mem('after leakage filter')
 
     # --- Cell 4: re-derive hour_of_day / day_of_week / is_weekend / is_peak ---
     df['hour_of_day'] = scheduled_arrival_dt.dt.hour.astype('int32')
@@ -131,13 +197,19 @@ def _load_training_frames():
 
     # --- Cell 5: target + feature matrix ---
     df = df.dropna(subset=['delay_minutes']).copy()
-    y = df['delay_minutes'].astype('float64')
+    y = df['delay_minutes'].astype('float32')  # already float32 from the downcast above; explicit for clarity
 
     X = df[FEATURE_COLS + ['source_date']].copy()
     X['source_date'] = X['source_date'].astype(str)
     for c in CATEGORICAL_COLS:
-        X[c] = X[c].astype('category')
-    X['stop_sequence'] = X['stop_sequence'].astype('float64')
+        # astype('category') on an ALREADY-categorical column (df[c] may be
+        # category dtype from the memory-optimization pass above) does not
+        # drop categories no longer present after the leakage filter/split --
+        # remove_unused_categories() keeps the persisted category vocabulary
+        # identical to what it would be without that earlier optimization
+        # (i.e. exactly X_train's own values, not a superset).
+        X[c] = X[c].astype('category').cat.remove_unused_categories()
+    X['stop_sequence'] = X['stop_sequence'].astype('float32')
     X['is_weekend'] = X['is_weekend'].astype('int8')
     X['is_peak'] = X['is_peak'].astype('int8')
 
@@ -220,7 +292,9 @@ def _train_and_save_model() -> None:
         random_state=42,
         n_jobs=-1,
     )
+    _log_mem('before DMatrix construction')
     model.fit(X_train, y_train)
+    _log_mem('after fit completes')
     print('Training complete.')
 
     training_metadata = _build_training_metadata(X_train)

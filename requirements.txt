@@ -16,6 +16,7 @@ python-dotenv
 boto3
 s3fs==2025.10.0
 xgboost
+psutil
 scikit-learn
 rapidfuzz
 joblib
