@@ -373,7 +373,7 @@ def _get_categories() -> dict:
     return _cache['categories']
 
 
-def build_features(trip_info: dict, departure_time: datetime) -> pd.DataFrame:
+def build_features(trip_info: dict, departure_time: datetime) -> tuple[pd.DataFrame, bool]:
     """Build one feature row matching notebook 07's training schema exactly.
 
     trip_info must supply route_id, stop_id, stop_sequence (the destination
@@ -383,6 +383,13 @@ def build_features(trip_info: dict, departure_time: datetime) -> pd.DataFrame:
     derived from — notebook 07 re-derives these from scheduled_arrival_time,
     not capture time, so this should be the trip's scheduled time, not
     wall-clock "now".
+
+    Returns (X, stop_id_is_oov). stop_id_is_oov is True when trip_info['stop_id']
+    isn't in the trained stop_id vocabulary -- pd.Categorical() below silently
+    encodes an out-of-vocabulary stop_id as NaN, which XGBoost still produces a
+    prediction for (via its learned default split direction) rather than
+    erroring, so callers need this signal to flag the result as lower-confidence
+    instead of it looking like a normal, fully-informed prediction.
     """
     categories = _get_categories()
 
@@ -407,6 +414,8 @@ def build_features(trip_info: dict, departure_time: datetime) -> pd.DataFrame:
     }
     X = pd.DataFrame([row])
 
+    stop_id_is_oov = trip_info['stop_id'] not in categories['stop_id']
+
     for c in CATEGORICAL_COLS:
         X[c] = pd.Categorical(X[c], categories=categories[c])
     X['hour_of_day'] = X['hour_of_day'].astype('int32')
@@ -417,7 +426,7 @@ def build_features(trip_info: dict, departure_time: datetime) -> pd.DataFrame:
     # inconsistently at inference time if fed float64 columns.
     X['stop_sequence'] = X['stop_sequence'].astype('float32')
 
-    return X[FEATURE_COLS]
+    return X[FEATURE_COLS], stop_id_is_oov
 
 
 def enrich_trip_with_dest_stop(trip: dict, dest_stop_ids: list[str]) -> dict:
@@ -446,7 +455,7 @@ def predict_delay(trip_info: dict, departure_time: datetime, live_delay: dict | 
     model = load_model()
     training_metadata = _get_training_metadata()
 
-    X = build_features(trip_info, departure_time)
+    X, stop_id_is_oov = build_features(trip_info, departure_time)
     predicted_delay_minutes = float(model.predict(X)[0])
 
     mode = trip_info.get('mode') or MODE_BY_ROUTE_TYPE.get(trip_info.get('route_type'), 'unknown')
@@ -463,6 +472,15 @@ def predict_delay(trip_info: dict, departure_time: datetime, live_delay: dict | 
         live_delay_minutes = None
         blended_delay_minutes = predicted_delay_minutes
         confidence = 'Medium' if well_represented else 'Low'
+
+    # Override, not a replacement: an out-of-vocabulary stop_id encodes as NaN
+    # in build_features() and still produces a real prediction from XGBoost's
+    # learned default split direction, but the route+mode coverage_counts
+    # heuristic above has no way to know that happened -- without this, a
+    # well-represented route with an OOV destination stop would report the
+    # same confidence as a fully in-vocabulary prediction.
+    if stop_id_is_oov:
+        confidence = 'Low'
 
     scheduled_arrival = trip_info['dest_arrival_time']
     estimated_arrival = scheduled_arrival + timedelta(minutes=blended_delay_minutes)
