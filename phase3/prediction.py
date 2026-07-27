@@ -400,7 +400,10 @@ def build_features(trip_info: dict, departure_time: datetime) -> pd.DataFrame:
     X['hour_of_day'] = X['hour_of_day'].astype('int32')
     X['is_weekend'] = X['is_weekend'].astype('int8')
     X['is_peak'] = X['is_peak'].astype('int8')
-    X['stop_sequence'] = X['stop_sequence'].astype('float64')
+    # float32 to match the training-time downcast (_load_training_frames /
+    # X_train['stop_sequence']) -- a model fit on float32 can behave
+    # inconsistently at inference time if fed float64 columns.
+    X['stop_sequence'] = X['stop_sequence'].astype('float32')
 
     return X[FEATURE_COLS]
 
