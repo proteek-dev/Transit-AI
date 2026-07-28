@@ -21,6 +21,12 @@ DAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
 STATIC_FILES = ['stops.txt', 'stop_times.txt', 'trips.txt', 'routes.txt',
                 'calendar.txt', 'calendar_dates.txt']
 
+# Ferry is out of scope everywhere except the raw S3 archiver
+# (scripts/archive_gtfsrt.py, untouched) -- routes, trips, stop_times, and
+# stops are all filtered against this in load() so no ferry service can ever
+# reach search, BFS transfer routing, or prediction downstream.
+FERRY_ROUTE_TYPE = 4
+
 # Sunday/thin-calendar fallback: a query date within this many days of the
 # static snapshot's capture date is where TransLink's calendar_dates.txt
 # additions (e.g. special Sunday services) are least likely to be published
@@ -81,17 +87,50 @@ class GTFSData:
             path = f's3://{static_prefix}/{self.snapshot_date}/{name}'
             frames[name] = pd.read_csv(path, dtype=str)
 
-        self.stops = frames['stops.txt']
+        # --- Ferry exclusion, in dependency order (routes -> trips ->
+        # stop_times -> stops) -- see FERRY_ROUTE_TYPE above. Filtering here,
+        # before _build_stop_index()/_build_route_indexes() run, means every
+        # downstream structure (search index, stop_to_routes, route_to_stops,
+        # cluster_to_routes) is ferry-free by construction, with no separate
+        # filtering needed at the search/BFS call sites themselves. ---
+        routes_raw = frames['routes.txt']
+        routes_raw = routes_raw.assign(route_type=routes_raw['route_type'].astype(int))
+        ferry_route_ids = set(routes_raw.loc[routes_raw['route_type'] == FERRY_ROUTE_TYPE, 'route_id'])
+        self.routes = routes_raw[routes_raw['route_type'] != FERRY_ROUTE_TYPE].reset_index(drop=True)
+
+        trips_raw = frames['trips.txt']
+        self.trips = trips_raw[~trips_raw['route_id'].isin(ferry_route_ids)].reset_index(drop=True)
+        non_ferry_trip_ids = set(self.trips['trip_id'])
+
+        stop_times_raw = frames['stop_times.txt']
+        stop_times_raw = stop_times_raw.assign(
+            stop_sequence=stop_times_raw['stop_sequence'].astype(int)
+        )
+        self.stop_times = stop_times_raw[
+            stop_times_raw['trip_id'].isin(non_ferry_trip_ids)
+        ].reset_index(drop=True)
+        non_ferry_stop_ids = set(self.stop_times['stop_id'])
+
+        stops_raw = frames['stops.txt']
+        # Keep any parent_station referenced by a surviving stop too, so
+        # _build_stop_index()'s canonical-name lookup (parent id -> parent
+        # name) still resolves for stops that share a hub with a kept mode
+        # (e.g. a train platform's parent station record).
+        kept_parent_ids = set(
+            stops_raw.loc[stops_raw['stop_id'].isin(non_ferry_stop_ids), 'parent_station'].dropna()
+        )
+        keep_stop_ids = non_ferry_stop_ids | kept_parent_ids
+        self.stops = stops_raw[stops_raw['stop_id'].isin(keep_stop_ids)].reset_index(drop=True)
         self.stops['stop_lat'] = self.stops['stop_lat'].astype(float)
         self.stops['stop_lon'] = self.stops['stop_lon'].astype(float)
 
-        self.stop_times = frames['stop_times.txt']
-        self.stop_times['stop_sequence'] = self.stop_times['stop_sequence'].astype(int)
-
-        self.trips = frames['trips.txt']
-
-        self.routes = frames['routes.txt']
-        self.routes['route_type'] = self.routes['route_type'].astype(int)
+        print(
+            f'Excluded ferry (route_type={FERRY_ROUTE_TYPE}): '
+            f'{len(ferry_route_ids):,} route(s), '
+            f'{len(trips_raw) - len(self.trips):,} trip(s), '
+            f'{len(stop_times_raw) - len(self.stop_times):,} stop_time row(s), '
+            f'{len(stops_raw) - len(self.stops):,} ferry-only stop(s)'
+        )
 
         self.calendar = frames['calendar.txt']
         for day in DAY_NAMES:

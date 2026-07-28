@@ -125,7 +125,9 @@ def _load_training_frames():
     print(f'Loading training snapshot: run_date={run_date}')
 
     df = pd.read_parquet(load_path)
+    rows_loaded = len(df)
     print(f'Loaded {len(df):,} rows x {df.shape[1]} cols')
+    print(f'[ROW ACCOUNTING] 1. Loaded from ferry-filtered S3 snapshot: {rows_loaded:,} rows')
     _log_mem('after data load')
 
     # --- Debug-only: sample down before any dtype conversion so the entire
@@ -138,6 +140,10 @@ def _load_training_frames():
         df = df.sample(frac=debug_sample_frac, random_state=42)
         print(f'[DEBUG_SAMPLE_FRAC={debug_sample_frac}] Sampling active -- '
               f'{n_before_sample:,} rows -> {len(df):,} rows')
+    rows_after_sample = len(df)
+    if debug_sample_frac < 1.0:
+        print(f'[ROW ACCOUNTING] 1b. After debug sample (frac={debug_sample_frac}): '
+              f'{rows_after_sample:,} rows ({rows_loaded - rows_after_sample:,} dropped by sampling)')
 
     # --- Memory footprint reduction: downcast float64 -> float32, and
     # convert repeating low-cardinality string/object columns to category
@@ -165,6 +171,7 @@ def _load_training_frames():
 
     # --- Cell 3: leakage filter ---
     _log_mem('before leakage filter')
+    rows_before_leakage_filter = len(df)
     # pd.to_datetime with an explicit format parses in vectorized C code with
     # no per-row Python objects, unlike .str.split(), which allocates a
     # Python list + string per row at 50M+ row scale. GTFS times can have
@@ -197,7 +204,10 @@ def _load_training_frames():
     n_dropped = int(leak_mask.sum())
     df = df.loc[~leak_mask].copy()
     scheduled_arrival_dt = scheduled_arrival_dt.loc[~leak_mask]
+    rows_after_leakage_filter = len(df)
     print(f'Leakage filter: dropped {n_dropped:,} rows (post-arrival captures)')
+    print(f'[ROW ACCOUNTING] 2. After leakage filter: {rows_before_leakage_filter:,} -> '
+          f'{rows_after_leakage_filter:,} rows ({n_dropped:,} dropped)')
     _log_mem('after leakage filter')
 
     # --- Cell 4: re-derive hour_of_day / day_of_week / is_weekend / is_peak ---
@@ -207,7 +217,11 @@ def _load_training_frames():
     df['is_peak'] = (~df['is_weekend']) & df['hour_of_day'].isin([7, 8, 16, 17])
 
     # --- Cell 5: target + feature matrix ---
+    rows_before_dropna = len(df)
     df = df.dropna(subset=['delay_minutes']).copy()
+    rows_after_dropna = len(df)
+    print(f'[ROW ACCOUNTING] 3. After dropna(delay_minutes): {rows_before_dropna:,} -> '
+          f'{rows_after_dropna:,} rows ({rows_before_dropna - rows_after_dropna:,} dropped)')
     y = df['delay_minutes'].astype('float32')  # already float32 from the downcast above; explicit for clarity
 
     X = df[FEATURE_COLS + ['source_date']].copy()
@@ -234,7 +248,30 @@ def _load_training_frames():
 
     X_train = X.loc[train_mask, FEATURE_COLS].copy()
     y_train = y.loc[train_mask]
+    n_train = len(X_train)
+    n_test = int(total_rows) - n_train
     print(f'Train: {len(X_train):,} rows (boundary date {boundary_date})')
+    print(f'[ROW ACCOUNTING] 4. Temporal split: {int(total_rows):,} rows -> '
+          f'train={n_train:,}, test={n_test:,} (boundary date {boundary_date})')
+
+    print('=' * 70)
+    print('Row accounting: loaded -> final train/test split')
+    print('=' * 70)
+    print(f'  1. Rows loaded from ferry-filtered snapshot : {rows_loaded:,}')
+    if debug_sample_frac < 1.0:
+        print(f'  1b. After debug sample (frac={debug_sample_frac})     : '
+              f'{rows_after_sample:,} ({rows_loaded - rows_after_sample:,} dropped by sampling)')
+    print(f'  2. After leakage filter                     : {rows_after_leakage_filter:,} '
+          f'({rows_after_sample - rows_after_leakage_filter:,} dropped)')
+    print(f'  3. After dropna(delay_minutes)               : {rows_after_dropna:,} '
+          f'({rows_after_leakage_filter - rows_after_dropna:,} dropped)')
+    print(f'  4. Final split: train={n_train:,} + test={n_test:,} = {n_train + n_test:,}')
+    if (n_train + n_test) != rows_after_dropna:
+        print(f'  WARNING: train+test ({n_train + n_test:,}) does not match post-dropna '
+              f'count ({rows_after_dropna:,}) -- gap of '
+              f'{rows_after_dropna - (n_train + n_test):,} row(s) is unexplained by any stage above.')
+    else:
+        print('  No gap: train+test exactly matches the post-dropna row count.')
 
     # Persisted alongside the model: the exact category->code mapping used at
     # fit time, so inference-time categorical columns can be reconstructed
