@@ -117,3 +117,63 @@ def render_stop_picker(
         return None
 
     return tooltip_to_stop_id.get(clicked_tooltip)
+
+
+def render_route_map(
+    legs: list[dict],
+    origin: dict,
+    dest: dict,
+    key: str,
+    zoom_start: int = 13,
+) -> None:
+    """Display-only map of a selected journey: one folium.PolyLine per leg
+    in `legs`, plus start (origin) / end (dest) markers. Fits bounds to
+    cover every leg's points, not just origin/dest, so the whole path is
+    visible. Unlike render_stop_picker(), there's no click resolution here
+    -- this map is read-only.
+
+    Each leg dict needs `points` (list of (lat, lon) tuples) and `color`;
+    `label`, if present, becomes the polyline's tooltip. A leg with empty
+    or missing `points` just has its line skipped -- doesn't fail the
+    whole map.
+
+    `origin`/`dest` are confirmed-stop dicts (same shape render_from_picker()/
+    render_to_picker() return) used for the start/end markers.
+    """
+    fmap = folium.Map(location=[origin['stop_lat'], origin['stop_lon']], zoom_start=zoom_start)
+
+    bound_points = [
+        [origin['stop_lat'], origin['stop_lon']],
+        [dest['stop_lat'], dest['stop_lon']],
+    ]
+
+    for leg in legs:
+        points = leg.get('points')
+        if not points:
+            continue
+        folium.PolyLine(
+            points, color=leg.get('color', _DEFAULT_FOLIUM_COLOR),
+            weight=5, opacity=0.8, tooltip=leg.get('label'),
+        ).add_to(fmap)
+        bound_points += [[lat, lon] for lat, lon in points]
+
+    # Reuses the locked_marker's "confirmed stop" icon style from
+    # render_stop_picker() above -- darkgreen lock -- for the origin, and a
+    # visually distinct flag for the destination, rather than the plain
+    # candidate-pin style (which implies "tappable", and neither marker is).
+    folium.Marker(
+        [origin['stop_lat'], origin['stop_lon']],
+        tooltip=f"🔒 {origin['stop_name']} (origin)",
+        icon=folium.Icon(color='darkgreen', icon='lock', prefix='fa'),
+    ).add_to(fmap)
+    folium.Marker(
+        [dest['stop_lat'], dest['stop_lon']],
+        tooltip=f"🏁 {dest['stop_name']} (destination)",
+        icon=folium.Icon(color='red', icon='flag-checkered', prefix='fa'),
+    ).add_to(fmap)
+
+    lats = [p[0] for p in bound_points]
+    lons = [p[1] for p in bound_points]
+    fmap.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
+
+    st_folium(fmap, height=420, use_container_width=True, key=key, returned_objects=[])

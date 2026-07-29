@@ -19,7 +19,13 @@ DATE_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 DAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 
 STATIC_FILES = ['stops.txt', 'stop_times.txt', 'trips.txt', 'routes.txt',
-                'calendar.txt', 'calendar_dates.txt']
+                'calendar.txt', 'calendar_dates.txt', 'shapes.txt']
+
+# Ferry is out of scope everywhere except the raw S3 archiver
+# (scripts/archive_gtfsrt.py, untouched) -- routes, trips, stop_times, and
+# stops are all filtered against this in load() so no ferry service can ever
+# reach search, BFS transfer routing, or prediction downstream.
+FERRY_ROUTE_TYPE = 4
 
 # Sunday/thin-calendar fallback: a query date within this many days of the
 # static snapshot's capture date is where TransLink's calendar_dates.txt
@@ -60,6 +66,7 @@ class GTFSData:
         self.stop_to_cluster = None    # stop_id -> canonical station name
         self.cluster_to_routes = None  # canonical station name -> set of route_id
         self.cluster_stop_ids = None   # canonical station name -> list of stop_id
+        self.shape_points = None       # shape_id -> ordered list of (lat, lon), built at load time
 
     def load(self):
         bucket, fs = _get_env()
@@ -81,17 +88,50 @@ class GTFSData:
             path = f's3://{static_prefix}/{self.snapshot_date}/{name}'
             frames[name] = pd.read_csv(path, dtype=str)
 
-        self.stops = frames['stops.txt']
+        # --- Ferry exclusion, in dependency order (routes -> trips ->
+        # stop_times -> stops) -- see FERRY_ROUTE_TYPE above. Filtering here,
+        # before _build_stop_index()/_build_route_indexes() run, means every
+        # downstream structure (search index, stop_to_routes, route_to_stops,
+        # cluster_to_routes) is ferry-free by construction, with no separate
+        # filtering needed at the search/BFS call sites themselves. ---
+        routes_raw = frames['routes.txt']
+        routes_raw = routes_raw.assign(route_type=routes_raw['route_type'].astype(int))
+        ferry_route_ids = set(routes_raw.loc[routes_raw['route_type'] == FERRY_ROUTE_TYPE, 'route_id'])
+        self.routes = routes_raw[routes_raw['route_type'] != FERRY_ROUTE_TYPE].reset_index(drop=True)
+
+        trips_raw = frames['trips.txt']
+        self.trips = trips_raw[~trips_raw['route_id'].isin(ferry_route_ids)].reset_index(drop=True)
+        non_ferry_trip_ids = set(self.trips['trip_id'])
+
+        stop_times_raw = frames['stop_times.txt']
+        stop_times_raw = stop_times_raw.assign(
+            stop_sequence=stop_times_raw['stop_sequence'].astype(int)
+        )
+        self.stop_times = stop_times_raw[
+            stop_times_raw['trip_id'].isin(non_ferry_trip_ids)
+        ].reset_index(drop=True)
+        non_ferry_stop_ids = set(self.stop_times['stop_id'])
+
+        stops_raw = frames['stops.txt']
+        # Keep any parent_station referenced by a surviving stop too, so
+        # _build_stop_index()'s canonical-name lookup (parent id -> parent
+        # name) still resolves for stops that share a hub with a kept mode
+        # (e.g. a train platform's parent station record).
+        kept_parent_ids = set(
+            stops_raw.loc[stops_raw['stop_id'].isin(non_ferry_stop_ids), 'parent_station'].dropna()
+        )
+        keep_stop_ids = non_ferry_stop_ids | kept_parent_ids
+        self.stops = stops_raw[stops_raw['stop_id'].isin(keep_stop_ids)].reset_index(drop=True)
         self.stops['stop_lat'] = self.stops['stop_lat'].astype(float)
         self.stops['stop_lon'] = self.stops['stop_lon'].astype(float)
 
-        self.stop_times = frames['stop_times.txt']
-        self.stop_times['stop_sequence'] = self.stop_times['stop_sequence'].astype(int)
-
-        self.trips = frames['trips.txt']
-
-        self.routes = frames['routes.txt']
-        self.routes['route_type'] = self.routes['route_type'].astype(int)
+        print(
+            f'Excluded ferry (route_type={FERRY_ROUTE_TYPE}): '
+            f'{len(ferry_route_ids):,} route(s), '
+            f'{len(trips_raw) - len(self.trips):,} trip(s), '
+            f'{len(stop_times_raw) - len(self.stop_times):,} stop_time row(s), '
+            f'{len(stops_raw) - len(self.stops):,} ferry-only stop(s)'
+        )
 
         self.calendar = frames['calendar.txt']
         for day in DAY_NAMES:
@@ -101,6 +141,16 @@ class GTFSData:
 
         self.calendar_dates = frames['calendar_dates.txt']
 
+        shapes_raw = frames['shapes.txt'].assign(
+            shape_pt_lat=frames['shapes.txt']['shape_pt_lat'].astype(float),
+            shape_pt_lon=frames['shapes.txt']['shape_pt_lon'].astype(float),
+            shape_pt_sequence=frames['shapes.txt']['shape_pt_sequence'].astype(int),
+        ).sort_values(['shape_id', 'shape_pt_sequence'])
+        self.shape_points = {
+            shape_id: list(zip(group['shape_pt_lat'], group['shape_pt_lon']))
+            for shape_id, group in shapes_raw.groupby('shape_id', sort=False)
+        }
+
         self._build_stop_index()
         self._build_route_indexes()
 
@@ -109,6 +159,20 @@ class GTFSData:
             f'{len(self.stops):,} stops, {len(self.routes):,} routes, '
             f'{len(self.trips):,} trips, {len(self.stop_times):,} stop_times'
         )
+
+        total_trips = len(self.trips)
+        trips_with_shape = self.trips['shape_id'].notna().sum()
+        pct_with_shape = (trips_with_shape / total_trips * 100) if total_trips else 0.0
+        print(
+            f'Loaded {len(self.shape_points):,} shapes; '
+            f'{trips_with_shape:,}/{total_trips:,} trips ({pct_with_shape:.1f}%) have a shape_id'
+        )
+        shape_id_by_trip = self.trips.set_index('trip_id')['shape_id']
+        for trip_id in self.trips['trip_id'].head(3):
+            shape_id = shape_id_by_trip.get(trip_id)
+            points = self.shape_points.get(shape_id) if pd.notna(shape_id) else None
+            n_points = len(points) if points is not None else 0
+            print(f'  spot-check trip_id={trip_id!r} shape_id={shape_id!r}: {n_points} shape points')
 
     def _build_stop_index(self):
         # Platforms reference a parent_station (e.g. tram/train platforms all
@@ -243,6 +307,22 @@ def search_stops(query: str, limit: int = 10) -> list[dict]:
         }
         for row in results
     ]
+
+
+def get_trip_shape_points(trip_id: str) -> list[tuple] | None:
+    """(lat, lon) points for trip_id's shape, in shape_pt_sequence order.
+
+    Returns None if trip_id isn't found, or if the trip has no shape_id
+    (a valid GTFS state, not a bug).
+    """
+    data = load_gtfs_data()
+    trip_rows = data.trips.loc[data.trips['trip_id'] == trip_id, 'shape_id']
+    if trip_rows.empty:
+        return None
+    shape_id = trip_rows.iloc[0]
+    if pd.isna(shape_id):
+        return None
+    return data.shape_points.get(shape_id)
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

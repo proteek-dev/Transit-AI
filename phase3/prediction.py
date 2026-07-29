@@ -11,6 +11,7 @@ import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import joblib
 import pandas as pd
@@ -21,7 +22,13 @@ import config
 import gtfs_data
 import live_gtfs
 
-MODEL_DIR = Path(__file__).parent / 'model'
+# The live app always reads/writes phase3/model/latest/. pipeline/02_train_model.sh
+# points a training run at an isolated phase3/model/_staging_{date}_{time}/
+# subdir instead via MODEL_SUBDIR_OVERRIDE, so a live model.predict() call can
+# never observe a partially-written retrain -- it promotes staging to latest/
+# only after all three artifact files are confirmed present.
+MODEL_SUBDIR = os.environ.get('MODEL_SUBDIR_OVERRIDE', 'latest')
+MODEL_DIR = Path(__file__).parent / 'model' / MODEL_SUBDIR
 MODEL_PATH = MODEL_DIR / 'xgb_v0.json'
 CATEGORIES_PATH = MODEL_DIR / 'categories.joblib'
 TRAINING_METADATA_PATH = MODEL_DIR / 'training_metadata.json'
@@ -56,12 +63,25 @@ def _log_mem(label: str) -> None:
     print(f'[MEM] {label}: {rss_mb:,.1f} MB RSS')
 
 
+def _mae(y_true, y_pred) -> float:
+    """Mean absolute error (notebook 07 Cells 8/8b). `y_pred` may be a
+    per-row array (model predictions) or a single scalar broadcast across
+    every row (the naive median-baseline case) -- both work via plain
+    ndarray broadcasting, no numpy import needed.
+    """
+    return float(abs(y_true - y_pred).mean())
+
+
 def _get_env():
     return config.get_s3_bucket(), config.get_s3_filesystem()
 
 
+def _s3_model_prefix() -> str:
+    return f'{config.get_s3_bucket()}/phase3/model/{MODEL_SUBDIR}'
+
+
 def _s3_model_paths() -> dict:
-    prefix = f'{config.get_s3_bucket()}/phase3/model'
+    prefix = _s3_model_prefix()
     return {
         'model': f's3://{prefix}/xgb_v0.json',
         'categories': f's3://{prefix}/categories.joblib',
@@ -81,7 +101,7 @@ def _download_model_from_s3() -> bool:
         fs.get(s3_paths['model'], str(MODEL_PATH))
         fs.get(s3_paths['categories'], str(CATEGORIES_PATH))
         fs.get(s3_paths['metadata'], str(TRAINING_METADATA_PATH))
-        print(f"Downloaded model files from s3://{config.get_s3_bucket()}/phase3/model/")
+        print(f"Downloaded model files from s3://{_s3_model_prefix()}/")
         return True
     except Exception as e:
         print(f'Could not load model from S3 ({e}) — will try local files instead.')
@@ -94,14 +114,16 @@ def _upload_model_to_s3() -> None:
     fs.put(str(MODEL_PATH), s3_paths['model'])
     fs.put(str(CATEGORIES_PATH), s3_paths['categories'])
     fs.put(str(TRAINING_METADATA_PATH), s3_paths['metadata'])
-    print(f"Uploaded model files to s3://{config.get_s3_bucket()}/phase3/model/")
+    print(f"Uploaded model files to s3://{_s3_model_prefix()}/")
 
 
 def _load_training_frames():
     """Reproduces notebook 07 Cells 2-6 verbatim: load via _latest.json,
     leakage filter, re-derive time features, target/feature build, temporal
-    split. Returns (X_train, y_train, categories) — only the train partition,
-    matching what notebook 07 actually fits on.
+    split. Returns (X_train, y_train, X_test, y_test, categories) — both
+    partitions, so _train_and_save_model() can compute a real held-out MAE
+    (notebook 07 Cells 8/8b) as part of every training run instead of that
+    being a separate manual step.
     """
     bucket, fs = _get_env()
     ml_features_prefix = f'{bucket}/ml_features/v0_feature_snapshot'
@@ -114,7 +136,9 @@ def _load_training_frames():
     print(f'Loading training snapshot: run_date={run_date}')
 
     df = pd.read_parquet(load_path)
+    rows_loaded = len(df)
     print(f'Loaded {len(df):,} rows x {df.shape[1]} cols')
+    print(f'[ROW ACCOUNTING] 1. Loaded from ferry-filtered S3 snapshot: {rows_loaded:,} rows')
     _log_mem('after data load')
 
     # --- Debug-only: sample down before any dtype conversion so the entire
@@ -127,6 +151,10 @@ def _load_training_frames():
         df = df.sample(frac=debug_sample_frac, random_state=42)
         print(f'[DEBUG_SAMPLE_FRAC={debug_sample_frac}] Sampling active -- '
               f'{n_before_sample:,} rows -> {len(df):,} rows')
+    rows_after_sample = len(df)
+    if debug_sample_frac < 1.0:
+        print(f'[ROW ACCOUNTING] 1b. After debug sample (frac={debug_sample_frac}): '
+              f'{rows_after_sample:,} rows ({rows_loaded - rows_after_sample:,} dropped by sampling)')
 
     # --- Memory footprint reduction: downcast float64 -> float32, and
     # convert repeating low-cardinality string/object columns to category
@@ -154,6 +182,7 @@ def _load_training_frames():
 
     # --- Cell 3: leakage filter ---
     _log_mem('before leakage filter')
+    rows_before_leakage_filter = len(df)
     # pd.to_datetime with an explicit format parses in vectorized C code with
     # no per-row Python objects, unlike .str.split(), which allocates a
     # Python list + string per row at 50M+ row scale. GTFS times can have
@@ -186,7 +215,10 @@ def _load_training_frames():
     n_dropped = int(leak_mask.sum())
     df = df.loc[~leak_mask].copy()
     scheduled_arrival_dt = scheduled_arrival_dt.loc[~leak_mask]
+    rows_after_leakage_filter = len(df)
     print(f'Leakage filter: dropped {n_dropped:,} rows (post-arrival captures)')
+    print(f'[ROW ACCOUNTING] 2. After leakage filter: {rows_before_leakage_filter:,} -> '
+          f'{rows_after_leakage_filter:,} rows ({n_dropped:,} dropped)')
     _log_mem('after leakage filter')
 
     # --- Cell 4: re-derive hour_of_day / day_of_week / is_weekend / is_peak ---
@@ -196,7 +228,11 @@ def _load_training_frames():
     df['is_peak'] = (~df['is_weekend']) & df['hour_of_day'].isin([7, 8, 16, 17])
 
     # --- Cell 5: target + feature matrix ---
+    rows_before_dropna = len(df)
     df = df.dropna(subset=['delay_minutes']).copy()
+    rows_after_dropna = len(df)
+    print(f'[ROW ACCOUNTING] 3. After dropna(delay_minutes): {rows_before_dropna:,} -> '
+          f'{rows_after_dropna:,} rows ({rows_before_dropna - rows_after_dropna:,} dropped)')
     y = df['delay_minutes'].astype('float32')  # already float32 from the downcast above; explicit for clarity
 
     X = df[FEATURE_COLS + ['source_date']].copy()
@@ -223,13 +259,45 @@ def _load_training_frames():
 
     X_train = X.loc[train_mask, FEATURE_COLS].copy()
     y_train = y.loc[train_mask]
+    # Mirrors X_train/y_train exactly -- same already-cast X (CATEGORICAL_COLS
+    # were cast + remove_unused_categories()'d on the full train+test X above,
+    # before this split), so X_test's categorical codes are guaranteed to
+    # align with X_train's / categories.joblib's, with no separate
+    # remove_unused_categories() call needed (or wanted: that would re-derive
+    # a test-only category list and desync its codes from what the model was
+    # actually fit on).
+    X_test = X.loc[~train_mask, FEATURE_COLS].copy()
+    y_test = y.loc[~train_mask]
+    n_train = len(X_train)
+    n_test = int(total_rows) - n_train
     print(f'Train: {len(X_train):,} rows (boundary date {boundary_date})')
+    print(f'[ROW ACCOUNTING] 4. Temporal split: {int(total_rows):,} rows -> '
+          f'train={n_train:,}, test={n_test:,} (boundary date {boundary_date})')
+
+    print('=' * 70)
+    print('Row accounting: loaded -> final train/test split')
+    print('=' * 70)
+    print(f'  1. Rows loaded from ferry-filtered snapshot : {rows_loaded:,}')
+    if debug_sample_frac < 1.0:
+        print(f'  1b. After debug sample (frac={debug_sample_frac})     : '
+              f'{rows_after_sample:,} ({rows_loaded - rows_after_sample:,} dropped by sampling)')
+    print(f'  2. After leakage filter                     : {rows_after_leakage_filter:,} '
+          f'({rows_after_sample - rows_after_leakage_filter:,} dropped)')
+    print(f'  3. After dropna(delay_minutes)               : {rows_after_dropna:,} '
+          f'({rows_after_leakage_filter - rows_after_dropna:,} dropped)')
+    print(f'  4. Final split: train={n_train:,} + test={n_test:,} = {n_train + n_test:,}')
+    if (n_train + n_test) != rows_after_dropna:
+        print(f'  WARNING: train+test ({n_train + n_test:,}) does not match post-dropna '
+              f'count ({rows_after_dropna:,}) -- gap of '
+              f'{rows_after_dropna - (n_train + n_test):,} row(s) is unexplained by any stage above.')
+    else:
+        print('  No gap: train+test exactly matches the post-dropna row count.')
 
     # Persisted alongside the model: the exact category->code mapping used at
     # fit time, so inference-time categorical columns can be reconstructed
     # identically (XGBoost's categorical splits are keyed on these codes).
     categories = {c: X_train[c].cat.categories.tolist() for c in CATEGORICAL_COLS}
-    return X_train, y_train, categories
+    return X_train, y_train, X_test, y_test, categories
 
 
 def _find_best_matching_static_snapshot(train_route_ids: set):
@@ -261,10 +329,19 @@ def _find_best_matching_static_snapshot(train_route_ids: set):
     return best_date, best_routes
 
 
-def _build_training_metadata(X_train: pd.DataFrame) -> dict:
+def _build_training_metadata(
+    X_train: pd.DataFrame,
+    train_mae: float,
+    test_mae: float,
+    naive_mae: float,
+    pct_improvement_over_naive: float,
+) -> dict:
     """Coverage counts per (route_short_name, mode), used by predict_delay()
     to judge whether a live route was well represented in training — keyed
-    on route_short_name rather than the version-drifting route_id.
+    on route_short_name rather than the version-drifting route_id. Also
+    records this run's train/test/naive MAE baseline (notebook 07 Cells
+    8/8b), so it's permanently available in training_metadata.json rather
+    than only printed to the training log.
     """
     train_route_ids = set(X_train['route_id'].astype(str).unique())
     snapshot_date, routes = _find_best_matching_static_snapshot(train_route_ids)
@@ -277,14 +354,19 @@ def _build_training_metadata(X_train: pd.DataFrame) -> dict:
     coverage_counts = {f'{name}|{mode}': int(n) for (name, mode), n in counts.items()}
 
     return {
+        'trained_at': datetime.now(ZoneInfo('Australia/Brisbane')).isoformat(),
         'static_snapshot_used_for_route_names': snapshot_date,
         'coverage_counts': coverage_counts,
+        'train_mae': train_mae,
+        'test_mae': test_mae,
+        'naive_mae': naive_mae,
+        'pct_improvement_over_naive': pct_improvement_over_naive,
     }
 
 
 def _train_and_save_model() -> None:
     print('No saved model found — training v0 XGBoost model from the S3 feature snapshot...')
-    X_train, y_train, categories = _load_training_frames()
+    X_train, y_train, X_test, y_test, categories = _load_training_frames()
 
     model = xgb.XGBRegressor(
         enable_categorical=True,
@@ -297,7 +379,29 @@ def _train_and_save_model() -> None:
     _log_mem('after fit completes')
     print('Training complete.')
 
-    training_metadata = _build_training_metadata(X_train)
+    # --- notebook 07 Cells 8/8b, ported so every retrain permanently records
+    # a real MAE baseline instead of that being a separate manual step.
+    # model.predict(X_train) reuses the already-fitted model above -- no
+    # retraining, just one extra inference pass. ---
+    test_pred = model.predict(X_test)
+    test_mae = _mae(y_test.values, test_pred)
+
+    train_pred = model.predict(X_train)
+    train_mae = _mae(y_train.values, train_pred)
+
+    train_median = float(y_train.median())
+    naive_mae = _mae(y_test.values, train_median)
+    pct_improvement_over_naive = (1 - test_mae / naive_mae) * 100
+
+    print('=== Train/test MAE summary ===')
+    print(f'Train: MAE {train_mae:.3f} min ({len(X_train):,} rows)')
+    print(f'Test:  MAE {test_mae:.3f} min ({len(X_test):,} rows)')
+    print(f'Naive baseline (predict train median = {train_median:.3f} min): MAE {naive_mae:.3f} min')
+    print(f'Test MAE improvement over naive median baseline: {pct_improvement_over_naive:.1f}%')
+
+    training_metadata = _build_training_metadata(
+        X_train, train_mae, test_mae, naive_mae, pct_improvement_over_naive
+    )
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     model.save_model(str(MODEL_PATH))
@@ -361,7 +465,7 @@ def _get_categories() -> dict:
     return _cache['categories']
 
 
-def build_features(trip_info: dict, departure_time: datetime) -> pd.DataFrame:
+def build_features(trip_info: dict, departure_time: datetime) -> tuple[pd.DataFrame, bool]:
     """Build one feature row matching notebook 07's training schema exactly.
 
     trip_info must supply route_id, stop_id, stop_sequence (the destination
@@ -371,6 +475,13 @@ def build_features(trip_info: dict, departure_time: datetime) -> pd.DataFrame:
     derived from — notebook 07 re-derives these from scheduled_arrival_time,
     not capture time, so this should be the trip's scheduled time, not
     wall-clock "now".
+
+    Returns (X, stop_id_is_oov). stop_id_is_oov is True when trip_info['stop_id']
+    isn't in the trained stop_id vocabulary -- pd.Categorical() below silently
+    encodes an out-of-vocabulary stop_id as NaN, which XGBoost still produces a
+    prediction for (via its learned default split direction) rather than
+    erroring, so callers need this signal to flag the result as lower-confidence
+    instead of it looking like a normal, fully-informed prediction.
     """
     categories = _get_categories()
 
@@ -395,6 +506,8 @@ def build_features(trip_info: dict, departure_time: datetime) -> pd.DataFrame:
     }
     X = pd.DataFrame([row])
 
+    stop_id_is_oov = trip_info['stop_id'] not in categories['stop_id']
+
     for c in CATEGORICAL_COLS:
         X[c] = pd.Categorical(X[c], categories=categories[c])
     X['hour_of_day'] = X['hour_of_day'].astype('int32')
@@ -405,7 +518,7 @@ def build_features(trip_info: dict, departure_time: datetime) -> pd.DataFrame:
     # inconsistently at inference time if fed float64 columns.
     X['stop_sequence'] = X['stop_sequence'].astype('float32')
 
-    return X[FEATURE_COLS]
+    return X[FEATURE_COLS], stop_id_is_oov
 
 
 def enrich_trip_with_dest_stop(trip: dict, dest_stop_ids: list[str]) -> dict:
@@ -434,7 +547,7 @@ def predict_delay(trip_info: dict, departure_time: datetime, live_delay: dict | 
     model = load_model()
     training_metadata = _get_training_metadata()
 
-    X = build_features(trip_info, departure_time)
+    X, stop_id_is_oov = build_features(trip_info, departure_time)
     predicted_delay_minutes = float(model.predict(X)[0])
 
     mode = trip_info.get('mode') or MODE_BY_ROUTE_TYPE.get(trip_info.get('route_type'), 'unknown')
@@ -451,6 +564,15 @@ def predict_delay(trip_info: dict, departure_time: datetime, live_delay: dict | 
         live_delay_minutes = None
         blended_delay_minutes = predicted_delay_minutes
         confidence = 'Medium' if well_represented else 'Low'
+
+    # Override, not a replacement: an out-of-vocabulary stop_id encodes as NaN
+    # in build_features() and still produces a real prediction from XGBoost's
+    # learned default split direction, but the route+mode coverage_counts
+    # heuristic above has no way to know that happened -- without this, a
+    # well-represented route with an OOV destination stop would report the
+    # same confidence as a fully in-vocabulary prediction.
+    if stop_id_is_oov:
+        confidence = 'Low'
 
     scheduled_arrival = trip_info['dest_arrival_time']
     estimated_arrival = scheduled_arrival + timedelta(minutes=blended_delay_minutes)
