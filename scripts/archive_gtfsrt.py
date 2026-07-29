@@ -348,6 +348,7 @@ def main() -> None:
         for feed_name, url in TRAM_FEEDS.items():
             fetch_and_save_tram(feed_name, url)
 
+        maybe_download_static_gtfs()
         download_performance_data(CONFIG)
 
         time.sleep(FETCH_INTERVAL)

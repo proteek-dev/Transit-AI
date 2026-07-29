@@ -11,7 +11,6 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 from streamlit_geolocation import streamlit_geolocation
-from streamlit_searchbox import st_searchbox
 
 import gtfs_data
 import live_gtfs
@@ -34,6 +33,11 @@ ROUTE_TYPE_MODE = {
     4: ('⛴', 'Ferry'),
 }
 DEFAULT_ROUTE_TYPE_MODE = ('🚍', 'Transit')
+
+# Route-map polyline colors, one per leg, cycled if ever exceeded -- in
+# practice never is, since find_multi_leg_trips()'s max_transfers=3 caps a
+# journey at 4 legs.
+ROUTE_MAP_LEG_COLORS = ['#2563eb', '#dc2626', '#16a34a', '#d97706']
 
 
 # ── Cached loaders ──────────────────────────────────────────────────────────
@@ -123,13 +127,6 @@ def _closest_slot_index(slots: list[time], target: time) -> int:
     return diffs.index(min(diffs))
 
 
-def _search_stops(query: str) -> list[tuple[str, dict]]:
-    """search_function for st_searchbox: (display_label, stop_data) tuples."""
-    if len(query.strip()) < 2:
-        return []
-    return [(m['stop_name'], m) for m in gtfs_data.search_stops(query, limit=10)]
-
-
 def _attach_route_types(stops: list[dict]) -> list[dict]:
     """Enrich search_stops()-shaped dicts with route_types, so typed-search
     results can be color-coded by mode_picker the same way nearest_stops()
@@ -147,6 +144,24 @@ def _attach_route_types(stops: list[dict]) -> list[dict]:
                     route_types.add(rt)
         enriched.append({**s, 'route_types': sorted(route_types)})
     return enriched
+
+
+def _build_route_map_legs(journey: dict) -> list[dict]:
+    """journey['legs'] -> map_picker.render_route_map()'s leg-dict shape:
+    each leg's GTFS-shape points (None if the trip has no shape_id -- a
+    valid GTFS state map_picker skips defensively), a color cycled from
+    ROUTE_MAP_LEG_COLORS, and a route_badge label.
+    """
+    legs = []
+    for i, leg in enumerate(journey['legs']):
+        trip = leg['trip']
+        points = gtfs_data.get_trip_shape_points(trip['trip_id'])
+        legs.append({
+            'points': points,
+            'color': ROUTE_MAP_LEG_COLORS[i % len(ROUTE_MAP_LEG_COLORS)],
+            'label': route_badge(trip),
+        })
+    return legs
 
 
 def render_from_picker() -> dict | None:
@@ -191,23 +206,29 @@ def render_from_picker() -> dict | None:
                     st.rerun()
     else:
         st.info('Location unavailable — search for your stop instead.')
-        typed = st_searchbox(
-            _search_stops,
-            label='Search for your stop',
+        query = st.text_input(
+            'Search for your stop',
             placeholder='Type a stop name...',
-            key='origin_typed_searchbox',
+            key='origin_typed_query',
         )
-        if typed:
-            candidates = _attach_route_types([typed])
-            picked_id = map_picker.render_stop_picker(
-                candidates, typed['stop_lat'], typed['stop_lon'], key='origin_typed_map',
-                mode_map=ROUTE_TYPE_MODE, default_mode=DEFAULT_ROUTE_TYPE_MODE,
-            )
-            if picked_id:
-                chosen = next((c for c in candidates if c['stop_id'] == picked_id), None)
-                if chosen:
-                    st.session_state['origin_confirmed'] = chosen
-                    st.rerun()
+        if query and len(query.strip()) >= 2:
+            matches = gtfs_data.search_stops(query, limit=15)
+            candidates = _attach_route_types(matches)
+            print(f"[render_from_picker] typed query={query!r} -> {len(candidates)} candidates: "
+                  f"{[c['stop_name'] for c in candidates]}")
+            if not candidates:
+                st.info('No matching stops found.')
+            else:
+                center = candidates[0]
+                picked_id = map_picker.render_stop_picker(
+                    candidates, center['stop_lat'], center['stop_lon'], key='origin_typed_map',
+                    mode_map=ROUTE_TYPE_MODE, default_mode=DEFAULT_ROUTE_TYPE_MODE,
+                )
+                if picked_id:
+                    chosen = next((c for c in candidates if c['stop_id'] == picked_id), None)
+                    if chosen:
+                        st.session_state['origin_confirmed'] = chosen
+                        st.rerun()
 
     return None
 
@@ -230,24 +251,29 @@ def render_to_picker(origin_confirmed: dict) -> dict | None:
             st.rerun()
         return confirmed
 
-    typed = st_searchbox(
-        _search_stops,
-        label='Search for your destination',
+    query = st.text_input(
+        'Search for your destination',
         placeholder='Type a stop name...',
-        key='dest_typed_searchbox',
+        key='dest_typed_query',
     )
-    if typed:
-        candidates = _attach_route_types([typed])
-        picked_id = map_picker.render_stop_picker(
-            candidates, origin_confirmed['stop_lat'], origin_confirmed['stop_lon'], key='dest_typed_map',
-            mode_map=ROUTE_TYPE_MODE, default_mode=DEFAULT_ROUTE_TYPE_MODE,
-            locked_marker=origin_confirmed,
-        )
-        if picked_id:
-            chosen = next((c for c in candidates if c['stop_id'] == picked_id), None)
-            if chosen:
-                st.session_state['dest_confirmed'] = chosen
-                st.rerun()
+    if query and len(query.strip()) >= 2:
+        matches = gtfs_data.search_stops(query, limit=15)
+        candidates = _attach_route_types(matches)
+        print(f"[render_to_picker] typed query={query!r} -> {len(candidates)} candidates: "
+              f"{[c['stop_name'] for c in candidates]}")
+        if not candidates:
+            st.info('No matching stops found.')
+        else:
+            picked_id = map_picker.render_stop_picker(
+                candidates, origin_confirmed['stop_lat'], origin_confirmed['stop_lon'], key='dest_typed_map',
+                mode_map=ROUTE_TYPE_MODE, default_mode=DEFAULT_ROUTE_TYPE_MODE,
+                locked_marker=origin_confirmed,
+            )
+            if picked_id:
+                chosen = next((c for c in candidates if c['stop_id'] == picked_id), None)
+                if chosen:
+                    st.session_state['dest_confirmed'] = chosen
+                    st.rerun()
 
     return None
 
@@ -324,6 +350,7 @@ def render_card_detail(trip: dict, pred: dict, raw_update: dict | None, stop_nam
 
 
 def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names,
+                      dest_stop_ids: list[str], departure_after: datetime,
                       label_prefix: tuple[str, str] = ('From', 'To'), expanded: bool = False) -> None:
     """Render one leg's prediction card. The leave-by banner and plain
     English summary are always visible; everything else (route badge,
@@ -332,9 +359,17 @@ def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names
 
     `expanded` controls the expander's initial state — True only for the
     first card in a results list.
+
+    `dest_stop_ids`/`departure_after` are only needed to wrap this trip into
+    the same one-leg-journey shape find_multi_leg_trips() produces, for the
+    "Show route" button below.
     """
     render_leave_by_banner(pred)
     st.write(pred['summary'])
+
+    if st.button('🗺️ Show route', key=f"show_route_{trip['trip_id']}"):
+        st.session_state['selected_journey'] = gtfs_data._direct_journey(trip, dest_stop_ids, departure_after)
+        st.rerun()
 
     label = f'🕐 Leave by {pred["leave_by"]} — {route_label_plain(trip)}'
     with st.expander(label, expanded=expanded):
@@ -355,7 +390,10 @@ def render_direct_trips(trips: list[dict], dest_stop_ids: list[str], departure_a
 
     for idx, (trip, pred, raw_update) in enumerate(predicted):
         with st.container(border=True):
-            render_trip_card(trip, pred, raw_update, stop_names, expanded=(idx == 0))
+            render_trip_card(
+                trip, pred, raw_update, stop_names, dest_stop_ids, departure_after,
+                expanded=(idx == 0),
+            )
 
 
 def render_transfer_journeys(journeys: list[dict], updates: dict, stop_names) -> None:
@@ -385,6 +423,10 @@ def render_transfer_journeys(journeys: list[dict], updates: dict, stop_names) ->
             with st.container(border=True):
                 render_leave_by_banner(first_pred)
                 st.write(f"{first_pred['summary']} ({transfer_note}.)")
+
+                if st.button('🗺️ Show route', key=f'show_route_journey_{idx}'):
+                    st.session_state['selected_journey'] = journey
+                    st.rerun()
 
                 label = (
                     f'Journey {idx} · 🕐 Leave by {first_pred["leave_by"]} — '
@@ -427,15 +469,18 @@ except Exception as e:
 
 # ── Input section ─────────────────────────────────────────────────────────
 
-st.subheader('📍 From')
-origin = render_from_picker()
+col_from, col_to = st.columns(2)
+with col_from:
+    st.subheader('📍 From')
+    origin = render_from_picker()
 
-st.subheader('🎯 To')
-if origin:
-    dest = render_to_picker(origin)
-else:
-    st.info('Set your origin first.')
-    dest = None
+with col_to:
+    st.subheader('🎯 To')
+    if origin:
+        dest = render_to_picker(origin)
+    else:
+        st.info('Set your origin first.')
+        dest = None
 
 now_brisbane = datetime.now(BRISBANE_TZ)
 
@@ -492,6 +537,9 @@ if search_clicked:
             'departure_after': departure_after,
             'window_minutes': window_minutes,
         }
+        # Previous selection may not correspond to this new result set --
+        # cleared here so the block below re-defaults to the first result.
+        st.session_state['selected_journey'] = None
 
 results = st.session_state.get('results')
 if results:
@@ -505,6 +553,28 @@ if results:
             'even with transfers. Try a different time or check nearby stops.'
         )
     else:
+        # Default to the first available result, matching the
+        # expanded=True-for-first-card convention: direct trip idx 0 if any
+        # exist, else the first transfer journey.
+        if st.session_state.get('selected_journey') is None:
+            if trips:
+                st.session_state['selected_journey'] = gtfs_data._direct_journey(
+                    trips[0], results['dest_stop_ids'], results['departure_after'],
+                )
+            elif transfer_journeys:
+                st.session_state['selected_journey'] = transfer_journeys[0]
+
+        selected_journey = st.session_state.get('selected_journey')
+        origin_marker = st.session_state.get('origin_confirmed')
+        dest_marker = st.session_state.get('dest_confirmed')
+        if selected_journey and origin_marker and dest_marker:
+            route_legs = _build_route_map_legs(selected_journey)
+            print(
+                f'[route map] rendering {len(route_legs)} leg(s): '
+                f"{[(l['label'], len(l['points']) if l['points'] else 0) for l in route_legs]}"
+            )
+            map_picker.render_route_map(route_legs, origin_marker, dest_marker, key='route_map')
+
         updates, live_error = get_live_updates()
         if live_error:
             st.warning('Live GTFS-RT feed is currently unavailable — showing model predictions only.')

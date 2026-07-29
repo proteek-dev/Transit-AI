@@ -63,6 +63,15 @@ def _log_mem(label: str) -> None:
     print(f'[MEM] {label}: {rss_mb:,.1f} MB RSS')
 
 
+def _mae(y_true, y_pred) -> float:
+    """Mean absolute error (notebook 07 Cells 8/8b). `y_pred` may be a
+    per-row array (model predictions) or a single scalar broadcast across
+    every row (the naive median-baseline case) -- both work via plain
+    ndarray broadcasting, no numpy import needed.
+    """
+    return float(abs(y_true - y_pred).mean())
+
+
 def _get_env():
     return config.get_s3_bucket(), config.get_s3_filesystem()
 
@@ -111,8 +120,10 @@ def _upload_model_to_s3() -> None:
 def _load_training_frames():
     """Reproduces notebook 07 Cells 2-6 verbatim: load via _latest.json,
     leakage filter, re-derive time features, target/feature build, temporal
-    split. Returns (X_train, y_train, categories) — only the train partition,
-    matching what notebook 07 actually fits on.
+    split. Returns (X_train, y_train, X_test, y_test, categories) — both
+    partitions, so _train_and_save_model() can compute a real held-out MAE
+    (notebook 07 Cells 8/8b) as part of every training run instead of that
+    being a separate manual step.
     """
     bucket, fs = _get_env()
     ml_features_prefix = f'{bucket}/ml_features/v0_feature_snapshot'
@@ -248,6 +259,15 @@ def _load_training_frames():
 
     X_train = X.loc[train_mask, FEATURE_COLS].copy()
     y_train = y.loc[train_mask]
+    # Mirrors X_train/y_train exactly -- same already-cast X (CATEGORICAL_COLS
+    # were cast + remove_unused_categories()'d on the full train+test X above,
+    # before this split), so X_test's categorical codes are guaranteed to
+    # align with X_train's / categories.joblib's, with no separate
+    # remove_unused_categories() call needed (or wanted: that would re-derive
+    # a test-only category list and desync its codes from what the model was
+    # actually fit on).
+    X_test = X.loc[~train_mask, FEATURE_COLS].copy()
+    y_test = y.loc[~train_mask]
     n_train = len(X_train)
     n_test = int(total_rows) - n_train
     print(f'Train: {len(X_train):,} rows (boundary date {boundary_date})')
@@ -277,7 +297,7 @@ def _load_training_frames():
     # fit time, so inference-time categorical columns can be reconstructed
     # identically (XGBoost's categorical splits are keyed on these codes).
     categories = {c: X_train[c].cat.categories.tolist() for c in CATEGORICAL_COLS}
-    return X_train, y_train, categories
+    return X_train, y_train, X_test, y_test, categories
 
 
 def _find_best_matching_static_snapshot(train_route_ids: set):
@@ -309,10 +329,19 @@ def _find_best_matching_static_snapshot(train_route_ids: set):
     return best_date, best_routes
 
 
-def _build_training_metadata(X_train: pd.DataFrame) -> dict:
+def _build_training_metadata(
+    X_train: pd.DataFrame,
+    train_mae: float,
+    test_mae: float,
+    naive_mae: float,
+    pct_improvement_over_naive: float,
+) -> dict:
     """Coverage counts per (route_short_name, mode), used by predict_delay()
     to judge whether a live route was well represented in training — keyed
-    on route_short_name rather than the version-drifting route_id.
+    on route_short_name rather than the version-drifting route_id. Also
+    records this run's train/test/naive MAE baseline (notebook 07 Cells
+    8/8b), so it's permanently available in training_metadata.json rather
+    than only printed to the training log.
     """
     train_route_ids = set(X_train['route_id'].astype(str).unique())
     snapshot_date, routes = _find_best_matching_static_snapshot(train_route_ids)
@@ -328,12 +357,16 @@ def _build_training_metadata(X_train: pd.DataFrame) -> dict:
         'trained_at': datetime.now(ZoneInfo('Australia/Brisbane')).isoformat(),
         'static_snapshot_used_for_route_names': snapshot_date,
         'coverage_counts': coverage_counts,
+        'train_mae': train_mae,
+        'test_mae': test_mae,
+        'naive_mae': naive_mae,
+        'pct_improvement_over_naive': pct_improvement_over_naive,
     }
 
 
 def _train_and_save_model() -> None:
     print('No saved model found — training v0 XGBoost model from the S3 feature snapshot...')
-    X_train, y_train, categories = _load_training_frames()
+    X_train, y_train, X_test, y_test, categories = _load_training_frames()
 
     model = xgb.XGBRegressor(
         enable_categorical=True,
@@ -346,7 +379,29 @@ def _train_and_save_model() -> None:
     _log_mem('after fit completes')
     print('Training complete.')
 
-    training_metadata = _build_training_metadata(X_train)
+    # --- notebook 07 Cells 8/8b, ported so every retrain permanently records
+    # a real MAE baseline instead of that being a separate manual step.
+    # model.predict(X_train) reuses the already-fitted model above -- no
+    # retraining, just one extra inference pass. ---
+    test_pred = model.predict(X_test)
+    test_mae = _mae(y_test.values, test_pred)
+
+    train_pred = model.predict(X_train)
+    train_mae = _mae(y_train.values, train_pred)
+
+    train_median = float(y_train.median())
+    naive_mae = _mae(y_test.values, train_median)
+    pct_improvement_over_naive = (1 - test_mae / naive_mae) * 100
+
+    print('=== Train/test MAE summary ===')
+    print(f'Train: MAE {train_mae:.3f} min ({len(X_train):,} rows)')
+    print(f'Test:  MAE {test_mae:.3f} min ({len(X_test):,} rows)')
+    print(f'Naive baseline (predict train median = {train_median:.3f} min): MAE {naive_mae:.3f} min')
+    print(f'Test MAE improvement over naive median baseline: {pct_improvement_over_naive:.1f}%')
+
+    training_metadata = _build_training_metadata(
+        X_train, train_mae, test_mae, naive_mae, pct_improvement_over_naive
+    )
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     model.save_model(str(MODEL_PATH))

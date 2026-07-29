@@ -19,7 +19,7 @@ DATE_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 DAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 
 STATIC_FILES = ['stops.txt', 'stop_times.txt', 'trips.txt', 'routes.txt',
-                'calendar.txt', 'calendar_dates.txt']
+                'calendar.txt', 'calendar_dates.txt', 'shapes.txt']
 
 # Ferry is out of scope everywhere except the raw S3 archiver
 # (scripts/archive_gtfsrt.py, untouched) -- routes, trips, stop_times, and
@@ -66,6 +66,7 @@ class GTFSData:
         self.stop_to_cluster = None    # stop_id -> canonical station name
         self.cluster_to_routes = None  # canonical station name -> set of route_id
         self.cluster_stop_ids = None   # canonical station name -> list of stop_id
+        self.shape_points = None       # shape_id -> ordered list of (lat, lon), built at load time
 
     def load(self):
         bucket, fs = _get_env()
@@ -140,6 +141,16 @@ class GTFSData:
 
         self.calendar_dates = frames['calendar_dates.txt']
 
+        shapes_raw = frames['shapes.txt'].assign(
+            shape_pt_lat=frames['shapes.txt']['shape_pt_lat'].astype(float),
+            shape_pt_lon=frames['shapes.txt']['shape_pt_lon'].astype(float),
+            shape_pt_sequence=frames['shapes.txt']['shape_pt_sequence'].astype(int),
+        ).sort_values(['shape_id', 'shape_pt_sequence'])
+        self.shape_points = {
+            shape_id: list(zip(group['shape_pt_lat'], group['shape_pt_lon']))
+            for shape_id, group in shapes_raw.groupby('shape_id', sort=False)
+        }
+
         self._build_stop_index()
         self._build_route_indexes()
 
@@ -148,6 +159,20 @@ class GTFSData:
             f'{len(self.stops):,} stops, {len(self.routes):,} routes, '
             f'{len(self.trips):,} trips, {len(self.stop_times):,} stop_times'
         )
+
+        total_trips = len(self.trips)
+        trips_with_shape = self.trips['shape_id'].notna().sum()
+        pct_with_shape = (trips_with_shape / total_trips * 100) if total_trips else 0.0
+        print(
+            f'Loaded {len(self.shape_points):,} shapes; '
+            f'{trips_with_shape:,}/{total_trips:,} trips ({pct_with_shape:.1f}%) have a shape_id'
+        )
+        shape_id_by_trip = self.trips.set_index('trip_id')['shape_id']
+        for trip_id in self.trips['trip_id'].head(3):
+            shape_id = shape_id_by_trip.get(trip_id)
+            points = self.shape_points.get(shape_id) if pd.notna(shape_id) else None
+            n_points = len(points) if points is not None else 0
+            print(f'  spot-check trip_id={trip_id!r} shape_id={shape_id!r}: {n_points} shape points')
 
     def _build_stop_index(self):
         # Platforms reference a parent_station (e.g. tram/train platforms all
@@ -282,6 +307,22 @@ def search_stops(query: str, limit: int = 10) -> list[dict]:
         }
         for row in results
     ]
+
+
+def get_trip_shape_points(trip_id: str) -> list[tuple] | None:
+    """(lat, lon) points for trip_id's shape, in shape_pt_sequence order.
+
+    Returns None if trip_id isn't found, or if the trip has no shape_id
+    (a valid GTFS state, not a bug).
+    """
+    data = load_gtfs_data()
+    trip_rows = data.trips.loc[data.trips['trip_id'] == trip_id, 'shape_id']
+    if trip_rows.empty:
+        return None
+    shape_id = trip_rows.iloc[0]
+    if pd.isna(shape_id):
+        return None
+    return data.shape_points.get(shape_id)
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
