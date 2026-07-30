@@ -21,6 +21,7 @@ import xgboost as xgb
 import config
 import gtfs_data
 import live_gtfs
+from route_types import MODE_BY_ROUTE_TYPE
 
 # The live app always reads/writes phase3/model/latest/. pipeline/02_train_model.sh
 # points a training run at an isolated phase3/model/_staging_{date}_{time}/
@@ -38,10 +39,10 @@ FEATURE_COLS = ['route_id', 'stop_id', 'mode', 'stop_sequence',
                 'hour_of_day', 'day_of_week', 'is_weekend', 'is_peak']
 CATEGORICAL_COLS = ['route_id', 'stop_id', 'mode', 'day_of_week']
 
-# Same mapping notebook 05 uses to derive the training `mode` column from
-# GTFS route_type — needed here to turn a find_trips() route_type back into
-# the same string the model was trained on.
-MODE_BY_ROUTE_TYPE = {0: 'tram', 2: 'rail', 3: 'bus', 4: 'ferry'}
+# MODE_BY_ROUTE_TYPE (route_types.py) is the same mapping notebook 05 uses to
+# derive the training `mode` column from GTFS route_type — needed here to
+# turn a find_trips() route_type back into the same string the model was
+# trained on.
 MODE_NOUN = {'tram': 'tram', 'rail': 'train', 'bus': 'bus', 'ferry': 'ferry', 'unknown': 'service'}
 
 # A (route_short_name, mode) combo with at least this many training rows is

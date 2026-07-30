@@ -34,10 +34,23 @@ ROUTE_TYPE_MODE = {
 }
 DEFAULT_ROUTE_TYPE_MODE = ('🚍', 'Transit')
 
+# Mode-filter chip options -> GTFS route_type. 'All' has no entry (means "no
+# filter"). Bus/Train/Tram only, matching what SEQ actually runs -- ferry is
+# excluded everywhere upstream (gtfs_data.py) and never surfaced here either.
+MODE_FILTER_ROUTE_TYPE = {'Bus': 3, 'Train': 2, 'Tram': 0}
+
 # Route-map polyline colors, one per leg, cycled if ever exceeded -- in
 # practice never is, since find_multi_leg_trips()'s max_transfers=3 caps a
 # journey at 4 legs.
 ROUTE_MAP_LEG_COLORS = ['#2563eb', '#dc2626', '#16a34a', '#d97706']
+
+# Final number of ranked results shown. CANDIDATE_POOL_SIZE widens each path
+# (direct trips, transfer journeys) beyond MAX_RESULTS before they're merged
+# and ranked by predicted arrival -- otherwise a candidate that wasn't in
+# either path's own top-MAX_RESULTS-by-schedule could never surface in the
+# combined ranking even if its predicted arrival beats one that was.
+MAX_RESULTS = 5
+CANDIDATE_POOL_SIZE = 10
 
 
 # ── Cached loaders ──────────────────────────────────────────────────────────
@@ -146,6 +159,53 @@ def _attach_route_types(stops: list[dict]) -> list[dict]:
     return enriched
 
 
+def _filter_by_mode(candidates: list[dict], mode_filter: str) -> list[dict]:
+    """UI-level candidate filter for the mode chip above the From/To
+    pickers -- doesn't touch gtfs_data.py's own filtering/BFS logic, just
+    trims the list handed to map_picker.render_stop_picker(). 'All' (or a
+    candidate with no route_types) passes through unfiltered.
+    """
+    if mode_filter == 'All':
+        return candidates
+    target = MODE_FILTER_ROUTE_TYPE[mode_filter]
+    return [c for c in candidates if target in (c.get('route_types') or [])]
+
+
+# Fields every confirmed origin/destination dict is guaranteed to carry,
+# regardless of which picker path produced it -- render_from_picker()'s
+# geolocation branch (gtfs_data.nearest_stops()) also attaches
+# distance_km/trip_count, which the typed-search path (gtfs_data.search_stops()
+# + _attach_route_types()) never has. Swapping through this common subset
+# means the swap behaves the same no matter how each side was originally picked.
+_CONFIRMED_STOP_FIELDS = ('stop_id', 'stop_ids', 'stop_name', 'stop_lat', 'stop_lon', 'route_types')
+
+
+def _normalize_confirmed_stop(stop: dict | None) -> dict | None:
+    """Reduce a confirmed origin/destination dict to the fields the rest of
+    the app actually relies on (map markers, route legs, card labels),
+    dropping selection-path-specific extras.
+    """
+    if stop is None:
+        return None
+    return {field: stop[field] for field in _CONFIRMED_STOP_FIELDS if field in stop}
+
+
+def _swap_origin_dest() -> None:
+    """Swap the confirmed origin/destination stops in place. Both sides are
+    normalized first (see _normalize_confirmed_stop) so the swap is
+    well-defined regardless of how each stop was originally selected (map tap
+    vs typed search). Clears the current results/selected journey since they
+    were computed for the pre-swap direction -- the user re-runs Search for
+    the reversed trip.
+    """
+    origin = _normalize_confirmed_stop(st.session_state.get('origin_confirmed'))
+    dest = _normalize_confirmed_stop(st.session_state.get('dest_confirmed'))
+    st.session_state['origin_confirmed'] = dest
+    st.session_state['dest_confirmed'] = origin
+    st.session_state['results'] = None
+    st.session_state['selected_journey'] = None
+
+
 def _build_route_map_legs(journey: dict) -> list[dict]:
     """journey['legs'] -> map_picker.render_route_map()'s leg-dict shape:
     each leg's GTFS-shape points (None if the trip has no shape_id -- a
@@ -164,12 +224,17 @@ def _build_route_map_legs(journey: dict) -> list[dict]:
     return legs
 
 
-def render_from_picker() -> dict | None:
+def render_from_picker(mode_filter: str = 'All') -> dict | None:
     """The 'From' field: 'Use my location' + map picker, with a typed-search
     fallback rendered through the same map picker. Returns the confirmed stop
     dict (has stop_id/stop_ids/stop_name/stop_lat/stop_lon) once the user has
     tapped a candidate, or None beforehand. Confirms into
     st.session_state['origin_confirmed'] and offers a "Change origin" reset.
+
+    `mode_filter` ('All'/'Bus'/'Train'/'Tram') trims the candidate list
+    handed to the map picker -- session_state['origin_candidates'] itself
+    stays the full, unfiltered result, so switching the filter doesn't
+    require a fresh geolocation fetch.
     """
     confirmed = st.session_state.get('origin_confirmed')
     if confirmed:
@@ -191,7 +256,7 @@ def render_from_picker() -> dict | None:
             st.session_state['origin_center'] = (lat, lon)
             st.session_state['origin_candidates'] = gtfs_data.nearest_stops(lat, lon, limit=15)
 
-        candidates = st.session_state.get('origin_candidates') or []
+        candidates = _filter_by_mode(st.session_state.get('origin_candidates') or [], mode_filter)
         if not candidates:
             st.info('No nearby stops found — search for your stop instead.')
         else:
@@ -213,9 +278,9 @@ def render_from_picker() -> dict | None:
         )
         if query and len(query.strip()) >= 2:
             matches = gtfs_data.search_stops(query, limit=15)
-            candidates = _attach_route_types(matches)
-            print(f"[render_from_picker] typed query={query!r} -> {len(candidates)} candidates: "
-                  f"{[c['stop_name'] for c in candidates]}")
+            candidates = _filter_by_mode(_attach_route_types(matches), mode_filter)
+            print(f"[render_from_picker] typed query={query!r} mode_filter={mode_filter!r} -> "
+                  f"{len(candidates)} candidates: {[c['stop_name'] for c in candidates]}")
             if not candidates:
                 st.info('No matching stops found.')
             else:
@@ -233,7 +298,7 @@ def render_from_picker() -> dict | None:
     return None
 
 
-def render_to_picker(origin_confirmed: dict) -> dict | None:
+def render_to_picker(origin_confirmed: dict, mode_filter: str = 'All') -> dict | None:
     """The 'To' field: typed search producing destination candidates, shown
     on the SAME map as the already-confirmed origin (rendered as a locked,
     non-tappable pin for context). Returns the confirmed destination dict
@@ -242,6 +307,9 @@ def render_to_picker(origin_confirmed: dict) -> dict | None:
     st.session_state['dest_confirmed'] and offers a "Change destination"
     reset. Click resolution goes through the same tooltip-lookup mechanism
     as the origin picker -- no lat/lng matching.
+
+    `mode_filter` ('All'/'Bus'/'Train'/'Tram') trims the candidate list the
+    same way render_from_picker() does.
     """
     confirmed = st.session_state.get('dest_confirmed')
     if confirmed:
@@ -258,9 +326,9 @@ def render_to_picker(origin_confirmed: dict) -> dict | None:
     )
     if query and len(query.strip()) >= 2:
         matches = gtfs_data.search_stops(query, limit=15)
-        candidates = _attach_route_types(matches)
-        print(f"[render_to_picker] typed query={query!r} -> {len(candidates)} candidates: "
-              f"{[c['stop_name'] for c in candidates]}")
+        candidates = _filter_by_mode(_attach_route_types(matches), mode_filter)
+        print(f"[render_to_picker] typed query={query!r} mode_filter={mode_filter!r} -> "
+              f"{len(candidates)} candidates: {[c['stop_name'] for c in candidates]}")
         if not candidates:
             st.info('No matching stops found.')
         else:
@@ -295,6 +363,33 @@ def _predict_leg(trip: dict, dest_stop_ids: list[str], search_departure_after: d
         st.warning(f'Could not predict this leg ({trip.get("trip_id")}): {e}')
         return None
     return trip, pred, raw_update
+
+
+def _predict_journey_legs(journey: dict, updates: dict) -> list:
+    """Predict every leg of a journey (direct or transfer -- both share the
+    same journey shape via gtfs_data._direct_journey()/find_multi_leg_trips()).
+    Returns a list aligned 1:1 with journey['legs']: each entry is the
+    (trip, pred, raw_update) tuple _predict_leg() returns, or None if that
+    leg's prediction failed.
+    """
+    return [
+        _predict_leg(leg['trip'], leg['dest_stop_ids'], leg['search_departure_after'], updates)
+        for leg in journey['legs']
+    ]
+
+
+def _predicted_arrival(leg_predictions: list) -> datetime | None:
+    """The predicted arrival datetime at the journey's final destination --
+    the last leg's scheduled arrival plus its predicted/blended delay. This
+    (not scheduled time, not transfer count, not confidence) is what
+    candidates are ranked by. None if the last leg's prediction failed --
+    such a candidate can't be ranked and is dropped rather than guessed at.
+    """
+    last = leg_predictions[-1]
+    if last is None:
+        return None
+    trip, pred, _ = last
+    return trip['dest_arrival_time'] + timedelta(minutes=pred['blended_delay_minutes'])
 
 
 def render_leave_by_banner(pred: dict) -> None:
@@ -376,77 +471,63 @@ def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names
         render_card_detail(trip, pred, raw_update, stop_names, label_prefix)
 
 
-def render_direct_trips(trips: list[dict], dest_stop_ids: list[str], departure_after: datetime,
-                         updates: dict, stop_names) -> None:
-    if any(t.get('fallback_schedule') for t in trips):
-        st.info('Schedule based on projected timetable — times may vary')
+def render_transfer_journey_card(journey: dict, leg_predictions: list, stop_names,
+                                  idx: int, expanded: bool) -> None:
+    """Render one transfer journey (num_transfers >= 1): leave-by banner +
+    journey summary always visible; per-leg detail and transfer connections
+    live inside one expander. `leg_predictions` must already be computed
+    (see _predict_journey_legs) -- no prediction happens here.
+    """
+    first_result = next((r for r in leg_predictions if r is not None), None)
+    if first_result is None:
+        return
+    first_trip, first_pred, _ = first_result
 
-    with st.spinner('Generating predictions...'):
-        predicted = []
-        for trip in trips[:5]:
-            result = _predict_leg(trip, dest_stop_ids, departure_after, updates)
-            if result is not None:
-                predicted.append(result)
+    n = journey['num_transfers']
+    transfer_note = f"{n} transfer{'' if n == 1 else 's'}, ~{journey['total_minutes']} min total"
 
-    for idx, (trip, pred, raw_update) in enumerate(predicted):
+    with st.container(border=True):
+        render_leave_by_banner(first_pred)
+        st.write(f"{first_pred['summary']} ({transfer_note}.)")
+
+        if st.button('🗺️ Show route', key=f'show_route_journey_{idx}'):
+            st.session_state['selected_journey'] = journey
+            st.rerun()
+
+        label = f'🕐 Leave by {first_pred["leave_by"]} — {route_label_plain(first_trip)} ({transfer_note})'
+        with st.expander(label, expanded=expanded):
+            for leg_idx, result in enumerate(leg_predictions):
+                if result is None:
+                    continue
+                trip, pred, raw_update = result
+                st.markdown(f'**Leg {leg_idx + 1}**')
+                render_card_detail(trip, pred, raw_update, stop_names, label_prefix=('Board', 'Alight'))
+
+                if leg_idx < len(journey['transfer_points']):
+                    tp = journey['transfer_points'][leg_idx]
+                    st.divider()
+                    st.markdown(
+                        f"🔄 **Transfer at {tp['stop_name']}** — {tp['connection_minutes']} min connection"
+                    )
+                    st.divider()
+
+
+def render_ranked_journey(idx: int, journey: dict, leg_predictions: list, stop_names,
+                           dest_stop_ids: list[str], departure_after: datetime) -> None:
+    """Render one already-ranked, already-predicted candidate -- a direct
+    trip (num_transfers == 0) as a single card, a transfer journey
+    (num_transfers >= 1) as a multi-leg card. Ranking/truncation/prediction
+    all already happened before this is called; this is display only.
+    """
+    if journey['num_transfers'] == 0:
+        trip, pred, raw_update = leg_predictions[0]
         with st.container(border=True):
             render_trip_card(
                 trip, pred, raw_update, stop_names, dest_stop_ids, departure_after,
                 expanded=(idx == 0),
             )
-
-
-def render_transfer_journeys(journeys: list[dict], updates: dict, stop_names) -> None:
-    """Same collapsible pattern as render_trip_card, applied to a whole
-    journey: leave-by banner + journey summary (built from the first leg's
-    plain-English summary) are always visible; per-leg detail and transfer
-    connections live inside one expander per journey.
-    """
-    with st.spinner('Generating predictions...'):
-        for idx, journey in enumerate(journeys, start=1):
-            # Aligned 1:1 with journey['legs'] (None for a leg whose
-            # prediction failed) so transfer_points indexing below still
-            # lines up correctly even if a leg is skipped.
-            leg_predictions = [
-                _predict_leg(leg['trip'], leg['dest_stop_ids'], leg['search_departure_after'], updates)
-                for leg in journey['legs']
-            ]
-
-            first_result = next((r for r in leg_predictions if r is not None), None)
-            if first_result is None:
-                continue
-            first_trip, first_pred, _ = first_result
-
-            n = journey['num_transfers']
-            transfer_note = f"{n} transfer{'' if n == 1 else 's'}, ~{journey['total_minutes']} min total"
-
-            with st.container(border=True):
-                render_leave_by_banner(first_pred)
-                st.write(f"{first_pred['summary']} ({transfer_note}.)")
-
-                if st.button('🗺️ Show route', key=f'show_route_journey_{idx}'):
-                    st.session_state['selected_journey'] = journey
-                    st.rerun()
-
-                label = (
-                    f'Journey {idx} · 🕐 Leave by {first_pred["leave_by"]} — '
-                    f'{route_label_plain(first_trip)} ({transfer_note})'
-                )
-                with st.expander(label, expanded=(idx == 1)):
-                    for leg_idx, result in enumerate(leg_predictions):
-                        if result is None:
-                            continue
-                        trip, pred, raw_update = result
-                        st.markdown(f'**Leg {leg_idx + 1}**')
-                        render_card_detail(trip, pred, raw_update, stop_names, label_prefix=('Board', 'Alight'))
-
-                        if leg_idx < len(journey['transfer_points']):
-                            tp = journey['transfer_points'][leg_idx]
-                            st.divider()
-                            st.markdown(
-                                f"🔄 **Transfer at {tp['stop_name']}** — {tp['connection_minutes']} min connection"
-                            )
-                            st.divider()
+    else:
+        render_transfer_journey_card(journey, leg_predictions, stop_names, idx, expanded=(idx == 0))
 
 
 # ── Header ────────────────────────────────────────────────────────────────
@@ -469,15 +550,31 @@ except Exception as e:
 
 # ── Input section ─────────────────────────────────────────────────────────
 
+mode_filter = st.segmented_control(
+    'Filter by mode', ['All', 'Bus', 'Train', 'Tram'], default='All', key='mode_filter',
+)
+# segmented_control returns None if the user clicks the selected pill again
+# (deselecting it) -- fall back to 'All' rather than leaving it unset, same
+# pattern as departure_mode below.
+mode_filter = mode_filter or 'All'
+
+_swap_spacer_l, swap_col, _swap_spacer_r = st.columns([4, 1, 4])
+with swap_col:
+    can_swap = bool(st.session_state.get('origin_confirmed') or st.session_state.get('dest_confirmed'))
+    if st.button('⇄', key='swap_origin_dest_btn', help='Swap From and To',
+                 use_container_width=True, disabled=not can_swap):
+        _swap_origin_dest()
+        st.rerun()
+
 col_from, col_to = st.columns(2)
 with col_from:
     st.subheader('📍 From')
-    origin = render_from_picker()
+    origin = render_from_picker(mode_filter)
 
 with col_to:
     st.subheader('🎯 To')
     if origin:
-        dest = render_to_picker(origin)
+        dest = render_to_picker(origin, mode_filter)
     else:
         st.info('Set your origin first.')
         dest = None
@@ -525,11 +622,16 @@ if search_clicked:
         window_minutes = 60
         with st.spinner('Searching for trips...'):
             trips = gtfs_data.find_trips(origin['stop_ids'], dest['stop_ids'], departure_after, window_minutes=window_minutes)
-            transfer_journeys = []
-            if not trips:
-                transfer_journeys = gtfs_data.find_multi_leg_trips(
-                    origin['stop_ids'], dest['stop_ids'], departure_after, window_minutes=window_minutes,
-                )
+            # Always runs now, direct or not -- a direct trip existing is no
+            # longer a reason to skip transfer alternatives that might
+            # actually have a sooner predicted arrival (see the merged
+            # ranking below). max_results widened to CANDIDATE_POOL_SIZE so
+            # prediction (and ranking) sees more than the final display count
+            # from this path too.
+            transfer_journeys = gtfs_data.find_multi_leg_trips(
+                origin['stop_ids'], dest['stop_ids'], departure_after, window_minutes=window_minutes,
+                max_results=CANDIDATE_POOL_SIZE,
+            )
         st.session_state['results'] = {
             'trips': trips,
             'transfer_journeys': transfer_journeys,
@@ -545,51 +647,76 @@ results = st.session_state.get('results')
 if results:
     trips = results['trips']
     transfer_journeys = results.get('transfer_journeys', [])
+    dest_stop_ids = results['dest_stop_ids']
+    departure_after = results['departure_after']
     st.divider()
 
-    if not trips and not transfer_journeys:
+    # Wrap direct trips into the same journey shape find_multi_leg_trips()
+    # uses, so both paths can be predicted/ranked/rendered uniformly.
+    # transfer_journeys is filtered to num_transfers >= 1: find_multi_leg_trips()
+    # runs its own depth-0 direct check internally too (now that the old
+    # `if not trips:` gate is gone, that branch is live), which would
+    # otherwise duplicate every entry already covered by `trips`.
+    direct_journeys = [
+        gtfs_data._direct_journey(trip, dest_stop_ids, departure_after)
+        for trip in trips[:CANDIDATE_POOL_SIZE]
+    ]
+    transfer_only_journeys = [j for j in transfer_journeys if j['num_transfers'] >= 1]
+    candidate_journeys = direct_journeys + transfer_only_journeys
+
+    if not candidate_journeys:
         st.info(
             f'No services found between these stops within the next {results["window_minutes"]} minutes, '
             'even with transfers. Try a different time or check nearby stops.'
         )
     else:
-        # Default to the first available result, matching the
-        # expanded=True-for-first-card convention: direct trip idx 0 if any
-        # exist, else the first transfer journey.
-        if st.session_state.get('selected_journey') is None:
-            if trips:
-                st.session_state['selected_journey'] = gtfs_data._direct_journey(
-                    trips[0], results['dest_stop_ids'], results['departure_after'],
-                )
-            elif transfer_journeys:
-                st.session_state['selected_journey'] = transfer_journeys[0]
-
-        selected_journey = st.session_state.get('selected_journey')
-        origin_marker = st.session_state.get('origin_confirmed')
-        dest_marker = st.session_state.get('dest_confirmed')
-        if selected_journey and origin_marker and dest_marker:
-            route_legs = _build_route_map_legs(selected_journey)
-            print(
-                f'[route map] rendering {len(route_legs)} leg(s): '
-                f"{[(l['label'], len(l['points']) if l['points'] else 0) for l in route_legs]}"
-            )
-            map_picker.render_route_map(route_legs, origin_marker, dest_marker, key='route_map')
-
         updates, live_error = get_live_updates()
         if live_error:
             st.warning('Live GTFS-RT feed is currently unavailable — showing model predictions only.')
 
         stop_names = data.stops.set_index('stop_id')['stop_name']
 
-        if trips:
-            if transfer_journeys:
-                st.subheader('Direct services')
-            render_direct_trips(trips, results['dest_stop_ids'], results['departure_after'], updates, stop_names)
+        if any(t.get('fallback_schedule') for t in trips):
+            st.info('Schedule based on projected timetable — times may vary')
 
-        if transfer_journeys:
-            if trips:
-                st.subheader('Services with transfers')
-            render_transfer_journeys(transfer_journeys, updates, stop_names)
+        # Predict every candidate in the widened pool BEFORE truncating to
+        # MAX_RESULTS, then rank purely by predicted arrival time -- not
+        # scheduled time, not transfer count, and confidence is displayed
+        # per-card but never factored into this sort.
+        with st.spinner('Generating predictions...'):
+            ranked = []
+            for journey in candidate_journeys:
+                leg_predictions = _predict_journey_legs(journey, updates)
+                predicted_arrival = _predicted_arrival(leg_predictions)
+                if predicted_arrival is not None:
+                    ranked.append((predicted_arrival, journey, leg_predictions))
+
+        ranked.sort(key=lambda r: r[0])
+        display_candidates = ranked[:MAX_RESULTS]
+
+        if not display_candidates:
+            st.info('Found services, but none could be predicted right now. Try again shortly.')
+        else:
+            st.caption('Ranked by predicted arrival time.')
+
+            # Previous selection may not correspond to this new result set --
+            # default to the top-ranked candidate.
+            if st.session_state.get('selected_journey') is None:
+                st.session_state['selected_journey'] = display_candidates[0][1]
+
+            selected_journey = st.session_state.get('selected_journey')
+            origin_marker = st.session_state.get('origin_confirmed')
+            dest_marker = st.session_state.get('dest_confirmed')
+            if selected_journey and origin_marker and dest_marker:
+                route_legs = _build_route_map_legs(selected_journey)
+                print(
+                    f'[route map] rendering {len(route_legs)} leg(s): '
+                    f"{[(l['label'], len(l['points']) if l['points'] else 0) for l in route_legs]}"
+                )
+                map_picker.render_route_map(route_legs, origin_marker, dest_marker, key='route_map')
+
+            for idx, (_predicted_arrival_dt, journey, leg_predictions) in enumerate(display_candidates):
+                render_ranked_journey(idx, journey, leg_predictions, stop_names, dest_stop_ids, departure_after)
 
 # ── Footer ──────────────────────────────────────────────────────────────
 

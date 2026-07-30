@@ -6,6 +6,7 @@ on top of it. No Streamlit or model code here — data layer only.
 """
 from __future__ import annotations
 
+import bisect
 import re
 from datetime import datetime, timedelta
 from math import atan2, cos, log1p, radians, sin, sqrt
@@ -14,6 +15,7 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 
 import config
+from route_types import FERRY_ROUTE_TYPE
 
 DATE_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 DAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
@@ -25,7 +27,7 @@ STATIC_FILES = ['stops.txt', 'stop_times.txt', 'trips.txt', 'routes.txt',
 # (scripts/archive_gtfsrt.py, untouched) -- routes, trips, stop_times, and
 # stops are all filtered against this in load() so no ferry service can ever
 # reach search, BFS transfer routing, or prediction downstream.
-FERRY_ROUTE_TYPE = 4
+# (FERRY_ROUTE_TYPE itself now lives in route_types.py, imported above.)
 
 # Sunday/thin-calendar fallback: a query date within this many days of the
 # static snapshot's capture date is where TransLink's calendar_dates.txt
@@ -67,6 +69,14 @@ class GTFSData:
         self.cluster_to_routes = None  # canonical station name -> set of route_id
         self.cluster_stop_ids = None   # canonical station name -> list of stop_id
         self.shape_points = None       # shape_id -> ordered list of (lat, lon), built at load time
+        # Per-route departure/arrival index used by _resolve_chain()'s fast
+        # path (see _build_route_departure_index) -- a static structural
+        # artifact of the snapshot, same rationale as route_to_stops above.
+        self.route_stop_departures = None  # route_id -> stop_id -> sorted [(departure_seconds, trip_id, stop_sequence, service_id)]
+        self.route_trip_stops = None       # route_id -> trip_id -> {stop_id: (stop_sequence, arrival_seconds)}
+        self.route_meta = None             # route_id -> {route_short_name, route_long_name, route_type}
+        self.stop_name_by_id = None        # stop_id -> stop_name
+        self.trip_headsign_by_id = None    # trip_id -> trip_headsign or None
 
     def load(self):
         bucket, fs = _get_env()
@@ -153,6 +163,7 @@ class GTFSData:
 
         self._build_stop_index()
         self._build_route_indexes()
+        self._build_route_departure_index()
 
         print(
             f'Loaded snapshot {self.snapshot_date}: '
@@ -235,6 +246,71 @@ class GTFSData:
             cluster = stop_to_cluster.get(stop_id, stop_id)
             cluster_to_routes.setdefault(cluster, set()).update(routes)
         self.cluster_to_routes = cluster_to_routes
+
+    def _build_route_departure_index(self):
+        """Per-route stop-level departure/arrival index -- a static structural
+        artifact of the snapshot (same rationale as route_to_stops), built
+        once here so _resolve_chain()'s per-leg existence check doesn't need
+        a fresh pandas merge over the whole day's stop_times for every
+        candidate chain. Profiling on real hub-to-hub queries showed this
+        merge (via find_trips() -> _find_trips_core()) costing ~127ms/call,
+        with hundreds of candidate chains per query -- that's the >50s cost
+        this index replaces with an O(log n) lookup.
+
+        route_stop_departures[route_id][stop_id] = sorted list of
+        (departure_seconds, trip_id, stop_sequence, service_id) -- the
+        origin-side lookup, sorted so a window search is a bisect.
+
+        route_trip_stops[route_id][trip_id] = {stop_id: (stop_sequence,
+        arrival_seconds)} -- every stop a given trip visits on this route,
+        for the destination-side reachability + ordering check.
+
+        Also caches route_meta / stop_name_by_id / trip_headsign_by_id so a
+        fast-path hit can build a full trip dict without touching pandas.
+        """
+        merged = self.stop_times[['trip_id', 'stop_id', 'stop_sequence', 'arrival_time', 'departure_time']].merge(
+            self.trips[['trip_id', 'route_id', 'service_id']], on='trip_id', how='left'
+        ).dropna(subset=['route_id'])
+        merged = merged.assign(
+            departure_seconds=_parse_gtfs_time(merged['departure_time']).dt.total_seconds().astype(int),
+            arrival_seconds=_parse_gtfs_time(merged['arrival_time']).dt.total_seconds().astype(int),
+        )
+
+        route_stop_departures: dict[str, dict[str, list]] = {}
+        route_trip_stops: dict[str, dict[str, dict]] = {}
+
+        for route_id, group in merged.groupby('route_id', sort=False):
+            by_stop: dict[str, list] = {}
+            by_trip: dict[str, dict] = {}
+            for row in group.itertuples(index=False):
+                by_stop.setdefault(row.stop_id, []).append(
+                    (row.departure_seconds, row.trip_id, row.stop_sequence, row.service_id)
+                )
+                by_trip.setdefault(row.trip_id, {})[row.stop_id] = (row.stop_sequence, row.arrival_seconds)
+            for entries in by_stop.values():
+                entries.sort(key=lambda t: t[0])
+            route_stop_departures[route_id] = by_stop
+            route_trip_stops[route_id] = by_trip
+
+        self.route_stop_departures = route_stop_departures
+        self.route_trip_stops = route_trip_stops
+
+        self.route_meta = {
+            row.route_id: {
+                'route_short_name': row.route_short_name,
+                'route_long_name': row.route_long_name,
+                'route_type': row.route_type,
+            }
+            for row in self.routes.itertuples(index=False)
+        }
+        self.stop_name_by_id = self.stops.set_index('stop_id')['stop_name'].to_dict()
+        if 'trip_headsign' in self.trips.columns:
+            self.trip_headsign_by_id = {
+                tid: (h if isinstance(h, str) and h.strip() else None)
+                for tid, h in zip(self.trips['trip_id'], self.trips['trip_headsign'])
+            }
+        else:
+            self.trip_headsign_by_id = {}
 
     def active_service_ids(self, query_date) -> set:
         date_int = int(query_date.strftime('%Y%m%d'))
@@ -684,7 +760,167 @@ def _expand_route_frontier(
     return completed, next_frontier
 
 
+_INDEX_UNRESOLVED = object()  # sentinel: the fast index has no data for this route/stop -- caller must fall back to the pandas path
+
+
+def _any_route_reaches_dest(data, from_stops, to_stops, query_date, search_departure_after, window_minutes):
+    """Mirrors find_trips()'s own non-empty gate (any route, any trip, from
+    any of from_stops to any of to_stops, sequence-ordered, within window, on
+    an active service) -- NOT scoped to one route_id.
+
+    find_trips()'s FALLBACK_THIN_COVERAGE_DAYS day-shift only triggers when
+    _find_trips_core() is empty across ALL routes for this stop pair -- if
+    some other route already serves it, find_trips() returns those rows
+    immediately and never reaches its own fallback, even though the ONE
+    route _lookup_leg_trip cares about has nothing that day. Without this
+    check, _lookup_leg_trip's day-shift retry (below) would fire whenever
+    just its own route is empty, misapplying a 7-day-shifted schedule to a
+    route that's correctly just not running that day (e.g. a calendar_dates
+    exception for that one date) while a near-duplicate route/service
+    happens to run a week later -- confirmed by differential testing against
+    the old code on a real case (Southport -> Beenleigh, route VLBD-4999).
+    """
+    active = data.active_service_ids(query_date)
+    day_midnight = datetime(query_date.year, query_date.month, query_date.day)
+    window_start = (search_departure_after - day_midnight).total_seconds()
+    window_end = window_start + window_minutes * 60
+    to_stop_set = set(to_stops)
+
+    routes_here = set()
+    for sid in from_stops:
+        routes_here |= data.stop_to_routes.get(sid, set())
+
+    for route_id in routes_here:
+        stop_departures = data.route_stop_departures.get(route_id)
+        trip_stops = data.route_trip_stops.get(route_id)
+        if not stop_departures or not trip_stops:
+            continue
+        for sid in from_stops:
+            entries = stop_departures.get(sid)
+            if not entries:
+                continue
+            idx = bisect.bisect_left(entries, (window_start,))
+            for dep_sec, trip_id, seq, service_id in entries[idx:]:
+                if dep_sec > window_end:
+                    break
+                if service_id not in active:
+                    continue
+                trip_map = trip_stops.get(trip_id)
+                if not trip_map:
+                    continue
+                for dsid in to_stop_set:
+                    dest_entry = trip_map.get(dsid)
+                    if dest_entry and dest_entry[0] > seq:
+                        return True
+    return False
+
+
+def _lookup_leg_trip(
+    data: GTFSData,
+    route_id: str,
+    from_stops: list[str],
+    to_stops: list[str],
+    departure_after: datetime,
+    window_minutes: int,
+):
+    """Fast index-based replacement for _resolve_chain()'s old
+    find_trips()-then-filter-by-route_id existence check. Mirrors
+    find_trips()'s semantics exactly -- earliest valid departure on
+    `route_id` from any of `from_stops` to any of `to_stops` within the
+    window, including its FALLBACK_THIN_COVERAGE_DAYS 7-day-ahead retry --
+    using GTFSData.route_stop_departures/route_trip_stops instead of a
+    pandas merge over the whole day's stop_times.
+
+    Returns a trip dict shaped like find_trips()'s rows, None if genuinely no
+    connecting trip exists on this route (a real negative answer -- the old
+    code would have reached the same conclusion, just slower), or the
+    _INDEX_UNRESOLVED sentinel if the index has no data to answer this query
+    at all (route_id or all of from_stops missing from the index -- should
+    not happen given route_to_stops is built from the same data, but this is
+    flagged explicitly by the caller rather than silently guessing).
+    """
+    stop_departures = data.route_stop_departures.get(route_id)
+    trip_stops = data.route_trip_stops.get(route_id)
+    if not stop_departures or not trip_stops:
+        return _INDEX_UNRESOLVED
+    if not any(sid in stop_departures for sid in from_stops):
+        return _INDEX_UNRESOLVED
+
+    to_stop_set = set(to_stops)
+
+    def _search(query_date, search_departure_after):
+        active = data.active_service_ids(query_date)
+        day_midnight = datetime(query_date.year, query_date.month, query_date.day)
+        window_start = (search_departure_after - day_midnight).total_seconds()
+        window_end = window_start + window_minutes * 60
+
+        best = None  # (dep_sec, trip_id, origin_stop_id, origin_seq, dest_stop_id, dest_seq, arr_sec)
+        for sid in from_stops:
+            entries = stop_departures.get(sid)
+            if not entries:
+                continue
+            idx = bisect.bisect_left(entries, (window_start,))
+            for dep_sec, trip_id, seq, service_id in entries[idx:]:
+                if dep_sec > window_end:
+                    break
+                if best is not None and dep_sec >= best[0]:
+                    break  # sorted ascending -- nothing further here can beat the current best
+                if service_id not in active:
+                    continue
+                trip_map = trip_stops.get(trip_id)
+                if not trip_map:
+                    continue
+                for dsid in to_stop_set:
+                    dest_entry = trip_map.get(dsid)
+                    if dest_entry and dest_entry[0] > seq:
+                        best = (dep_sec, trip_id, sid, seq, dsid, dest_entry[0], dest_entry[1])
+                        break
+        return best, day_midnight
+
+    query_date = departure_after.date()
+    best, day_midnight = _search(query_date, departure_after)
+
+    fallback_schedule = False
+    if best is None:
+        snapshot_date = datetime.strptime(data.snapshot_date, '%Y-%m-%d').date()
+        if abs((query_date - snapshot_date).days) <= FALLBACK_THIN_COVERAGE_DAYS:
+            # Only attempt the day-shift if NO route at all serves this stop
+            # pair in this window on this date -- matching find_trips()'s
+            # real trigger condition exactly (see _any_route_reaches_dest).
+            if not _any_route_reaches_dest(data, from_stops, to_stops, query_date, departure_after, window_minutes):
+                fb_departure_after = departure_after + timedelta(days=7)
+                best, day_midnight = _search(fb_departure_after.date(), fb_departure_after)
+                fallback_schedule = best is not None
+
+    if best is None:
+        return None
+
+    dep_sec, trip_id, origin_stop_id, origin_seq, dest_stop_id, dest_seq, arr_sec = best
+    origin_departure_time = day_midnight + timedelta(seconds=dep_sec)
+    dest_arrival_time = day_midnight + timedelta(seconds=arr_sec)
+    if fallback_schedule:
+        origin_departure_time -= timedelta(days=7)
+        dest_arrival_time -= timedelta(days=7)
+
+    meta = data.route_meta.get(route_id, {})
+    return {
+        'trip_id': trip_id,
+        'route_id': route_id,
+        'route_short_name': meta.get('route_short_name'),
+        'route_long_name': meta.get('route_long_name'),
+        'route_type': meta.get('route_type'),
+        'trip_headsign': data.trip_headsign_by_id.get(trip_id),
+        'origin_stop_name': data.stop_name_by_id.get(origin_stop_id),
+        'origin_departure_time': origin_departure_time,
+        'dest_stop_name': data.stop_name_by_id.get(dest_stop_id),
+        'dest_arrival_time': dest_arrival_time,
+        'n_stops_between': max(dest_seq - origin_seq - 1, 0),
+        'fallback_schedule': fallback_schedule,
+    }
+
+
 def _resolve_chain(
+    data: GTFSData,
     chain: dict,
     origin_stop_ids: list[str],
     dest_stop_ids: list[str],
@@ -693,9 +929,12 @@ def _resolve_chain(
     min_connection: int,
     max_connection: int,
 ) -> dict | None:
-    """Resolve a route-graph chain into a timed journey by calling find_trips()
-    leg-by-leg. Returns None if any leg has no timed trip within its window, or
-    any connection falls outside [min_connection, max_connection].
+    """Resolve a route-graph chain into a timed journey, leg-by-leg. Each leg
+    first tries _lookup_leg_trip()'s fast per-route index; only when that
+    index can't answer at all (_INDEX_UNRESOLVED) does it fall back to the
+    original find_trips()-then-filter-by-route_id pandas path, logging the
+    fallthrough. Returns None if any leg has no timed trip within its window,
+    or any connection falls outside [min_connection, max_connection].
     """
     routes = chain['routes']
     leg_stop_bounds = [origin_stop_ids] + list(chain['transfer_stops']) + [dest_stop_ids]
@@ -709,11 +948,18 @@ def _resolve_chain(
     for i, route_id in enumerate(routes):
         from_stops = leg_stop_bounds[i]
         to_stops = leg_stop_bounds[i + 1]
-        candidates = find_trips(from_stops, to_stops, next_departure_after, next_window)
-        candidates = [t for t in candidates if t['route_id'] == route_id]
-        if not candidates:
+
+        trip = _lookup_leg_trip(data, route_id, from_stops, to_stops, next_departure_after, next_window)
+        if trip is _INDEX_UNRESOLVED:
+            print(
+                f'[_resolve_chain] index fallthrough: route_id={route_id!r} not covered by '
+                f'route_stop_departures/route_trip_stops -- falling back to full find_trips() scan'
+            )
+            candidates = find_trips(from_stops, to_stops, next_departure_after, next_window)
+            candidates = [t for t in candidates if t['route_id'] == route_id]
+            trip = candidates[0] if candidates else None
+        if trip is None:
             return None
-        trip = candidates[0]
 
         if i > 0:
             prev_arrival = legs[i - 1]['trip']['dest_arrival_time']
@@ -832,7 +1078,7 @@ def find_multi_leg_trips(
             if terminal_route in settled_routes:
                 continue
             journey = _resolve_chain(
-                chain, origin_stop_ids, dest_stop_ids, departure_after, window_minutes,
+                data, chain, origin_stop_ids, dest_stop_ids, departure_after, window_minutes,
                 min_connection, max_connection,
             )
             if journey is not None:
