@@ -98,6 +98,45 @@ class GTFSData:
             path = f's3://{static_prefix}/{self.snapshot_date}/{name}'
             frames[name] = pd.read_csv(path, dtype=str)
 
+        # --- DIAGNOSTIC (print-only, no filtering applied yet) -- investigate
+        # 'turnback' stops before any ferry exclusion or index-building runs,
+        # against the raw, unfiltered frames as read from S3. ---
+        stops_diag = frames['stops.txt']
+        stop_times_diag = frames['stop_times.txt']
+
+        turnback_mask = stops_diag['stop_name'].str.contains('turnback', case=False, na=False)
+        turnback_stops = stops_diag[turnback_mask]
+        print(f"[DIAGNOSTIC] 'turnback' stop_name matches: {len(turnback_stops)}")
+        for name in sorted(turnback_stops['stop_name'].unique()):
+            print(f'  - {name!r}')
+
+        st_seq = stop_times_diag.assign(stop_sequence=stop_times_diag['stop_sequence'].astype(int))
+        trip_min_max = st_seq.groupby('trip_id')['stop_sequence'].agg(['min', 'max'])
+
+        for row in turnback_stops.itertuples(index=False):
+            stop_id = row.stop_id
+            parent_station = getattr(row, 'parent_station', None)
+            has_parent = isinstance(parent_station, str) and parent_station.strip() != ''
+
+            matches = st_seq[st_seq['stop_id'] == stop_id]
+            n_trips = matches['trip_id'].nunique()
+            print(f'\n[DIAGNOSTIC] stop_id={stop_id!r} stop_name={row.stop_name!r}')
+            print(f"  in stop_times.txt: {'yes' if not matches.empty else 'no'} ({n_trips} distinct trip_id(s))")
+            print(f'  parent_station: {parent_station!r} (has_parent={has_parent})')
+
+            if not matches.empty:
+                first_count = last_count = middle_count = 0
+                for m in matches.itertuples(index=False):
+                    tmin, tmax = trip_min_max.loc[m.trip_id, 'min'], trip_min_max.loc[m.trip_id, 'max']
+                    if m.stop_sequence == tmin:
+                        first_count += 1
+                    elif m.stop_sequence == tmax:
+                        last_count += 1
+                    else:
+                        middle_count += 1
+                print(f'  occurrences: {len(matches)} across {n_trips} distinct trip(s) -- '
+                      f'position: first={first_count} last={last_count} middle={middle_count}')
+
         # --- Ferry exclusion, in dependency order (routes -> trips ->
         # stop_times -> stops) -- see FERRY_ROUTE_TYPE above. Filtering here,
         # before _build_stop_index()/_build_route_indexes() run, means every
@@ -170,6 +209,10 @@ class GTFSData:
             f'{len(self.stops):,} stops, {len(self.routes):,} routes, '
             f'{len(self.trips):,} trips, {len(self.stop_times):,} stop_times'
         )
+        print(
+            f'Excluded {len(self._turnback_excluded_names)} turnback stop(s) from the search index '
+            f'(still present in routing/prediction data): {self._turnback_excluded_names}'
+        )
 
         total_trips = len(self.trips)
         trips_with_shape = self.trips['shape_id'].notna().sum()
@@ -195,7 +238,21 @@ class GTFSData:
         canonical_id = stops['parent_station'].fillna(stops['stop_id'])
         canonical_name = canonical_id.map(name_by_id).fillna(stops['stop_name'])
 
-        grouped = stops.assign(canonical_name=canonical_name).groupby(
+        # Tram turnback points (e.g. 'Cavill Avenue turnback') are operational
+        # waypoints a trip passes through mid-journey while reversing
+        # direction, not passenger-facing boarding stops -- confirmed via
+        # diagnostic: every occurrence in stop_times.txt sits at a middle
+        # stop_sequence position (never first/last), and none carry a
+        # parent_station. Excluded here from the search/nearest-stop index
+        # ONLY (name-based, not a hardcoded stop_id list, since stop_ids are
+        # snapshot-specific). routing (route_to_stops, stop_to_routes,
+        # cluster_to_routes, _stop_id_to_canonical_name below) still needs
+        # the full stop set -- real trips physically pass through them.
+        turnback_mask = stops['stop_name'].str.contains('turnback', case=False, na=False)
+        self._turnback_excluded_names = sorted(stops.loc[turnback_mask, 'stop_name'].unique())
+        searchable_stops = stops.loc[~turnback_mask]
+
+        grouped = searchable_stops.assign(canonical_name=canonical_name).groupby(
             'canonical_name', sort=False
         ).agg(
             stop_ids=('stop_id', lambda s: sorted(set(s))),
@@ -206,7 +263,9 @@ class GTFSData:
         # stop_id -> canonical station name, reused by _build_route_indexes()
         # so transfer detection recognizes same-station platforms that carry
         # different stop_ids per mode (e.g. a tram platform and a train
-        # platform at the same interchange).
+        # platform at the same interchange). Built from the FULL stops frame
+        # (not searchable_stops) -- must not lose turnback stop_ids, which
+        # _build_route_indexes() needs for correct transfer clustering.
         self._stop_id_to_canonical_name = dict(zip(stops['stop_id'], canonical_name))
 
     def _build_route_indexes(self):

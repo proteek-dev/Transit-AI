@@ -202,16 +202,14 @@ def _swap_origin_dest() -> None:
     """Swap the confirmed origin/destination stops in place. Both sides are
     normalized first (see _normalize_confirmed_stop) so the swap is
     well-defined regardless of how each stop was originally selected (map tap
-    vs typed search). Clears the current results/selected journey since they
-    were computed for the pre-swap direction -- the user re-runs Search for
-    the reversed trip.
+    vs typed search). Clears the current results since they were computed for
+    the pre-swap direction -- the user re-runs Search for the reversed trip.
     """
     origin = _normalize_confirmed_stop(st.session_state.get('origin_confirmed'))
     dest = _normalize_confirmed_stop(st.session_state.get('dest_confirmed'))
     st.session_state['origin_confirmed'] = dest
     st.session_state['dest_confirmed'] = origin
     st.session_state['results'] = None
-    st.session_state['selected_journey'] = None
 
 
 def _build_route_map_legs(journey: dict) -> list[dict]:
@@ -465,18 +463,28 @@ def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names
 
     `dest_stop_ids`/`departure_after` are only needed to wrap this trip into
     the same one-leg-journey shape find_multi_leg_trips() produces, for the
-    "Show route" button below.
+    "Show route" toggle below.
     """
     render_leave_by_banner(pred)
     st.write(pred['summary'])
 
-    if st.button('🗺️ Show route', key=f"show_route_{trip['trip_id']}"):
-        st.session_state['selected_journey'] = gtfs_data._direct_journey(trip, dest_stop_ids, departure_after)
-        st.rerun()
+    route_open_key = f"show_route_open_{trip['trip_id']}"
+    if st.button('🗺️ Show route', key=f"show_route_btn_{trip['trip_id']}"):
+        st.session_state[route_open_key] = not st.session_state.get(route_open_key, False)
 
     label = f'🕐 Leave by {pred["leave_by"]} — {route_label_plain(trip)}'
     with st.expander(label, expanded=expanded):
         render_card_detail(trip, pred, raw_update, stop_names, label_prefix)
+
+        if st.session_state.get(route_open_key, False):
+            origin_marker = st.session_state.get('origin_confirmed')
+            dest_marker = st.session_state.get('dest_confirmed')
+            if origin_marker and dest_marker:
+                journey = gtfs_data._direct_journey(trip, dest_stop_ids, departure_after)
+                route_legs = _build_route_map_legs(journey)
+                map_picker.render_route_map(
+                    route_legs, origin_marker, dest_marker, key=f"route_map_{trip['trip_id']}",
+                )
 
 
 def render_transfer_journey_card(journey: dict, leg_predictions: list, stop_names,
@@ -494,13 +502,14 @@ def render_transfer_journey_card(journey: dict, leg_predictions: list, stop_name
     n = journey['num_transfers']
     transfer_note = f"{n} transfer{'' if n == 1 else 's'}, ~{journey['total_minutes']} min total"
 
+    route_open_key = f'show_route_open_journey_{idx}'
+
     with st.container(border=True):
         render_leave_by_banner(first_pred)
         st.write(f"{first_pred['summary']} ({transfer_note}.)")
 
-        if st.button('🗺️ Show route', key=f'show_route_journey_{idx}'):
-            st.session_state['selected_journey'] = journey
-            st.rerun()
+        if st.button('🗺️ Show route', key=f'show_route_btn_journey_{idx}'):
+            st.session_state[route_open_key] = not st.session_state.get(route_open_key, False)
 
         label = f'🕐 Leave by {first_pred["leave_by"]} — {route_label_plain(first_trip)} ({transfer_note})'
         with st.expander(label, expanded=expanded):
@@ -518,6 +527,15 @@ def render_transfer_journey_card(journey: dict, leg_predictions: list, stop_name
                         f"🔄 **Transfer at {tp['stop_name']}** — {tp['connection_minutes']} min connection"
                     )
                     st.divider()
+
+            if st.session_state.get(route_open_key, False):
+                origin_marker = st.session_state.get('origin_confirmed')
+                dest_marker = st.session_state.get('dest_confirmed')
+                if origin_marker and dest_marker:
+                    route_legs = _build_route_map_legs(journey)
+                    map_picker.render_route_map(
+                        route_legs, origin_marker, dest_marker, key=f'route_map_journey_{idx}',
+                    )
 
 
 def render_ranked_journey(idx: int, journey: dict, leg_predictions: list, stop_names,
@@ -648,9 +666,6 @@ if search_clicked:
             'departure_after': departure_after,
             'window_minutes': window_minutes,
         }
-        # Previous selection may not correspond to this new result set --
-        # cleared here so the block below re-defaults to the first result.
-        st.session_state['selected_journey'] = None
 
 results = st.session_state.get('results')
 if results:
@@ -708,22 +723,6 @@ if results:
         else:
             st.caption('Ranked by predicted arrival time.')
 
-            # Previous selection may not correspond to this new result set --
-            # default to the top-ranked candidate.
-            if st.session_state.get('selected_journey') is None:
-                st.session_state['selected_journey'] = display_candidates[0][1]
-
-            selected_journey = st.session_state.get('selected_journey')
-            origin_marker = st.session_state.get('origin_confirmed')
-            dest_marker = st.session_state.get('dest_confirmed')
-            if selected_journey and origin_marker and dest_marker:
-                route_legs = _build_route_map_legs(selected_journey)
-                print(
-                    f'[route map] rendering {len(route_legs)} leg(s): '
-                    f"{[(l['label'], len(l['points']) if l['points'] else 0) for l in route_legs]}"
-                )
-                map_picker.render_route_map(route_legs, origin_marker, dest_marker, key='route_map')
-
             for idx, (_predicted_arrival_dt, journey, leg_predictions) in enumerate(display_candidates):
                 render_ranked_journey(idx, journey, leg_predictions, stop_names, dest_stop_ids, departure_after)
 
@@ -738,7 +737,25 @@ with st.expander('About this app'):
         'research prototype, not an official TransLink product.'
     )
 
+training_metadata = prediction.get_training_metadata()
+trained_at = datetime.fromisoformat(training_metadata['trained_at']).strftime('%d %b %Y')
+
+data_window_start = training_metadata.get('data_window_start')
+data_window_end = training_metadata.get('data_window_end')
+data_window_days = training_metadata.get('data_window_days')
+
+if data_window_start and data_window_end and data_window_days:
+    predictions_caption = (
+        f'Predictions based on {data_window_days} days of historical data '
+        f'({data_window_start} to {data_window_end}). Model last trained {trained_at}.'
+    )
+else:
+    # Older training_metadata.json from before the data_window_* fields
+    # existed -- fall back to just the trained-at date, never a hardcoded
+    # day count that could silently go stale.
+    predictions_caption = f'Model last trained {trained_at}.'
+
 st.caption(
-    'Predictions based on ~21 days of historical data. '
+    f'{predictions_caption} '
     'Model: XGBoost v0 baseline. Live data from TransLink GTFS-RT feeds.'
 )
