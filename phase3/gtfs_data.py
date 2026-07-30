@@ -385,11 +385,23 @@ def search_stops(query: str, limit: int = 10) -> list[dict]:
     ]
 
 
-def get_trip_shape_points(trip_id: str) -> list[tuple] | None:
+def get_trip_shape_points(
+    trip_id: str, origin_stop_id: str | None = None, dest_stop_id: str | None = None,
+) -> list[tuple] | None:
     """(lat, lon) points for trip_id's shape, in shape_pt_sequence order.
 
     Returns None if trip_id isn't found, or if the trip has no shape_id
     (a valid GTFS state, not a bug).
+
+    If origin_stop_id and dest_stop_id are both given, the shape is trimmed
+    to just the origin-to-destination segment: each stop's (lat, lon) is
+    matched to its nearest shape point (plain Euclidean distance -- shape
+    points are dense enough at this scale that haversine isn't needed), and
+    the point list is sliced between the two matched indices (inclusive,
+    ordered by index rather than assuming which stop comes first) so the
+    rendered path is the passenger's actual ride, not the vehicle's whole
+    route. Falls back to the full shape if either stop_id isn't found in
+    data.stops.
     """
     data = load_gtfs_data()
     trip_rows = data.trips.loc[data.trips['trip_id'] == trip_id, 'shape_id']
@@ -398,7 +410,27 @@ def get_trip_shape_points(trip_id: str) -> list[tuple] | None:
     shape_id = trip_rows.iloc[0]
     if pd.isna(shape_id):
         return None
-    return data.shape_points.get(shape_id)
+    points = data.shape_points.get(shape_id)
+    if points is None or origin_stop_id is None or dest_stop_id is None:
+        return points
+
+    stop_lat_lon = data.stops.set_index('stop_id')[['stop_lat', 'stop_lon']]
+    if origin_stop_id not in stop_lat_lon.index or dest_stop_id not in stop_lat_lon.index:
+        return points
+
+    origin_lat, origin_lon = stop_lat_lon.loc[origin_stop_id]
+    dest_lat, dest_lon = stop_lat_lon.loc[dest_stop_id]
+
+    def _nearest_point_idx(lat: float, lon: float) -> int:
+        return min(
+            range(len(points)),
+            key=lambda i: (points[i][0] - lat) ** 2 + (points[i][1] - lon) ** 2,
+        )
+
+    origin_idx = _nearest_point_idx(origin_lat, origin_lon)
+    dest_idx = _nearest_point_idx(dest_lat, dest_lon)
+    lo, hi = min(origin_idx, dest_idx), max(origin_idx, dest_idx)
+    return points[lo:hi + 1]
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -602,8 +634,10 @@ def _find_trips_core(
             'route_long_name': row.route_long_name,
             'route_type': row.route_type,
             'trip_headsign': row.trip_headsign if isinstance(row.trip_headsign, str) and row.trip_headsign.strip() else None,
+            'origin_stop_id': row.origin_stop_id,
             'origin_stop_name': row.origin_stop_name,
             'origin_departure_time': row.origin_departure_dt.to_pydatetime(),
+            'dest_stop_id': row.dest_stop_id,
             'dest_stop_name': row.dest_stop_name,
             'dest_arrival_time': row.dest_arrival_dt.to_pydatetime(),
             'n_stops_between': int(row.n_stops_between),
@@ -910,8 +944,10 @@ def _lookup_leg_trip(
         'route_long_name': meta.get('route_long_name'),
         'route_type': meta.get('route_type'),
         'trip_headsign': data.trip_headsign_by_id.get(trip_id),
+        'origin_stop_id': origin_stop_id,
         'origin_stop_name': data.stop_name_by_id.get(origin_stop_id),
         'origin_departure_time': origin_departure_time,
+        'dest_stop_id': dest_stop_id,
         'dest_stop_name': data.stop_name_by_id.get(dest_stop_id),
         'dest_arrival_time': dest_arrival_time,
         'n_stops_between': max(dest_seq - origin_seq - 1, 0),

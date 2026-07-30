@@ -140,6 +140,14 @@ def _closest_slot_index(slots: list[time], target: time) -> int:
     return diffs.index(min(diffs))
 
 
+def _rotate_slots(slots: list[time], start_idx: int) -> list[time]:
+    """Rotate a chronological slot list so it starts at start_idx and wraps
+    back around to itself -- every slot is still present, just reordered so
+    the closest-to-now slot leads instead of midnight.
+    """
+    return slots[start_idx:] + slots[:start_idx]
+
+
 def _attach_route_types(stops: list[dict]) -> list[dict]:
     """Enrich search_stops()-shaped dicts with route_types, so typed-search
     results can be color-coded by mode_picker the same way nearest_stops()
@@ -215,7 +223,7 @@ def _build_route_map_legs(journey: dict) -> list[dict]:
     legs = []
     for i, leg in enumerate(journey['legs']):
         trip = leg['trip']
-        points = gtfs_data.get_trip_shape_points(trip['trip_id'])
+        points = gtfs_data.get_trip_shape_points(trip['trip_id'], trip['origin_stop_id'], trip['dest_stop_id'])
         legs.append({
             'points': points,
             'color': ROUTE_MAP_LEG_COLORS[i % len(ROUTE_MAP_LEG_COLORS)],
@@ -582,9 +590,10 @@ with col_to:
 now_brisbane = datetime.now(BRISBANE_TZ)
 
 time_slots = _time_slot_options()
-label_to_time = {_format_time_ampm_short(t): t for t in time_slots}
-time_labels = list(label_to_time.keys())
 default_time_index = _closest_slot_index(time_slots, now_brisbane.time())
+rotated_time_slots = _rotate_slots(time_slots, default_time_index)
+label_to_time = {_format_time_ampm_short(t): t for t in rotated_time_slots}
+time_labels = list(label_to_time.keys())
 
 col3, col4 = st.columns(2)
 with col3:
@@ -600,7 +609,7 @@ with col4:
 
 travel_time = None
 if departure_mode == 'Custom':
-    selected_time_label = st.selectbox('Departure time', time_labels, index=default_time_index)
+    selected_time_label = st.selectbox('Departure time', time_labels, index=0)
     travel_time = label_to_time[selected_time_label]
 
 search_clicked = st.button('Search', type='primary', use_container_width=True)
