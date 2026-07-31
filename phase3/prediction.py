@@ -21,6 +21,7 @@ import xgboost as xgb
 import config
 import gtfs_data
 import live_gtfs
+from route_types import MODE_BY_ROUTE_TYPE
 
 # The live app always reads/writes phase3/model/latest/. pipeline/02_train_model.sh
 # points a training run at an isolated phase3/model/_staging_{date}_{time}/
@@ -38,10 +39,10 @@ FEATURE_COLS = ['route_id', 'stop_id', 'mode', 'stop_sequence',
                 'hour_of_day', 'day_of_week', 'is_weekend', 'is_peak']
 CATEGORICAL_COLS = ['route_id', 'stop_id', 'mode', 'day_of_week']
 
-# Same mapping notebook 05 uses to derive the training `mode` column from
-# GTFS route_type — needed here to turn a find_trips() route_type back into
-# the same string the model was trained on.
-MODE_BY_ROUTE_TYPE = {0: 'tram', 2: 'rail', 3: 'bus', 4: 'ferry'}
+# MODE_BY_ROUTE_TYPE (route_types.py) is the same mapping notebook 05 uses to
+# derive the training `mode` column from GTFS route_type — needed here to
+# turn a find_trips() route_type back into the same string the model was
+# trained on.
 MODE_NOUN = {'tram': 'tram', 'rail': 'train', 'bus': 'bus', 'ferry': 'ferry', 'unknown': 'service'}
 
 # A (route_short_name, mode) combo with at least this many training rows is
@@ -249,6 +250,14 @@ def _load_training_frames():
     X['is_weekend'] = X['is_weekend'].astype('int8')
     X['is_peak'] = X['is_peak'].astype('int8')
 
+    # Full pre-split date span -- 'source_date' is already string-cast (ISO
+    # 'YYYY-MM-DD' above), so lexicographic min/max is chronological min/max.
+    # Captured here (train+test combined) rather than after the split, since
+    # this is what the model was actually trained+evaluated on as a whole.
+    data_window_start = X['source_date'].min()
+    data_window_end = X['source_date'].max()
+    data_window_days = X['source_date'].nunique()
+
     # --- Cell 6: temporal split (train = earliest dates, test = latest ~20%) ---
     rows_by_date = X.groupby('source_date', observed=True).size().sort_index()
     total_rows = rows_by_date.sum()
@@ -297,7 +306,7 @@ def _load_training_frames():
     # fit time, so inference-time categorical columns can be reconstructed
     # identically (XGBoost's categorical splits are keyed on these codes).
     categories = {c: X_train[c].cat.categories.tolist() for c in CATEGORICAL_COLS}
-    return X_train, y_train, X_test, y_test, categories
+    return X_train, y_train, X_test, y_test, categories, data_window_start, data_window_end, data_window_days
 
 
 def _find_best_matching_static_snapshot(train_route_ids: set):
@@ -335,6 +344,9 @@ def _build_training_metadata(
     test_mae: float,
     naive_mae: float,
     pct_improvement_over_naive: float,
+    data_window_start: str,
+    data_window_end: str,
+    data_window_days: int,
 ) -> dict:
     """Coverage counts per (route_short_name, mode), used by predict_delay()
     to judge whether a live route was well represented in training — keyed
@@ -361,12 +373,17 @@ def _build_training_metadata(
         'test_mae': test_mae,
         'naive_mae': naive_mae,
         'pct_improvement_over_naive': pct_improvement_over_naive,
+        'data_window_start': data_window_start,
+        'data_window_end': data_window_end,
+        'data_window_days': data_window_days,
     }
 
 
 def _train_and_save_model() -> None:
     print('No saved model found — training v0 XGBoost model from the S3 feature snapshot...')
-    X_train, y_train, X_test, y_test, categories = _load_training_frames()
+    X_train, y_train, X_test, y_test, categories, data_window_start, data_window_end, data_window_days = (
+        _load_training_frames()
+    )
 
     model = xgb.XGBRegressor(
         enable_categorical=True,
@@ -400,7 +417,8 @@ def _train_and_save_model() -> None:
     print(f'Test MAE improvement over naive median baseline: {pct_improvement_over_naive:.1f}%')
 
     training_metadata = _build_training_metadata(
-        X_train, train_mae, test_mae, naive_mae, pct_improvement_over_naive
+        X_train, train_mae, test_mae, naive_mae, pct_improvement_over_naive,
+        data_window_start, data_window_end, data_window_days,
     )
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -457,6 +475,14 @@ def _get_training_metadata() -> dict:
     if 'training_metadata' not in _cache:
         load_model()
     return _cache['training_metadata']
+
+
+def get_training_metadata() -> dict:
+    """Public accessor for training_metadata.json's contents (trained_at,
+    data_window_start/end/days, MAE baselines, coverage_counts, ...) -- so
+    callers like app.py don't need to reach into the private cache directly.
+    """
+    return _get_training_metadata()
 
 
 def _get_categories() -> dict:
