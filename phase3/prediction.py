@@ -49,6 +49,19 @@ MODE_NOUN = {'tram': 'tram', 'rail': 'train', 'bus': 'bus', 'ferry': 'ferry', 'u
 # considered "well represented" for the coverage check in predict_delay().
 WELL_REPRESENTED_MIN_ROWS = 1000
 
+# Leakage filtering moved upstream to notebook 05 (write time) on 2026-08-08.
+# Max source_date present in any snapshot as of that migration (from the
+# _latest.json manifest's source_date_range at the time) -- rows at/before
+# this date may be S3 copy_object carry-forwards of pre-migration,
+# unfiltered snapshot data (carry-forward bypasses notebook 05's Python
+# write path entirely, so its new write-time filter never touches them).
+# Rows after this date can only exist if written by the already-filtered
+# post-migration code path. See _load_training_frames()'s leakage-filter
+# safety net below, and notebook 05's "Step 5b — Leakage filter (write-time)"
+# cell. Intentionally NOT auto-derived from the manifest -- it's a snapshot
+# of a point in time (when this code shipped), not a live value.
+MIGRATION_CUTOFF_SOURCE_DATE = '2026-07-30'
+
 _cache: dict = {}
 
 
@@ -136,64 +149,151 @@ def _load_training_frames():
     load_path = f's3://{ml_features_prefix}/run_date={run_date}/'
     print(f'Loading training snapshot: run_date={run_date}')
 
-    df = pd.read_parquet(load_path)
-    rows_loaded = len(df)
-    print(f'Loaded {len(df):,} rows x {df.shape[1]} cols')
-    print(f'[ROW ACCOUNTING] 1. Loaded from ferry-filtered S3 snapshot: {rows_loaded:,} rows')
-    _log_mem('after data load')
-
-    # --- Debug-only: sample down before any dtype conversion so the entire
+    # --- Debug-only: sample down each partition as it's read, so the entire
     # downstream path (dtype optimization, DMatrix construction, fit, save)
-    # runs against a small dataset in seconds instead of the full ~62M-row
+    # runs against a small dataset in seconds instead of the full ~94M-row
     # snapshot. Unset (or 1.0) means full data -- the default, normal path.
     debug_sample_frac = float(os.environ.get('DEBUG_SAMPLE_FRAC', 1.0))
+
+    def _optimize_dtypes(chunk: pd.DataFrame) -> pd.DataFrame:
+        """Same float64->float32 downcast + category casts as before, just
+        applied per-chunk now instead of once on the full bulk-loaded frame
+        -- see the module-level MIGRATION_CUTOFF_SOURCE_DATE comment for why
+        the read itself is chunked. Kept as its own step (not folded into
+        the read) so pd.concat() below combines already-compact, already-
+        categorical pieces rather than raw object-dtype ones -- concatenating
+        33 raw chunks into one ~88M-row frame would recreate the exact
+        transient-doubling memory cost this rewrite exists to avoid.
+        """
+        float64_cols = chunk.select_dtypes(include='float64').columns
+        for c in float64_cols:
+            chunk[c] = chunk[c].astype('float32')
+        for c in ('route_id', 'stop_id', 'mode', 'day_of_week', 'source_date', 'trip_id'):
+            if c in chunk.columns and chunk[c].dtype == object:
+                chunk[c] = chunk[c].astype('category')
+        return chunk
+
+    def _filter_leaky_chunk(chunk: pd.DataFrame, source_date_str: str) -> tuple[pd.DataFrame, int]:
+        """Leak-check + drop for ONE source_date's rows only. scheduled_arrival_dt
+        for a single date is one scalar Timestamp broadcast across the chunk
+        (not the 33-category .cat.codes trick below, which exists to handle
+        many dates in one Series efficiently -- for exactly one date per
+        chunk here, a scalar is simpler and just as cheap).
+        """
+        raw_time = chunk['scheduled_arrival_time']
+        parsed = pd.to_datetime(raw_time, format='%H:%M:%S', errors='coerce')
+        offset = parsed - parsed.dt.normalize()
+        past_midnight = parsed.isna()
+        if past_midnight.any():
+            hh = raw_time.loc[past_midnight].str.slice(0, 2).astype(int)
+            rest = raw_time.loc[past_midnight].str.slice(2)
+            days, hh_mod = divmod(hh, 24)
+            wrapped_time = hh_mod.astype(str).str.zfill(2) + rest
+            fixed_parsed = pd.to_datetime(wrapped_time, format='%H:%M:%S')
+            offset.loc[past_midnight] = (
+                (fixed_parsed - fixed_parsed.dt.normalize()) + pd.to_timedelta(days, unit='D')
+            )
+        source_date_midnight = pd.to_datetime(source_date_str, format='%Y-%m-%d').tz_localize('Australia/Brisbane')
+        scheduled_arrival_dt = source_date_midnight + offset
+        leak_mask = chunk['snapshot_timestamp'] >= scheduled_arrival_dt
+        n_leaky = int(leak_mask.sum())
+        return chunk.loc[~leak_mask], n_leaky
+
+    # Never load the full ~94M-row archive into one dataframe and then try
+    # to remove leaky rows from it in-memory -- every variant of that
+    # (.loc[mask].copy(), chunked df.drop(inplace=True)) OOM-killed on this
+    # machine, because pandas has no way to remove rows from a DataFrame
+    # without reallocating a full new set of column arrays for what remains,
+    # so the old (pre-filter) and new (post-filter) versions of the ~94M-row
+    # frame both exist in memory at once, transiently. Instead: read + filter
+    # one source_date partition at a time (each ~1-7M rows depending on the
+    # date, never the whole archive), and only concatenate the small,
+    # already-clean, already-optimized results once at the end.
+    partition_prefix = f'{ml_features_prefix}/run_date={run_date}'
+    all_source_dates = sorted(
+        e.rstrip('/').rsplit('source_date=', 1)[-1]
+        for e in fs.ls(partition_prefix) if 'source_date=' in e
+    )
+    pre_cutoff_dates = [d for d in all_source_dates if d <= MIGRATION_CUTOFF_SOURCE_DATE]
+    post_cutoff_dates = [d for d in all_source_dates if d > MIGRATION_CUTOFF_SOURCE_DATE]
+    print(f'[CHUNKED READ] {len(all_source_dates)} source_date partition(s) total: '
+          f'{len(pre_cutoff_dates)} pre-cutoff (chunked read + safety-net filter, one date at a '
+          f'time), {len(post_cutoff_dates)} post-cutoff (bulk read, trusted clean -- already '
+          f'filtered at write time by notebook 05).')
+    _log_mem('before data load')
+
+    clean_chunks = []
+    rows_loaded = 0
+    n_dropped = 0
+    for i, d in enumerate(pre_cutoff_dates, 1):
+        chunk = pd.read_parquet(f's3://{partition_prefix}/source_date={d}/')
+        chunk['source_date'] = d
+        n_chunk_loaded = len(chunk)
+        if debug_sample_frac < 1.0:
+            chunk = chunk.sample(frac=debug_sample_frac, random_state=42)
+        rows_loaded += n_chunk_loaded
+
+        chunk = _optimize_dtypes(chunk)
+        clean_chunk, n_chunk_dropped = _filter_leaky_chunk(chunk, d)
+        n_dropped += n_chunk_dropped
+        clean_chunks.append(clean_chunk)
+
+        print(f'[LEAKAGE-BY-DATE] source_date={d}  before={n_chunk_loaded:,}  '
+              f'after={n_chunk_loaded - n_chunk_dropped:,}  dropped={n_chunk_dropped:,}  '
+              f'({(n_chunk_dropped / n_chunk_loaded * 100) if n_chunk_loaded else 0:.2f}%)')
+        _log_mem(f'chunked read: after source_date={d} ({i}/{len(pre_cutoff_dates)})')
+
+    pre_cutoff_df = (
+        pd.concat(clean_chunks, ignore_index=True) if clean_chunks
+        else pd.DataFrame(columns=['source_date', 'scheduled_arrival_time', 'snapshot_timestamp'])
+    )
+    del clean_chunks
+    _log_mem('after concatenating all pre-cutoff chunks')
+
+    if post_cutoff_dates:
+        # Already filtered at write time (notebook 05 Step 5b) -- read
+        # normally in bulk, no per-partition chunking or leak check needed.
+        post_cutoff_df = pd.read_parquet(load_path, filters=[('source_date', '>', MIGRATION_CUTOFF_SOURCE_DATE)])
+        post_cutoff_df = _optimize_dtypes(post_cutoff_df)
+        rows_loaded += len(post_cutoff_df)
+    else:
+        post_cutoff_df = pd.DataFrame(columns=pre_cutoff_df.columns)
+    _log_mem('after post-cutoff bulk read')
+
+    print(f'Loaded {rows_loaded:,} rows total ({len(pre_cutoff_dates):,} pre-cutoff date(s) + '
+          f'{len(post_cutoff_dates):,} post-cutoff date(s))')
+    print(f'[ROW ACCOUNTING] 1. Loaded from ferry-filtered S3 snapshot: {rows_loaded:,} rows')
     if debug_sample_frac < 1.0:
-        n_before_sample = len(df)
-        df = df.sample(frac=debug_sample_frac, random_state=42)
-        print(f'[DEBUG_SAMPLE_FRAC={debug_sample_frac}] Sampling active -- '
-              f'{n_before_sample:,} rows -> {len(df):,} rows')
-    rows_after_sample = len(df)
-    if debug_sample_frac < 1.0:
-        print(f'[ROW ACCOUNTING] 1b. After debug sample (frac={debug_sample_frac}): '
-              f'{rows_after_sample:,} rows ({rows_loaded - rows_after_sample:,} dropped by sampling)')
+        print(f'[ROW ACCOUNTING] 1b. Debug sample active (frac={debug_sample_frac}) -- applied per partition above')
+    rows_before_leakage_filter = rows_loaded
 
-    # --- Memory footprint reduction: downcast float64 -> float32, and
-    # convert repeating low-cardinality string/object columns to category
-    # dtype. Pure memory optimization on the raw ~62M-row snapshot -- no
-    # modeling logic, feature selection, or hyperparameters change here.
-    # Columns XGBoost needs as true numeric for splitting (delay_minutes,
-    # stop_sequence) are downcast in place but never categorized;
-    # scheduled_arrival_time stays a string (parsed via .str below, and
-    # never reaches XGBoost -- dropped before X is built).
-    mem_before = df.memory_usage(deep=True).sum()
+    df = pd.concat([pre_cutoff_df, post_cutoff_df], ignore_index=True)
+    del pre_cutoff_df, post_cutoff_df
+    # pd.concat() of per-chunk categoricals whose category SETS differ (e.g.
+    # source_date -- each chunk only ever has its own single date as a
+    # category) silently coerces the combined column back to object dtype,
+    # not a unioned category -- confirmed by direct test before this code
+    # was run for real. Re-optimizing once here, on the already-reduced
+    # final frame (same size class the old bulk approach's dtype step
+    # always handled fine), restores category dtype with the correct
+    # unioned vocabulary before scheduled_arrival_dt's .cat.codes below
+    # needs it.
+    df = _optimize_dtypes(df)
+    rows_after_leakage_filter = len(df)
+    _log_mem('after combining pre-cutoff and post-cutoff data')
+    print(f'Leakage filter: dropped {n_dropped:,} rows (post-arrival captures)')
+    print(f'[ROW ACCOUNTING] 2. After leakage filter: {rows_before_leakage_filter:,} -> '
+          f'{rows_after_leakage_filter:,} rows ({n_dropped:,} dropped)')
 
-    float64_cols = df.select_dtypes(include='float64').columns
-    for c in float64_cols:
-        df[c] = df[c].astype('float32')
-
-    category_cols = ['route_id', 'stop_id', 'mode', 'day_of_week', 'source_date', 'trip_id']
-    for c in category_cols:
-        if c in df.columns and df[c].dtype == object:
-            df[c] = df[c].astype('category')
-
-    mem_after = df.memory_usage(deep=True).sum()
-    print(f'Memory usage: {mem_before / 1e6:,.1f} MB -> {mem_after / 1e6:,.1f} MB '
-          f'({(1 - mem_after / mem_before) * 100:.1f}% reduction)')
-    _log_mem('after dtype optimization')
-
-    # --- Cell 3: leakage filter ---
-    _log_mem('before leakage filter')
-    rows_before_leakage_filter = len(df)
-    # pd.to_datetime with an explicit format parses in vectorized C code with
-    # no per-row Python objects, unlike .str.split(), which allocates a
-    # Python list + string per row at 50M+ row scale. GTFS times can have
-    # hours >= 24 for past-midnight trips, which %H (00-23) rejects --
-    # errors='coerce' turns those rows into NaT for free, which doubles as
-    # the mask for a small divmod-based fallback on just that subset.
+    # scheduled_arrival_dt is needed again below (Cell 4) for the FINAL
+    # combined+filtered df -- recomputed once here rather than carried
+    # through the chunking loop above (simpler, and proven cheap at this
+    # already-reduced, already-category-optimized scale: this is the same
+    # category-code-broadcast construction already validated earlier this
+    # session, never the expensive step).
     raw_time = df['scheduled_arrival_time']
     parsed = pd.to_datetime(raw_time, format='%H:%M:%S', errors='coerce')
     offset = parsed - parsed.dt.normalize()
-
     past_midnight = parsed.isna()
     if past_midnight.any():
         hh = raw_time.loc[past_midnight].str.slice(0, 2).astype(int)
@@ -201,26 +301,14 @@ def _load_training_frames():
         days, hh_mod = divmod(hh, 24)
         wrapped_time = hh_mod.astype(str).str.zfill(2) + rest
         fixed_parsed = pd.to_datetime(wrapped_time, format='%H:%M:%S')
-        # `days` is added back as a standalone Timedelta rather than folded
-        # into fixed_parsed's date -- .dt.normalize() would otherwise
-        # re-derive midnight from the shifted date and cancel it out.
         offset.loc[past_midnight] = (
             (fixed_parsed - fixed_parsed.dt.normalize()) + pd.to_timedelta(days, unit='D')
         )
-
-    source_date_midnight = pd.to_datetime(df['source_date'].astype(str)).dt.tz_localize('Australia/Brisbane')
+    _cat = df['source_date']
+    _unique_parsed = pd.to_datetime(_cat.cat.categories, format='%Y-%m-%d').tz_localize('Australia/Brisbane')
+    source_date_midnight = pd.Series(_unique_parsed[_cat.cat.codes.to_numpy()], index=df.index)
     scheduled_arrival_dt = source_date_midnight + offset
-    _log_mem('after scheduled_arrival_dt construction')
-
-    leak_mask = df['snapshot_timestamp'] >= scheduled_arrival_dt
-    n_dropped = int(leak_mask.sum())
-    df = df.loc[~leak_mask].copy()
-    scheduled_arrival_dt = scheduled_arrival_dt.loc[~leak_mask]
-    rows_after_leakage_filter = len(df)
-    print(f'Leakage filter: dropped {n_dropped:,} rows (post-arrival captures)')
-    print(f'[ROW ACCOUNTING] 2. After leakage filter: {rows_before_leakage_filter:,} -> '
-          f'{rows_after_leakage_filter:,} rows ({n_dropped:,} dropped)')
-    _log_mem('after leakage filter')
+    _log_mem('after scheduled_arrival_dt reconstruction (final combined df)')
 
     # --- Cell 4: re-derive hour_of_day / day_of_week / is_weekend / is_peak ---
     df['hour_of_day'] = scheduled_arrival_dt.dt.hour.astype('int32')
@@ -228,58 +316,82 @@ def _load_training_frames():
     df['is_weekend'] = df['day_of_week'].isin(['Saturday', 'Sunday'])
     df['is_peak'] = (~df['is_weekend']) & df['hour_of_day'].isin([7, 8, 16, 17])
 
-    # --- Cell 5: target + feature matrix ---
+    # --- Cell 5: target + feature dtype prep (in place on df -- no full-frame
+    # copy). dropna(inplace=True) mutates df's own internal arrays rather
+    # than binding a second full-size frame to `df` before the old one is
+    # collected, and nothing below this point needs the pre-dropna rows, so
+    # there's no reason to keep them around.
     rows_before_dropna = len(df)
-    df = df.dropna(subset=['delay_minutes']).copy()
+    df.dropna(subset=['delay_minutes'], inplace=True)
     rows_after_dropna = len(df)
     print(f'[ROW ACCOUNTING] 3. After dropna(delay_minutes): {rows_before_dropna:,} -> '
           f'{rows_after_dropna:,} rows ({rows_before_dropna - rows_after_dropna:,} dropped)')
+    _log_mem('after dropna(delay_minutes)')
     y = df['delay_minutes'].astype('float32')  # already float32 from the downcast above; explicit for clarity
 
-    X = df[FEATURE_COLS + ['source_date']].copy()
-    X['source_date'] = X['source_date'].astype(str)
     for c in CATEGORICAL_COLS:
         # astype('category') on an ALREADY-categorical column (df[c] may be
         # category dtype from the memory-optimization pass above) does not
-        # drop categories no longer present after the leakage filter/split --
+        # drop categories no longer present after the leakage filter/dropna --
         # remove_unused_categories() keeps the persisted category vocabulary
-        # identical to what it would be without that earlier optimization
-        # (i.e. exactly X_train's own values, not a superset).
-        X[c] = X[c].astype('category').cat.remove_unused_categories()
-    X['stop_sequence'] = X['stop_sequence'].astype('float32')
-    X['is_weekend'] = X['is_weekend'].astype('int8')
-    X['is_peak'] = X['is_peak'].astype('int8')
+        # identical to what it would be without that earlier optimization.
+        # Applied directly on df (not a separate X copy) -- X_train/X_test
+        # below inherit this exact vocabulary via plain slicing, since
+        # slicing/copying a categorical column preserves its category list
+        # unchanged. Doing it here, once, on the full train+test-combined
+        # set (before the split) is what keeps X_test's codes aligned with
+        # X_train's / categories.joblib's -- a second remove_unused_categories()
+        # per split partition would desync them.
+        df[c] = df[c].astype('category').cat.remove_unused_categories()
+    df['stop_sequence'] = df['stop_sequence'].astype('float32')
+    df['is_weekend'] = df['is_weekend'].astype('int8')
+    df['is_peak'] = df['is_peak'].astype('int8')
+    _log_mem('after feature dtype cast (pre-split)')
+
+    # Small (single-column) string copy of source_date used for the date-span
+    # summary and the split boundary below -- not a full-frame copy.
+    source_date_str = df['source_date'].astype(str)
 
     # Full pre-split date span -- 'source_date' is already string-cast (ISO
-    # 'YYYY-MM-DD' above), so lexicographic min/max is chronological min/max.
+    # 'YYYY-MM-DD'), so lexicographic min/max is chronological min/max.
     # Captured here (train+test combined) rather than after the split, since
     # this is what the model was actually trained+evaluated on as a whole.
-    data_window_start = X['source_date'].min()
-    data_window_end = X['source_date'].max()
-    data_window_days = X['source_date'].nunique()
+    data_window_start = source_date_str.min()
+    data_window_end = source_date_str.max()
+    data_window_days = source_date_str.nunique()
 
-    # --- Cell 6: temporal split (train = earliest dates, test = latest ~20%) ---
-    rows_by_date = X.groupby('source_date', observed=True).size().sort_index()
+    # --- Cell 6: temporal split (train = earliest dates, test = latest ~20%),
+    # done BEFORE building the feature frame so X_train/X_test are each
+    # sliced straight out of df -- df, X_train, and X_test are the only
+    # full/partial-size frames ever alive together, never an extra
+    # combined-X copy on top of both splits.
+    rows_by_date = source_date_str.groupby(source_date_str).size().sort_index()
     total_rows = rows_by_date.sum()
     cum_from_end = rows_by_date[::-1].cumsum()[::-1]
     candidate_dates = cum_from_end[cum_from_end <= 0.20 * total_rows].index
     boundary_date = candidate_dates.min() if len(candidate_dates) else rows_by_date.index.max()
-    train_mask = X['source_date'] < boundary_date
+    train_mask = source_date_str < boundary_date
+    del source_date_str
 
-    X_train = X.loc[train_mask, FEATURE_COLS].copy()
+    X_train = df.loc[train_mask, FEATURE_COLS].copy()
     y_train = y.loc[train_mask]
-    # Mirrors X_train/y_train exactly -- same already-cast X (CATEGORICAL_COLS
-    # were cast + remove_unused_categories()'d on the full train+test X above,
-    # before this split), so X_test's categorical codes are guaranteed to
-    # align with X_train's / categories.joblib's, with no separate
-    # remove_unused_categories() call needed (or wanted: that would re-derive
-    # a test-only category list and desync its codes from what the model was
-    # actually fit on).
-    X_test = X.loc[~train_mask, FEATURE_COLS].copy()
-    y_test = y.loc[~train_mask]
     n_train = len(X_train)
+    _log_mem('after building X_train')
+
+    # Mirrors X_train/y_train exactly -- same already-cast df columns
+    # (CATEGORICAL_COLS were cast + remove_unused_categories()'d on the full
+    # train+test df above, before this split), so X_test's categorical codes
+    # are guaranteed to align with X_train's / categories.joblib's, with no
+    # separate remove_unused_categories() call needed (or wanted: that would
+    # re-derive a test-only category list and desync its codes from what the
+    # model was actually fit on).
+    X_test = df.loc[~train_mask, FEATURE_COLS].copy()
+    y_test = y.loc[~train_mask]
     n_test = int(total_rows) - n_train
-    print(f'Train: {len(X_train):,} rows (boundary date {boundary_date})')
+    _log_mem('after building X_test')
+
+    del df, y, train_mask
+    print(f'Train: {n_train:,} rows (boundary date {boundary_date})')
     print(f'[ROW ACCOUNTING] 4. Temporal split: {int(total_rows):,} rows -> '
           f'train={n_train:,}, test={n_test:,} (boundary date {boundary_date})')
 
