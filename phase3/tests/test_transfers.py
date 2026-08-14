@@ -1,13 +1,17 @@
 """Diagnostic script for find_multi_leg_trips() — not a test suite, just prints.
 
-Run: python phase3/test_transfers.py
+Run: python phase3/tests/test_transfers.py
 
 Do NOT use Playwright/Selenium/any browser here — this only exercises the
 gtfs_data data layer directly.
 """
 from __future__ import annotations
 
+import sys
 from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gtfs_data import find_multi_leg_trips, find_trips, search_stops
 

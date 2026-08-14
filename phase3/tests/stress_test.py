@@ -5,11 +5,15 @@ other source file — it only calls the existing public API and prints what
 it finds, including root-cause analysis for zero-result cases. Do not treat
 any print statement here as a fix; it is a report.
 
-Run: python phase3/stress_test.py
+Run: python phase3/tests/stress_test.py
 """
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gtfs_data import (
     find_multi_leg_trips,

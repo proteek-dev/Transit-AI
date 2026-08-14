@@ -1,6 +1,6 @@
 """Diagnostic script for nearest_stops() — not a test suite, just prints.
 
-Run: python phase3/test_nearest_stops.py
+Run: python phase3/tests/test_nearest_stops.py
 
 Do NOT use Playwright/Selenium/any browser here — this only exercises the
 gtfs_data data layer directly. Live map/geolocation interaction is tested
@@ -9,6 +9,10 @@ manually in the running Streamlit app.
 from __future__ import annotations
 
 import importlib.metadata
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gtfs_data import nearest_stops
 
