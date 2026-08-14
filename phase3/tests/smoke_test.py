@@ -18,13 +18,13 @@ row that actually serves the stop, rather than fabricated values, so
 predict_delay() sees a realistic feature row.
 
 Run from the repo root or from phase3/:
-    python3 scripts/smoke_test.py
+    python3 phase3/tests/smoke_test.py
 """
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'phase3'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import gtfs_data  # noqa: E402
 import prediction  # noqa: E402
