@@ -146,7 +146,6 @@ def _load_training_frames():
     with fs.open(manifest_path) as f:
         manifest = json.load(f)
     run_date = manifest['latest_run']
-    load_path = f's3://{ml_features_prefix}/run_date={run_date}/'
     print(f'Loading training snapshot: run_date={run_date}')
 
     # --- Debug-only: sample down each partition as it's read, so the entire
@@ -173,12 +172,14 @@ def _load_training_frames():
                 chunk[c] = chunk[c].astype('category')
         return chunk
 
-    def _filter_leaky_chunk(chunk: pd.DataFrame, source_date_str: str) -> tuple[pd.DataFrame, int]:
-        """Leak-check + drop for ONE source_date's rows only. scheduled_arrival_dt
-        for a single date is one scalar Timestamp broadcast across the chunk
-        (not the 33-category .cat.codes trick below, which exists to handle
-        many dates in one Series efficiently -- for exactly one date per
-        chunk here, a scalar is simpler and just as cheap).
+    def _compute_scheduled_arrival_dt(chunk: pd.DataFrame, source_date_str: str) -> pd.Series:
+        """Reconstructs scheduled_arrival_dt for ONE source_date's rows -- a
+        single scalar Timestamp broadcast across the chunk (not the many-
+        dates .cat.codes trick this replaced, which only paid off when this
+        ran once on the full multi-date combined frame). Shared by both the
+        pre-cutoff leak check and the post-cutoff feature derivation below,
+        so this is computed exactly once per chunk, never again later on
+        the full concatenated df.
         """
         raw_time = chunk['scheduled_arrival_time']
         parsed = pd.to_datetime(raw_time, format='%H:%M:%S', errors='coerce')
@@ -194,10 +195,36 @@ def _load_training_frames():
                 (fixed_parsed - fixed_parsed.dt.normalize()) + pd.to_timedelta(days, unit='D')
             )
         source_date_midnight = pd.to_datetime(source_date_str, format='%Y-%m-%d').tz_localize('Australia/Brisbane')
-        scheduled_arrival_dt = source_date_midnight + offset
+        return source_date_midnight + offset
+
+    def _filter_leaky_chunk(chunk: pd.DataFrame, source_date_str: str) -> tuple[pd.DataFrame, pd.Series, int]:
+        """Leak-check + drop for ONE source_date's rows only. Returns the
+        clean chunk alongside its already-computed scheduled_arrival_dt
+        (filtered to match) so the caller doesn't need to recompute it.
+        """
+        scheduled_arrival_dt = _compute_scheduled_arrival_dt(chunk, source_date_str)
         leak_mask = chunk['snapshot_timestamp'] >= scheduled_arrival_dt
         n_leaky = int(leak_mask.sum())
-        return chunk.loc[~leak_mask], n_leaky
+        clean_chunk = chunk.loc[~leak_mask].copy()
+        clean_scheduled_arrival_dt = scheduled_arrival_dt.loc[~leak_mask]
+        return clean_chunk, clean_scheduled_arrival_dt, n_leaky
+
+    def _add_time_features_and_dropna(
+        chunk: pd.DataFrame, scheduled_arrival_dt: pd.Series
+    ) -> tuple[pd.DataFrame, int, int]:
+        """Cell 4 (hour_of_day/day_of_week/is_weekend/is_peak) + Cell 5's
+        dropna(delay_minutes), applied to ONE already-leak-filtered chunk
+        instead of once on the full concatenated frame -- keeps peak memory
+        bounded to chunk size instead of the ~147M-row combined frame.
+        """
+        chunk['hour_of_day'] = scheduled_arrival_dt.dt.hour.astype('int32')
+        chunk['day_of_week'] = scheduled_arrival_dt.dt.day_name()
+        chunk['is_weekend'] = chunk['day_of_week'].isin(['Saturday', 'Sunday'])
+        chunk['is_peak'] = (~chunk['is_weekend']) & chunk['hour_of_day'].isin([7, 8, 16, 17])
+        n_before_dropna = len(chunk)
+        chunk = chunk.dropna(subset=['delay_minutes'])
+        n_after_dropna = len(chunk)
+        return chunk, n_before_dropna, n_after_dropna
 
     # Never load the full ~94M-row archive into one dataframe and then try
     # to remove leaky rows from it in-memory -- every variant of that
@@ -218,13 +245,31 @@ def _load_training_frames():
     post_cutoff_dates = [d for d in all_source_dates if d > MIGRATION_CUTOFF_SOURCE_DATE]
     print(f'[CHUNKED READ] {len(all_source_dates)} source_date partition(s) total: '
           f'{len(pre_cutoff_dates)} pre-cutoff (chunked read + safety-net filter, one date at a '
-          f'time), {len(post_cutoff_dates)} post-cutoff (bulk read, trusted clean -- already '
-          f'filtered at write time by notebook 05).')
+          f'time), {len(post_cutoff_dates)} post-cutoff (chunked read, no leak filter -- already '
+          f'filtered at write time by notebook 05, one date at a time).')
+
+    # Debug-only: cap the number of dates read on each side of the cutoff,
+    # so the whole pipeline (load, filter, dropna, split, fit, MAE) can be
+    # validated end-to-end on a small slice without waiting on the full
+    # archive -- proves logic correctness independent of memory/scale.
+    # Unset (the default) leaves pre_cutoff_dates/post_cutoff_dates untouched.
+    debug_max_dates = os.environ.get('DEBUG_MAX_DATES')
+    if debug_max_dates is not None:
+        debug_max_dates = int(debug_max_dates)
+        pre_cutoff_dates = pre_cutoff_dates[:debug_max_dates]
+        post_cutoff_dates = post_cutoff_dates[:debug_max_dates]
+        print(f'=== DEBUG MODE: DEBUG_MAX_DATES={debug_max_dates} -- processing '
+              f'{len(pre_cutoff_dates)} pre-cutoff + {len(post_cutoff_dates)} post-cutoff dates only. '
+              f'MODEL WILL NOT BE SAVED OR PROMOTED. ===')
+
     _log_mem('before data load')
 
-    clean_chunks = []
+    all_chunks = []
     rows_loaded = 0
+    rows_after_sample_total = 0
     n_dropped = 0
+    rows_before_dropna_total = 0
+    rows_after_dropna_total = 0
     for i, d in enumerate(pre_cutoff_dates, 1):
         chunk = pd.read_parquet(f's3://{partition_prefix}/source_date={d}/')
         chunk['source_date'] = d
@@ -232,33 +277,57 @@ def _load_training_frames():
         if debug_sample_frac < 1.0:
             chunk = chunk.sample(frac=debug_sample_frac, random_state=42)
         rows_loaded += n_chunk_loaded
+        rows_after_sample_total += len(chunk)
 
         chunk = _optimize_dtypes(chunk)
-        clean_chunk, n_chunk_dropped = _filter_leaky_chunk(chunk, d)
+        clean_chunk, chunk_scheduled_arrival_dt, n_chunk_dropped = _filter_leaky_chunk(chunk, d)
         n_dropped += n_chunk_dropped
-        clean_chunks.append(clean_chunk)
+
+        clean_chunk, n_chunk_before_dropna, n_chunk_after_dropna = _add_time_features_and_dropna(
+            clean_chunk, chunk_scheduled_arrival_dt
+        )
+        rows_before_dropna_total += n_chunk_before_dropna
+        rows_after_dropna_total += n_chunk_after_dropna
+        all_chunks.append(clean_chunk)
 
         print(f'[LEAKAGE-BY-DATE] source_date={d}  before={n_chunk_loaded:,}  '
               f'after={n_chunk_loaded - n_chunk_dropped:,}  dropped={n_chunk_dropped:,}  '
               f'({(n_chunk_dropped / n_chunk_loaded * 100) if n_chunk_loaded else 0:.2f}%)')
+        print(f'[DROPNA-BY-DATE] source_date={d}  before={n_chunk_before_dropna:,}  '
+              f'after={n_chunk_after_dropna:,}  dropped={n_chunk_before_dropna - n_chunk_after_dropna:,}')
         _log_mem(f'chunked read: after source_date={d} ({i}/{len(pre_cutoff_dates)})')
 
-    pre_cutoff_df = (
-        pd.concat(clean_chunks, ignore_index=True) if clean_chunks
-        else pd.DataFrame(columns=['source_date', 'scheduled_arrival_time', 'snapshot_timestamp'])
-    )
-    del clean_chunks
-    _log_mem('after concatenating all pre-cutoff chunks')
+    # Already filtered at write time (notebook 05 Step 5b) -- read one
+    # source_date partition at a time just like the pre-cutoff loop above
+    # (same memory-avoidance rationale), just without the leak check/drop,
+    # since these partitions are already trusted clean. Appended into the
+    # SAME all_chunks list as the pre-cutoff chunks above -- one shared list
+    # feeding a single final concat, instead of three separate concats
+    # (pre-cutoff-only, post-cutoff-only, then combining those two), which
+    # is what actually OOM-killed a 46-date run: each intermediate concat
+    # transiently held multiple large frames in memory at once.
+    for i, d in enumerate(post_cutoff_dates, 1):
+        chunk = pd.read_parquet(f's3://{partition_prefix}/source_date={d}/')
+        chunk['source_date'] = d
+        n_chunk_loaded = len(chunk)
+        if debug_sample_frac < 1.0:
+            chunk = chunk.sample(frac=debug_sample_frac, random_state=42)
+        rows_loaded += n_chunk_loaded
+        rows_after_sample_total += len(chunk)
 
-    if post_cutoff_dates:
-        # Already filtered at write time (notebook 05 Step 5b) -- read
-        # normally in bulk, no per-partition chunking or leak check needed.
-        post_cutoff_df = pd.read_parquet(load_path, filters=[('source_date', '>', MIGRATION_CUTOFF_SOURCE_DATE)])
-        post_cutoff_df = _optimize_dtypes(post_cutoff_df)
-        rows_loaded += len(post_cutoff_df)
-    else:
-        post_cutoff_df = pd.DataFrame(columns=pre_cutoff_df.columns)
-    _log_mem('after post-cutoff bulk read')
+        chunk = _optimize_dtypes(chunk)
+        chunk_scheduled_arrival_dt = _compute_scheduled_arrival_dt(chunk, d)
+        chunk, n_chunk_before_dropna, n_chunk_after_dropna = _add_time_features_and_dropna(
+            chunk, chunk_scheduled_arrival_dt
+        )
+        rows_before_dropna_total += n_chunk_before_dropna
+        rows_after_dropna_total += n_chunk_after_dropna
+        all_chunks.append(chunk)
+
+        print(f'[POST-CUTOFF-BY-DATE] source_date={d}  rows={len(chunk):,} (already leak-filtered at write time)')
+        print(f'[DROPNA-BY-DATE] source_date={d}  before={n_chunk_before_dropna:,}  '
+              f'after={n_chunk_after_dropna:,}  dropped={n_chunk_before_dropna - n_chunk_after_dropna:,}')
+        _log_mem(f'chunked read: after source_date={d} ({i}/{len(post_cutoff_dates)})')
 
     print(f'Loaded {rows_loaded:,} rows total ({len(pre_cutoff_dates):,} pre-cutoff date(s) + '
           f'{len(post_cutoff_dates):,} post-cutoff date(s))')
@@ -267,8 +336,15 @@ def _load_training_frames():
         print(f'[ROW ACCOUNTING] 1b. Debug sample active (frac={debug_sample_frac}) -- applied per partition above')
     rows_before_leakage_filter = rows_loaded
 
-    df = pd.concat([pre_cutoff_df, post_cutoff_df], ignore_index=True)
-    del pre_cutoff_df, post_cutoff_df
+    # Single concat of every per-date chunk (pre-cutoff + post-cutoff)
+    # directly into df -- no separate pre_cutoff_df/post_cutoff_df
+    # intermediates, so only one combined frame is ever materialized here,
+    # not three.
+    df = (
+        pd.concat(all_chunks, ignore_index=True) if all_chunks
+        else pd.DataFrame(columns=['source_date', 'scheduled_arrival_time', 'snapshot_timestamp'])
+    )
+    del all_chunks
     # pd.concat() of per-chunk categoricals whose category SETS differ (e.g.
     # source_date -- each chunk only ever has its own single date as a
     # category) silently coerces the combined column back to object dtype,
@@ -276,57 +352,25 @@ def _load_training_frames():
     # was run for real. Re-optimizing once here, on the already-reduced
     # final frame (same size class the old bulk approach's dtype step
     # always handled fine), restores category dtype with the correct
-    # unioned vocabulary before scheduled_arrival_dt's .cat.codes below
-    # needs it.
+    # unioned vocabulary for the CATEGORICAL_COLS cast below.
     df = _optimize_dtypes(df)
-    rows_after_leakage_filter = len(df)
-    _log_mem('after combining pre-cutoff and post-cutoff data')
+    _log_mem(f'after concatenating all {len(pre_cutoff_dates) + len(post_cutoff_dates)} chunks (pre+post)')
+
+    # rows_before_dropna_total/rows_after_dropna_total were accumulated per
+    # chunk above (post-leak-filter, pre-dropna -> post-dropna) inside the
+    # two read loops -- scheduled_arrival_dt reconstruction, Cell 4's
+    # hour_of_day/day_of_week/is_weekend/is_peak derivation, and dropna all
+    # now happen once per (small) chunk instead of once on the full
+    # (~147M-row) combined frame, so `df` here is already post-dropna.
+    rows_after_leakage_filter = rows_before_dropna_total
     print(f'Leakage filter: dropped {n_dropped:,} rows (post-arrival captures)')
     print(f'[ROW ACCOUNTING] 2. After leakage filter: {rows_before_leakage_filter:,} -> '
           f'{rows_after_leakage_filter:,} rows ({n_dropped:,} dropped)')
 
-    # scheduled_arrival_dt is needed again below (Cell 4) for the FINAL
-    # combined+filtered df -- recomputed once here rather than carried
-    # through the chunking loop above (simpler, and proven cheap at this
-    # already-reduced, already-category-optimized scale: this is the same
-    # category-code-broadcast construction already validated earlier this
-    # session, never the expensive step).
-    raw_time = df['scheduled_arrival_time']
-    parsed = pd.to_datetime(raw_time, format='%H:%M:%S', errors='coerce')
-    offset = parsed - parsed.dt.normalize()
-    past_midnight = parsed.isna()
-    if past_midnight.any():
-        hh = raw_time.loc[past_midnight].str.slice(0, 2).astype(int)
-        rest = raw_time.loc[past_midnight].str.slice(2)
-        days, hh_mod = divmod(hh, 24)
-        wrapped_time = hh_mod.astype(str).str.zfill(2) + rest
-        fixed_parsed = pd.to_datetime(wrapped_time, format='%H:%M:%S')
-        offset.loc[past_midnight] = (
-            (fixed_parsed - fixed_parsed.dt.normalize()) + pd.to_timedelta(days, unit='D')
-        )
-    _cat = df['source_date']
-    _unique_parsed = pd.to_datetime(_cat.cat.categories, format='%Y-%m-%d').tz_localize('Australia/Brisbane')
-    source_date_midnight = pd.Series(_unique_parsed[_cat.cat.codes.to_numpy()], index=df.index)
-    scheduled_arrival_dt = source_date_midnight + offset
-    _log_mem('after scheduled_arrival_dt reconstruction (final combined df)')
-
-    # --- Cell 4: re-derive hour_of_day / day_of_week / is_weekend / is_peak ---
-    df['hour_of_day'] = scheduled_arrival_dt.dt.hour.astype('int32')
-    df['day_of_week'] = scheduled_arrival_dt.dt.day_name()
-    df['is_weekend'] = df['day_of_week'].isin(['Saturday', 'Sunday'])
-    df['is_peak'] = (~df['is_weekend']) & df['hour_of_day'].isin([7, 8, 16, 17])
-
-    # --- Cell 5: target + feature dtype prep (in place on df -- no full-frame
-    # copy). dropna(inplace=True) mutates df's own internal arrays rather
-    # than binding a second full-size frame to `df` before the old one is
-    # collected, and nothing below this point needs the pre-dropna rows, so
-    # there's no reason to keep them around.
-    rows_before_dropna = len(df)
-    df.dropna(subset=['delay_minutes'], inplace=True)
-    rows_after_dropna = len(df)
-    print(f'[ROW ACCOUNTING] 3. After dropna(delay_minutes): {rows_before_dropna:,} -> '
-          f'{rows_after_dropna:,} rows ({rows_before_dropna - rows_after_dropna:,} dropped)')
-    _log_mem('after dropna(delay_minutes)')
+    rows_after_dropna = rows_after_dropna_total
+    print(f'[ROW ACCOUNTING] 3. After dropna(delay_minutes): {rows_before_dropna_total:,} -> '
+          f'{rows_after_dropna:,} rows ({rows_before_dropna_total - rows_after_dropna:,} dropped)')
+    _log_mem('after dropna(delay_minutes) (already applied per-chunk above)')
     y = df['delay_minutes'].astype('float32')  # already float32 from the downcast above; explicit for clarity
 
     for c in CATEGORICAL_COLS:
@@ -401,9 +445,9 @@ def _load_training_frames():
     print(f'  1. Rows loaded from ferry-filtered snapshot : {rows_loaded:,}')
     if debug_sample_frac < 1.0:
         print(f'  1b. After debug sample (frac={debug_sample_frac})     : '
-              f'{rows_after_sample:,} ({rows_loaded - rows_after_sample:,} dropped by sampling)')
+              f'{rows_after_sample_total:,} ({rows_loaded - rows_after_sample_total:,} dropped by sampling)')
     print(f'  2. After leakage filter                     : {rows_after_leakage_filter:,} '
-          f'({rows_after_sample - rows_after_leakage_filter:,} dropped)')
+          f'({rows_after_sample_total - rows_after_leakage_filter:,} dropped)')
     print(f'  3. After dropna(delay_minutes)               : {rows_after_dropna:,} '
           f'({rows_after_leakage_filter - rows_after_dropna:,} dropped)')
     print(f'  4. Final split: train={n_train:,} + test={n_test:,} = {n_train + n_test:,}')
@@ -527,6 +571,18 @@ def _train_and_save_model() -> None:
     print(f'Test:  MAE {test_mae:.3f} min ({len(X_test):,} rows)')
     print(f'Naive baseline (predict train median = {train_median:.3f} min): MAE {naive_mae:.3f} min')
     print(f'Test MAE improvement over naive median baseline: {pct_improvement_over_naive:.1f}%')
+
+    # DEBUG_MAX_DATES validation runs must prove the pipeline works end-to-end
+    # (everything above this line just did) but must never let a partial-data
+    # model reach save/promotion. Aborting with a non-zero exit here is
+    # already handled correctly by pipeline/02_train_model.sh (runs/ and
+    # latest/ are left untouched on any non-zero exit), so no separate
+    # promotion-guard logic is needed in the bash script.
+    if os.environ.get('DEBUG_MAX_DATES') is not None:
+        raise RuntimeError(
+            'DEBUG_MAX_DATES is set -- aborting before save to prevent a partial-data '
+            'model from being promoted to latest/. Unset DEBUG_MAX_DATES for a real training run.'
+        )
 
     training_metadata = _build_training_metadata(
         X_train, train_mae, test_mae, naive_mae, pct_improvement_over_naive,
