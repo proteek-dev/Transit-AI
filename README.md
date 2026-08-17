@@ -62,12 +62,27 @@ Transit-AI/
 ├── config/
 │   └── feeds.yaml           # Feed URLs (GTFS-RT combined + per-mode, static, performance)
 ├── phase3/                  # The live app
-│   ├── app.py                # Streamlit UI — stop search, results, route map
-│   ├── gtfs_data.py           # Static GTFS data layer — stop search, trip finding, shapes
-│   ├── map_picker.py          # Reusable map-based stop picker + route path display
-│   ├── live_gtfs.py           # Live GTFS-RT fetch, short-lived cache
-│   ├── prediction.py          # Model load/train, feature building, delay blending
-│   └── config.py              # Credential resolution (Streamlit Cloud / local / .env)
+│   ├── app.py                 # Streamlit UI — stop search, results, shared route map
+│   ├── gtfs_data.py            # Facade re-exporting gtfs/ below — external imports unchanged
+│   ├── gtfs/
+│   │   ├── loader.py             # GTFS static snapshot load, ferry exclusion, dtype/memory optimization
+│   │   ├── search.py             # Typed stop search (fuzzy + proximity-biased) + nearest-stop ranking
+│   │   ├── routing.py            # Direct + multi-leg transfer trip finding (BFS)
+│   │   └── shapes.py             # Trip shape (road/rail path) lookup
+│   ├── prediction.py           # Facade re-exporting ml/ below — external imports unchanged
+│   ├── ml/
+│   │   ├── training.py           # Model training (chunked read, leakage filter, fit, MAE baseline)
+│   │   ├── inference.py          # Feature building + delay prediction/blending at request time
+│   │   └── model_io.py           # Model/metadata load, caching, S3 upload
+│   ├── ui/
+│   │   ├── pickers.py            # From/To stop pickers (map tap + typed search)
+│   │   ├── cards.py              # Result card rendering
+│   │   └── formatting.py         # Pure display-formatting helpers
+│   ├── map_picker.py           # Reusable map — stop picker + route path display
+│   ├── live_gtfs.py            # Live GTFS-RT fetch, short-lived cache
+│   ├── config.py               # Credential resolution (Streamlit Cloud / local / .env)
+│   ├── route_types.py          # Shared GTFS route_type ↔ mode-name mapping
+│   └── tests/                  # Diagnostic/smoke scripts (run directly, not pytest)
 ├── .env.example
 ├── requirements.txt
 └── README.md
@@ -116,8 +131,10 @@ Then browse to `http://<local-ip>:8501` from your phone.
 Pick a "From" and "To" stop and a departure time; it finds direct or multi-leg-transfer trips and predicts arrival delay by blending a trained model with TransLink's live GTFS-RT feed.
 
 - Map-based stop selection for both origin and destination — type or use your location, and every nearby matching stop shows as a tappable pin, not a single auto-resolved match
+- Typed destination search is proximity-biased toward your already-picked origin, so results near the wrong end of the corridor don't surface just because they share a name
+- Distance shown ("180m away", "2.3km away") wherever the app actually knows your position relative to a stop
 - Multi-leg transfer routing across bus, rail, and tram
-- A route map showing the actual GTFS road/rail path for whichever result you select, not just a straight line
+- A single shared route map (not one per result) showing the actual GTFS road/rail path, defaulting to the top-ranked result and updating when you pick a different one
 - Leave-by time as the headline output, with a plain-English summary and a confidence rating (High/Medium/Low)
 - Live delay blended with the trained model at request time
 
@@ -134,6 +151,7 @@ Pick a "From" and "To" stop and a departure time; it finds direct or multi-leg-t
 - Continuous GTFS-Realtime archive since late June 2026, now via a dedicated EC2 daemon (migrated off a laptop-based process for reliability)
 - Feature pipeline joins realtime data against the static GTFS snapshot actually in effect on each date, ferry-excluded
 - XGBoost delay model, retrained periodically, with an automatically recorded MAE baseline on every run and date/time-versioned model storage for rollback
+- Current baseline, trained on the full ~156M-row ferry-free archive across 46 source-date partitions: train MAE 1.999 min, test MAE 1.957 min vs. a naive median baseline of 2.486 min — a 21.3% improvement over naive
 
 **App**
 - Full trip search: map-based stop pickers, direct + multi-leg transfer routing, leave-by output, live route map with real path shapes

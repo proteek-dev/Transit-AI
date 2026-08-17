@@ -43,12 +43,30 @@ from ml.model_io import (
 # of a point in time (when this code shipped), not a live value.
 MIGRATION_CUTOFF_SOURCE_DATE = '2026-07-30'
 
+# Populated by _log_mem() -- one (label, rss_mb) tuple per checkpoint taken
+# during a training run, so _build_training_metadata() can persist the RSS
+# trend into training_metadata.json instead of it being print-only and lost
+# after the run. Reset by _reset_mem_checkpoints() at the start of every
+# _train_and_save_model() call.
+_mem_checkpoints: list[tuple[str, float]] = []
+
 
 def _log_mem(label: str) -> None:
     """Debug checkpoint: current process RSS, so a slow/OOM-prone training
     run can be narrowed down to a specific stage without a profiler."""
     rss_mb = psutil.Process().memory_info().rss / 1e6
     print(f'[MEM] {label}: {rss_mb:,.1f} MB RSS')
+    _mem_checkpoints.append((label, rss_mb))
+
+
+def _reset_mem_checkpoints() -> None:
+    """Clears _mem_checkpoints. Called at the very start of
+    _train_and_save_model(), before _load_training_frames() runs, so a stale
+    checkpoint list from a prior run in the same process can never leak into
+    this run's training_metadata.json -- this module is normally invoked as
+    a single-run script, but don't rely on that.
+    """
+    _mem_checkpoints.clear()
 
 
 def _mae(y_true, y_pred) -> float:
@@ -432,6 +450,7 @@ def _build_training_metadata(
     data_window_start: str,
     data_window_end: str,
     data_window_days: int,
+    mem_checkpoints: list[tuple[str, float]],
 ) -> dict:
     """Coverage counts per (route_short_name, mode), used by predict_delay()
     to judge whether a live route was well represented in training — keyed
@@ -439,6 +458,11 @@ def _build_training_metadata(
     records this run's train/test/naive MAE baseline (notebook 07 Cells
     8/8b), so it's permanently available in training_metadata.json rather
     than only printed to the training log.
+
+    mem_checkpoints is the (label, rss_mb) list accumulated by _log_mem()
+    over the run (see module-level _mem_checkpoints) -- persisted here so RSS
+    trend is comparable across runs as the archive grows (~5-6M rows/day)
+    instead of only existing in console output that's lost after each run.
     """
     train_route_ids = set(X_train['route_id'].astype(str).unique())
     snapshot_date, routes = _find_best_matching_static_snapshot(train_route_ids)
@@ -449,6 +473,24 @@ def _build_training_metadata(
 
     counts = lookup.groupby(['route_short_name', 'mode'], observed=True).size()
     coverage_counts = {f'{name}|{mode}': int(n) for (name, mode), n in counts.items()}
+
+    if not mem_checkpoints:
+        raise ValueError(
+            'No memory checkpoints captured (_mem_checkpoints is empty) -- '
+            '_log_mem() should have run at least once during this training run. '
+            'Refusing to write training_metadata.json with missing RSS data.'
+        )
+    peak_rss_mb = max(rss_mb for _, rss_mb in mem_checkpoints)
+
+    def _checkpoint_rss(label: str) -> float:
+        for checkpoint_label, rss_mb in mem_checkpoints:
+            if checkpoint_label == label:
+                return rss_mb
+        raise ValueError(
+            f'Expected memory checkpoint {label!r} not found in captured checkpoints '
+            f'({[l for l, _ in mem_checkpoints]!r}) -- a _log_mem() call site may have '
+            'been renamed or removed. Refusing to silently persist a missing RSS value.'
+        )
 
     return {
         'trained_at': datetime.now(ZoneInfo('Australia/Brisbane')).isoformat(),
@@ -461,10 +503,16 @@ def _build_training_metadata(
         'data_window_start': data_window_start,
         'data_window_end': data_window_end,
         'data_window_days': data_window_days,
+        'peak_rss_mb': peak_rss_mb,
+        'rss_at_categorical_cast_mb': _checkpoint_rss('after feature dtype cast (pre-split)'),
+        'rss_at_x_train_build_mb': _checkpoint_rss('after building X_train'),
+        'rss_at_x_test_build_mb': _checkpoint_rss('after building X_test'),
+        'rss_after_fit_mb': _checkpoint_rss('after fit completes'),
     }
 
 
 def _train_and_save_model() -> None:
+    _reset_mem_checkpoints()
     print('No saved model found — training v0 XGBoost model from the S3 feature snapshot...')
     X_train, y_train, X_test, y_test, categories, data_window_start, data_window_end, data_window_days = (
         _load_training_frames()
@@ -516,6 +564,7 @@ def _train_and_save_model() -> None:
     training_metadata = _build_training_metadata(
         X_train, train_mae, test_mae, naive_mae, pct_improvement_over_naive,
         data_window_start, data_window_end, data_window_days,
+        list(_mem_checkpoints),
     )
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)

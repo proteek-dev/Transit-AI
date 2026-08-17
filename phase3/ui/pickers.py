@@ -15,7 +15,7 @@ from streamlit_geolocation import streamlit_geolocation
 
 import gtfs_data
 import map_picker
-from ui.formatting import DEFAULT_ROUTE_TYPE_MODE, ROUTE_TYPE_MODE
+from ui.formatting import DEFAULT_ROUTE_TYPE_MODE, ROUTE_TYPE_MODE, format_distance
 
 # Mode-filter chip options -> GTFS route_type. 'All' has no entry (means "no
 # filter"). Bus/Train/Tram only, matching what SEQ actually runs -- ferry is
@@ -73,7 +73,11 @@ def render_from_picker(mode_filter: str = 'All') -> dict | None:
     """
     confirmed = st.session_state.get('origin_confirmed')
     if confirmed:
-        st.success(f"From: {confirmed['stop_name']} ✓")
+        distance_suffix = (
+            f" ({format_distance(confirmed['distance_km'])})"
+            if confirmed.get('distance_km') is not None else ''
+        )
+        st.success(f"From: {confirmed['stop_name']} ✓{distance_suffix}")
         if st.button('Change origin', key='origin_change_btn'):
             st.session_state['origin_confirmed'] = None
             st.session_state['origin_candidates'] = None
@@ -148,7 +152,11 @@ def render_to_picker(origin_confirmed: dict, mode_filter: str = 'All') -> dict |
     """
     confirmed = st.session_state.get('dest_confirmed')
     if confirmed:
-        st.success(f"To: {confirmed['stop_name']} ✓")
+        distance_suffix = (
+            f" ({format_distance(confirmed['distance_km'])})"
+            if confirmed.get('distance_km') is not None else ''
+        )
+        st.success(f"To: {confirmed['stop_name']} ✓{distance_suffix}")
         if st.button('Change destination', key='dest_change_btn'):
             st.session_state['dest_confirmed'] = None
             st.rerun()
@@ -160,7 +168,10 @@ def render_to_picker(origin_confirmed: dict, mode_filter: str = 'All') -> dict |
         key='dest_typed_query',
     )
     if query and len(query.strip()) >= 2:
-        matches = gtfs_data.search_stops(query, limit=15)
+        matches = gtfs_data.search_stops(
+            query, limit=15,
+            ref_lat=origin_confirmed['stop_lat'], ref_lon=origin_confirmed['stop_lon'],
+        )
         candidates = _filter_by_mode(_attach_route_types(matches), mode_filter)
         print(f"[render_to_picker] typed query={query!r} mode_filter={mode_filter!r} -> "
               f"{len(candidates)} candidates: {[c['stop_name'] for c in candidates]}")
