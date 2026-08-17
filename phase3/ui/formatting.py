@@ -55,6 +55,18 @@ def route_label_plain(trip: dict) -> str:
     return label
 
 
+def format_distance(distance_km: float) -> str:
+    """'180m away' below 1km (rounded to the nearest 10m), else '2.3km away'
+    (one decimal place). Callers are responsible for only calling this when
+    a distance_km value actually exists on a candidate -- this never
+    computes or estimates a distance itself.
+    """
+    if distance_km < 1.0:
+        meters = round(distance_km * 1000 / 10) * 10
+        return f'{meters:.0f}m away'
+    return f'{distance_km:.1f}km away'
+
+
 def delay_color(minutes: float) -> str:
     if minutes > 5:
         return '#D64545'  # red

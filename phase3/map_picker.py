@@ -12,6 +12,8 @@ from __future__ import annotations
 import folium
 from streamlit_folium import st_folium
 
+from ui.formatting import format_distance
+
 # folium's built-in marker colors, keyed by GTFS route_type. Only used for
 # pin color; the mode emoji/label itself comes from the caller's mode_map.
 _FOLIUM_COLOR_BY_MODE = {
@@ -87,6 +89,8 @@ def render_stop_picker(
         mode_labels = [mode_map.get(rt, default_mode)[1] for rt in route_types] or [default_mode[1]]
 
         tooltip = f"{emoji} {cand['stop_name']} ({'/'.join(mode_labels)})"
+        if cand.get('distance_km') is not None:
+            tooltip += f" — {format_distance(cand['distance_km'])}"
         tooltip_to_stop_id[tooltip] = cand['stop_id']
 
         folium.Marker(

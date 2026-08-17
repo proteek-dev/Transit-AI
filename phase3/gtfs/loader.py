@@ -16,9 +16,6 @@ from route_types import FERRY_ROUTE_TYPE
 DATE_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 DAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 
-STATIC_FILES = ['stops.txt', 'stop_times.txt', 'trips.txt', 'routes.txt',
-                'calendar.txt', 'calendar_dates.txt', 'shapes.txt']
-
 # Ferry is out of scope everywhere except the raw S3 archiver
 # (scripts/archive_gtfsrt.py, untouched) -- routes, trips, stop_times, and
 # stops are all filtered against this in load() so no ferry service can ever
@@ -83,32 +80,116 @@ class GTFSData:
         self.snapshot_date = max(snapshot_dates)
         print(f'Loading static GTFS snapshot: {self.snapshot_date}')
 
-        frames = {}
-        for name in STATIC_FILES:
-            path = f's3://{static_prefix}/{self.snapshot_date}/{name}'
-            frames[name] = pd.read_csv(path, dtype=str)
+        snapshot_root = f's3://{static_prefix}/{self.snapshot_date}'
 
-        # --- DIAGNOSTIC (print-only, no filtering applied yet) -- investigate
-        # 'turnback' stops before any ferry exclusion or index-building runs,
-        # against the raw, unfiltered frames as read from S3. ---
-        stops_diag = frames['stops.txt']
-        stop_times_diag = frames['stop_times.txt']
+        # TODO: consider category dtype for repeated ID columns (trip_id,
+        # stop_id, route_id, service_id) read below, needs its own isolated
+        # change + full test pass -- left as plain str/object for now since
+        # they're used as raw dict keys, merge keys, and itertuples fields
+        # throughout _build_route_indexes() and _build_route_departure_index(),
+        # and category dtype risks silent equality/hash surprises there.
 
-        turnback_mask = stops_diag['stop_name'].str.contains('turnback', case=False, na=False)
-        turnback_stops = stops_diag[turnback_mask]
+        # --- Ferry exclusion, in dependency order (routes -> trips ->
+        # stop_times -> stops) -- see FERRY_ROUTE_TYPE above. Filtering here,
+        # before _build_stop_index()/_build_route_indexes() run, means every
+        # downstream structure (search index, stop_to_routes, route_to_stops,
+        # cluster_to_routes) is ferry-free by construction, with no separate
+        # filtering needed at the search/BFS call sites themselves. Each read
+        # below is also restricted to the columns this module actually uses
+        # (usecols) and stop_times.txt -- the ~2.9M-row dominant contributor
+        # to peak memory -- is read+filtered in chunks so the full unfiltered
+        # frame is never held in memory at once. ---
+        routes_raw = pd.read_csv(
+            f'{snapshot_root}/routes.txt',
+            usecols=['route_id', 'route_short_name', 'route_long_name', 'route_type'],
+            dtype=str,
+        )
+        routes_raw = routes_raw.assign(route_type=routes_raw['route_type'].astype('int32'))
+        ferry_route_ids = set(routes_raw.loc[routes_raw['route_type'] == FERRY_ROUTE_TYPE, 'route_id'])
+        self.routes = routes_raw[routes_raw['route_type'] != FERRY_ROUTE_TYPE].reset_index(drop=True)
+
+        # trips.txt is small (no chunking needed) -- filtered against
+        # ferry_route_ids up front so the stop_times chunk loop below can
+        # filter against non_ferry_trip_ids directly.
+        trips_raw = pd.read_csv(
+            f'{snapshot_root}/trips.txt',
+            usecols=['trip_id', 'route_id', 'service_id', 'shape_id', 'trip_headsign'],
+            dtype=str,
+        )
+        self.trips = trips_raw[~trips_raw['route_id'].isin(ferry_route_ids)].reset_index(drop=True)
+        non_ferry_trip_ids = set(self.trips['trip_id'])
+
+        stop_time_cols = ['trip_id', 'stop_id', 'stop_sequence', 'arrival_time', 'departure_time']
+        stop_times_chunks = []
+        stop_time_rows_loaded = 0
+        for chunk in pd.read_csv(
+            f'{snapshot_root}/stop_times.txt',
+            usecols=stop_time_cols,
+            dtype=str,
+            chunksize=500_000,
+        ):
+            stop_time_rows_loaded += len(chunk)
+            chunk = chunk.assign(stop_sequence=chunk['stop_sequence'].astype('int32'))
+            stop_times_chunks.append(chunk[chunk['trip_id'].isin(non_ferry_trip_ids)])
+        self.stop_times = (
+            pd.concat(stop_times_chunks, ignore_index=True) if stop_times_chunks
+            else pd.DataFrame(columns=stop_time_cols)
+        )
+        del stop_times_chunks
+        non_ferry_stop_ids = set(self.stop_times['stop_id'])
+
+        stops_raw = pd.read_csv(
+            f'{snapshot_root}/stops.txt',
+            usecols=['stop_id', 'stop_name', 'stop_lat', 'stop_lon', 'parent_station'],
+            dtype=str,
+        )
+        # Keep any parent_station referenced by a surviving stop too, so
+        # _build_stop_index()'s canonical-name lookup (parent id -> parent
+        # name) still resolves for stops that share a hub with a kept mode
+        # (e.g. a train platform's parent station record).
+        kept_parent_ids = set(
+            stops_raw.loc[stops_raw['stop_id'].isin(non_ferry_stop_ids), 'parent_station'].dropna()
+        )
+        keep_stop_ids = non_ferry_stop_ids | kept_parent_ids
+        self.stops = stops_raw[stops_raw['stop_id'].isin(keep_stop_ids)].reset_index(drop=True)
+        self.stops['stop_lat'] = self.stops['stop_lat'].astype('float32')
+        self.stops['stop_lon'] = self.stops['stop_lon'].astype('float32')
+
+        print(
+            f'Excluded ferry (route_type={FERRY_ROUTE_TYPE}): '
+            f'{len(ferry_route_ids):,} route(s), '
+            f'{len(trips_raw) - len(self.trips):,} trip(s), '
+            f'{stop_time_rows_loaded - len(self.stop_times):,} stop_time row(s), '
+            f'{len(stops_raw) - len(self.stops):,} ferry-only stop(s)'
+        )
+
+        # --- DIAGNOSTIC (print-only) -- investigate 'turnback' stops. Runs
+        # against the post-ferry-filter frames (self.stops / self.stop_times),
+        # NOT the raw unfiltered frames the previous (pre-chunking) version
+        # of this diagnostic used: now that stop_times.txt is read+filtered
+        # in chunks (above), the full unfiltered frame is never materialized
+        # as a single object to diagnose against, and reconstructing it here
+        # would mean concatenating every chunk unfiltered first -- reintroducing
+        # the exact peak-memory problem this change exists to fix. Deliberate
+        # call: turnback stops are not a ferry concern (see _build_stop_index()
+        # below) and this diagnostic's purpose -- auditing turnback stop_times
+        # occurrences -- doesn't need ferry rows present, so running it
+        # post-filter is equivalent for its purpose. Flagging this explicitly
+        # since it is a behavior change from the prior "raw frame" version. ---
+        turnback_mask = self.stops['stop_name'].str.contains('turnback', case=False, na=False)
+        turnback_stops = self.stops[turnback_mask]
         print(f"[DIAGNOSTIC] 'turnback' stop_name matches: {len(turnback_stops)}")
         for name in sorted(turnback_stops['stop_name'].unique()):
             print(f'  - {name!r}')
 
-        st_seq = stop_times_diag.assign(stop_sequence=stop_times_diag['stop_sequence'].astype(int))
-        trip_min_max = st_seq.groupby('trip_id')['stop_sequence'].agg(['min', 'max'])
+        trip_min_max = self.stop_times.groupby('trip_id')['stop_sequence'].agg(['min', 'max'])
 
         for row in turnback_stops.itertuples(index=False):
             stop_id = row.stop_id
             parent_station = getattr(row, 'parent_station', None)
             has_parent = isinstance(parent_station, str) and parent_station.strip() != ''
 
-            matches = st_seq[st_seq['stop_id'] == stop_id]
+            matches = self.stop_times[self.stop_times['stop_id'] == stop_id]
             n_trips = matches['trip_id'].nunique()
             print(f'\n[DIAGNOSTIC] stop_id={stop_id!r} stop_name={row.stop_name!r}')
             print(f"  in stop_times.txt: {'yes' if not matches.empty else 'no'} ({n_trips} distinct trip_id(s))")
@@ -127,63 +208,31 @@ class GTFSData:
                 print(f'  occurrences: {len(matches)} across {n_trips} distinct trip(s) -- '
                       f'position: first={first_count} last={last_count} middle={middle_count}')
 
-        # --- Ferry exclusion, in dependency order (routes -> trips ->
-        # stop_times -> stops) -- see FERRY_ROUTE_TYPE above. Filtering here,
-        # before _build_stop_index()/_build_route_indexes() run, means every
-        # downstream structure (search index, stop_to_routes, route_to_stops,
-        # cluster_to_routes) is ferry-free by construction, with no separate
-        # filtering needed at the search/BFS call sites themselves. ---
-        routes_raw = frames['routes.txt']
-        routes_raw = routes_raw.assign(route_type=routes_raw['route_type'].astype(int))
-        ferry_route_ids = set(routes_raw.loc[routes_raw['route_type'] == FERRY_ROUTE_TYPE, 'route_id'])
-        self.routes = routes_raw[routes_raw['route_type'] != FERRY_ROUTE_TYPE].reset_index(drop=True)
-
-        trips_raw = frames['trips.txt']
-        self.trips = trips_raw[~trips_raw['route_id'].isin(ferry_route_ids)].reset_index(drop=True)
-        non_ferry_trip_ids = set(self.trips['trip_id'])
-
-        stop_times_raw = frames['stop_times.txt']
-        stop_times_raw = stop_times_raw.assign(
-            stop_sequence=stop_times_raw['stop_sequence'].astype(int)
+        self.calendar = pd.read_csv(
+            f'{snapshot_root}/calendar.txt',
+            usecols=['service_id', *DAY_NAMES, 'start_date', 'end_date'],
+            dtype=str,
         )
-        self.stop_times = stop_times_raw[
-            stop_times_raw['trip_id'].isin(non_ferry_trip_ids)
-        ].reset_index(drop=True)
-        non_ferry_stop_ids = set(self.stop_times['stop_id'])
-
-        stops_raw = frames['stops.txt']
-        # Keep any parent_station referenced by a surviving stop too, so
-        # _build_stop_index()'s canonical-name lookup (parent id -> parent
-        # name) still resolves for stops that share a hub with a kept mode
-        # (e.g. a train platform's parent station record).
-        kept_parent_ids = set(
-            stops_raw.loc[stops_raw['stop_id'].isin(non_ferry_stop_ids), 'parent_station'].dropna()
-        )
-        keep_stop_ids = non_ferry_stop_ids | kept_parent_ids
-        self.stops = stops_raw[stops_raw['stop_id'].isin(keep_stop_ids)].reset_index(drop=True)
-        self.stops['stop_lat'] = self.stops['stop_lat'].astype(float)
-        self.stops['stop_lon'] = self.stops['stop_lon'].astype(float)
-
-        print(
-            f'Excluded ferry (route_type={FERRY_ROUTE_TYPE}): '
-            f'{len(ferry_route_ids):,} route(s), '
-            f'{len(trips_raw) - len(self.trips):,} trip(s), '
-            f'{len(stop_times_raw) - len(self.stop_times):,} stop_time row(s), '
-            f'{len(stops_raw) - len(self.stops):,} ferry-only stop(s)'
-        )
-
-        self.calendar = frames['calendar.txt']
         for day in DAY_NAMES:
-            self.calendar[day] = self.calendar[day].astype(int)
-        self.calendar['start_date'] = self.calendar['start_date'].astype(int)
-        self.calendar['end_date'] = self.calendar['end_date'].astype(int)
+            self.calendar[day] = self.calendar[day].astype('int32')
+        self.calendar['start_date'] = self.calendar['start_date'].astype('int32')
+        self.calendar['end_date'] = self.calendar['end_date'].astype('int32')
 
-        self.calendar_dates = frames['calendar_dates.txt']
+        self.calendar_dates = pd.read_csv(
+            f'{snapshot_root}/calendar_dates.txt',
+            usecols=['service_id', 'date', 'exception_type'],
+            dtype=str,
+        )
 
-        shapes_raw = frames['shapes.txt'].assign(
-            shape_pt_lat=frames['shapes.txt']['shape_pt_lat'].astype(float),
-            shape_pt_lon=frames['shapes.txt']['shape_pt_lon'].astype(float),
-            shape_pt_sequence=frames['shapes.txt']['shape_pt_sequence'].astype(int),
+        shapes_raw = pd.read_csv(
+            f'{snapshot_root}/shapes.txt',
+            usecols=['shape_id', 'shape_pt_lat', 'shape_pt_lon', 'shape_pt_sequence'],
+            dtype=str,
+        )
+        shapes_raw = shapes_raw.assign(
+            shape_pt_lat=shapes_raw['shape_pt_lat'].astype('float32'),
+            shape_pt_lon=shapes_raw['shape_pt_lon'].astype('float32'),
+            shape_pt_sequence=shapes_raw['shape_pt_sequence'].astype('int32'),
         ).sort_values(['shape_id', 'shape_pt_sequence'])
         self.shape_points = {
             shape_id: list(zip(group['shape_pt_lat'], group['shape_pt_lon']))

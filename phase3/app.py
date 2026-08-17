@@ -16,8 +16,9 @@ import streamlit as st
 
 import gtfs_data
 import live_gtfs
+import map_picker
 import prediction
-from ui.cards import render_ranked_journey
+from ui.cards import build_route_map_legs, render_ranked_journey
 from ui.formatting import (
     _closest_slot_index,
     _format_time_ampm_short,
@@ -177,18 +178,29 @@ with swap_col:
         _swap_origin_dest()
         st.rerun()
 
-col_from, col_to = st.columns(2)
-with col_from:
-    st.subheader('📍 From')
-    origin = render_from_picker(mode_filter)
+st.subheader('📍 From')
+origin = render_from_picker(mode_filter)
 
-with col_to:
-    st.subheader('🎯 To')
-    if origin:
-        dest = render_to_picker(origin, mode_filter)
-    else:
-        st.info('Set your origin first.')
-        dest = None
+st.subheader('🎯 To')
+if origin:
+    dest = render_to_picker(origin, mode_filter)
+else:
+    st.info('Set your origin first.')
+    dest = None
+
+if origin and dest:
+    st.subheader('🗺️ Route overview')
+# Reserved here (not gated on origin/dest, unlike the subheader above) so
+# writing into it further down the script -- after display_candidates is
+# computed -- can never hit a NameError on a run where origin/dest aren't
+# both confirmed yet. Content is deferred: Streamlit runs this whole script
+# top-to-bottom on every rerun, and the ranked/predicted results this map
+# needs to show the top journey aren't available until after the Search
+# button and the results-processing block further down, so the map's
+# visual position is reserved here but drawn into later via `with
+# route_map_placeholder:` -- the standard "position early, content late"
+# st.empty() pattern.
+route_map_placeholder = st.empty()
 
 now_brisbane = datetime.now(BRISBANE_TZ)
 
@@ -251,6 +263,10 @@ if search_clicked:
             'departure_after': departure_after,
             'window_minutes': window_minutes,
         }
+        # A fresh search must not carry over a route selection from a
+        # previous, different result set -- reset to "no selection", which
+        # the display logic below then defaults to the new top result.
+        st.session_state['selected_route_key'] = None
 
 results = st.session_state.get('results')
 if results:
@@ -278,6 +294,9 @@ if results:
             f'No services found between these stops within the next {results["window_minutes"]} minutes, '
             'even with transfers. Try a different time or check nearby stops.'
         )
+        if origin and dest:
+            with route_map_placeholder:
+                map_picker.render_route_map([], origin, dest, key='shared_route_map')
     else:
         updates, live_error = get_live_updates()
         if live_error:
@@ -305,11 +324,54 @@ if results:
 
         if not display_candidates:
             st.info('Found services, but none could be predicted right now. Try again shortly.')
+            if origin and dest:
+                with route_map_placeholder:
+                    map_picker.render_route_map([], origin, dest, key='shared_route_map')
         else:
             st.caption('Ranked by predicted arrival time.')
 
+            # Stable per-candidate identity for the shared route map's
+            # selection -- a direct trip keys on its trip_id (same identity
+            # its old per-card route_open_key used), a transfer journey keys
+            # on its position in this ranked list (same identity its old
+            # show_route_open_journey_{idx} used). Built from
+            # display_candidates (the final, ranked/truncated list), not the
+            # wider candidate_journeys pool, since that's the order these
+            # cards actually render in below.
+            journey_keys = [
+                ('trip', leg_predictions[0][0]['trip_id']) if journey['num_transfers'] == 0
+                else ('journey', idx)
+                for idx, (_arrival, journey, leg_predictions) in enumerate(display_candidates)
+            ]
+
+            selected_key = st.session_state.get('selected_route_key')
+            if selected_key not in journey_keys:
+                # No selection yet, or it's a stale trip_id/idx left over
+                # from a previous, different result set -- default to the
+                # top-ranked result rather than erroring on a lookup that
+                # no longer matches anything in THIS result set.
+                selected_key = journey_keys[0]
+                st.session_state['selected_route_key'] = selected_key
+
+            selected_journey = display_candidates[journey_keys.index(selected_key)][1]
+
+            if origin and dest:
+                route_legs = build_route_map_legs(selected_journey)
+                with route_map_placeholder:
+                    map_picker.render_route_map(route_legs, origin, dest, key='shared_route_map')
+
             for idx, (_predicted_arrival_dt, journey, leg_predictions) in enumerate(display_candidates):
-                render_ranked_journey(idx, journey, leg_predictions, stop_names, dest_stop_ids, departure_after)
+                render_ranked_journey(
+                    idx, journey, leg_predictions, stop_names, dest_stop_ids, departure_after,
+                    journey_keys[idx],
+                )
+elif origin and dest:
+    # No search has been run yet this session (or 'results' was never set)
+    # -- pins-only, matching the original overview map's before-search
+    # behavior exactly, just drawn into the reserved placeholder instead of
+    # rendered inline.
+    with route_map_placeholder:
+        map_picker.render_route_map([], origin, dest, key='shared_route_map')
 
 # ── Footer ──────────────────────────────────────────────────────────────
 

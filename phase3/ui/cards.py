@@ -1,10 +1,13 @@
 """Result card rendering for the Phase 3 Streamlit app -- direct trips and
-multi-leg transfer journeys, plus the per-card "🗺️ Show route" toggle.
+multi-leg transfer journeys, plus the per-card "🗺️ Show route" button.
 
 render_ranked_journey() is the entry point app.py calls for each already-
 ranked, already-predicted candidate; it dispatches to render_trip_card()
 (direct) or render_transfer_journey_card() (transfer), both of which use
-render_card_detail() for the shared per-leg detail layout.
+render_card_detail() for the shared per-leg detail layout. Each card's
+"Show route" button no longer renders its own map -- there is exactly one
+route map on the page (app.py, at the top), and clicking a card's button
+just sets which journey it displays via st.session_state['selected_route_key'].
 """
 from __future__ import annotations
 
@@ -13,7 +16,6 @@ from datetime import datetime
 import streamlit as st
 
 import gtfs_data
-import map_picker
 import prediction
 from ui.formatting import CONFIDENCE_COLOR, badge_html, delay_color, route_badge, route_label_plain
 
@@ -23,7 +25,7 @@ from ui.formatting import CONFIDENCE_COLOR, badge_html, delay_color, route_badge
 ROUTE_MAP_LEG_COLORS = ['#2563eb', '#dc2626', '#16a34a', '#d97706']
 
 
-def _build_route_map_legs(journey: dict) -> list[dict]:
+def build_route_map_legs(journey: dict) -> list[dict]:
     """journey['legs'] -> map_picker.render_route_map()'s leg-dict shape:
     each leg's GTFS-shape points (None if the trip has no shape_id -- a
     valid GTFS state map_picker skips defensively), a color cycled from
@@ -94,7 +96,7 @@ def render_card_detail(trip: dict, pred: dict, raw_update: dict | None, stop_nam
 
 
 def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names,
-                      dest_stop_ids: list[str], departure_after: datetime,
+                      dest_stop_ids: list[str], departure_after: datetime, journey_key: tuple,
                       label_prefix: tuple[str, str] = ('From', 'To'), expanded: bool = False) -> None:
     """Render one leg's prediction card. The leave-by banner and plain
     English summary are always visible; everything else (route badge,
@@ -104,38 +106,35 @@ def render_trip_card(trip: dict, pred: dict, raw_update: dict | None, stop_names
     `expanded` controls the expander's initial state — True only for the
     first card in a results list.
 
-    `dest_stop_ids`/`departure_after` are only needed to wrap this trip into
-    the same one-leg-journey shape find_multi_leg_trips() produces, for the
-    "Show route" toggle below.
+    `journey_key` is this card's stable identity in the single shared route
+    map app.py renders at the top of the page. Clicking "Show route" just
+    sets st.session_state['selected_route_key'] to this value and reruns --
+    no map is rendered here.
     """
     render_leave_by_banner(pred)
     st.write(pred['summary'])
 
-    route_open_key = f"show_route_open_{trip['trip_id']}"
     if st.button('🗺️ Show route', key=f"show_route_btn_{trip['trip_id']}"):
-        st.session_state[route_open_key] = not st.session_state.get(route_open_key, False)
+        st.session_state['selected_route_key'] = journey_key
+        st.rerun()
+    if journey_key == st.session_state.get('selected_route_key'):
+        st.caption('📍 shown on map above')
 
     label = f'🕐 Leave by {pred["leave_by"]} — {route_label_plain(trip)}'
     with st.expander(label, expanded=expanded):
         render_card_detail(trip, pred, raw_update, stop_names, label_prefix)
 
-        if st.session_state.get(route_open_key, False):
-            origin_marker = st.session_state.get('origin_confirmed')
-            dest_marker = st.session_state.get('dest_confirmed')
-            if origin_marker and dest_marker:
-                journey = gtfs_data._direct_journey(trip, dest_stop_ids, departure_after)
-                route_legs = _build_route_map_legs(journey)
-                map_picker.render_route_map(
-                    route_legs, origin_marker, dest_marker, key=f"route_map_{trip['trip_id']}",
-                )
-
 
 def render_transfer_journey_card(journey: dict, leg_predictions: list, stop_names,
-                                  idx: int, expanded: bool) -> None:
+                                  idx: int, expanded: bool, journey_key: tuple) -> None:
     """Render one transfer journey (num_transfers >= 1): leave-by banner +
     journey summary always visible; per-leg detail and transfer connections
     live inside one expander. `leg_predictions` must already be computed
     (see _predict_journey_legs) -- no prediction happens here.
+
+    `journey_key` is this card's stable identity in the single shared route
+    map app.py renders at the top of the page -- see render_trip_card()'s
+    docstring for the same mechanism.
     """
     first_result = next((r for r in leg_predictions if r is not None), None)
     if first_result is None:
@@ -145,14 +144,15 @@ def render_transfer_journey_card(journey: dict, leg_predictions: list, stop_name
     n = journey['num_transfers']
     transfer_note = f"{n} transfer{'' if n == 1 else 's'}, ~{journey['total_minutes']} min total"
 
-    route_open_key = f'show_route_open_journey_{idx}'
-
     with st.container(border=True):
         render_leave_by_banner(first_pred)
         st.write(f"{first_pred['summary']} ({transfer_note}.)")
 
         if st.button('🗺️ Show route', key=f'show_route_btn_journey_{idx}'):
-            st.session_state[route_open_key] = not st.session_state.get(route_open_key, False)
+            st.session_state['selected_route_key'] = journey_key
+            st.rerun()
+        if journey_key == st.session_state.get('selected_route_key'):
+            st.caption('📍 shown on map above')
 
         label = f'🕐 Leave by {first_pred["leave_by"]} — {route_label_plain(first_trip)} ({transfer_note})'
         with st.expander(label, expanded=expanded):
@@ -171,29 +171,26 @@ def render_transfer_journey_card(journey: dict, leg_predictions: list, stop_name
                     )
                     st.divider()
 
-            if st.session_state.get(route_open_key, False):
-                origin_marker = st.session_state.get('origin_confirmed')
-                dest_marker = st.session_state.get('dest_confirmed')
-                if origin_marker and dest_marker:
-                    route_legs = _build_route_map_legs(journey)
-                    map_picker.render_route_map(
-                        route_legs, origin_marker, dest_marker, key=f'route_map_journey_{idx}',
-                    )
-
 
 def render_ranked_journey(idx: int, journey: dict, leg_predictions: list, stop_names,
-                           dest_stop_ids: list[str], departure_after: datetime) -> None:
+                           dest_stop_ids: list[str], departure_after: datetime,
+                           journey_key: tuple) -> None:
     """Render one already-ranked, already-predicted candidate -- a direct
     trip (num_transfers == 0) as a single card, a transfer journey
     (num_transfers >= 1) as a multi-leg card. Ranking/truncation/prediction
     all already happened before this is called; this is display only.
+
+    `journey_key` is threaded through to whichever card function this
+    dispatches to -- see render_trip_card()'s docstring for what it's for.
     """
     if journey['num_transfers'] == 0:
         trip, pred, raw_update = leg_predictions[0]
         with st.container(border=True):
             render_trip_card(
-                trip, pred, raw_update, stop_names, dest_stop_ids, departure_after,
+                trip, pred, raw_update, stop_names, dest_stop_ids, departure_after, journey_key,
                 expanded=(idx == 0),
             )
     else:
-        render_transfer_journey_card(journey, leg_predictions, stop_names, idx, expanded=(idx == 0))
+        render_transfer_journey_card(
+            journey, leg_predictions, stop_names, idx, expanded=(idx == 0), journey_key=journey_key,
+        )

@@ -13,8 +13,26 @@ from rapidfuzz import fuzz, process
 from gtfs.loader import load_gtfs_data
 
 
-def search_stops(query: str, limit: int = 10) -> list[dict]:
-    """Typeahead stop search: prefix matches first, then fuzzy matches, deduped by stop_name."""
+def search_stops(
+    query: str,
+    limit: int = 10,
+    ref_lat: float | None = None,
+    ref_lon: float | None = None,
+) -> list[dict]:
+    """Typeahead stop search: prefix matches first, then fuzzy matches, deduped by stop_name.
+
+    When ref_lat/ref_lon are both given, the fuzzy-match branch pulls a
+    wider candidate pool from process.extract() and re-sorts it by haversine
+    distance from (ref_lat, ref_lon) before truncating to `remaining` --
+    narrows fuzzy typeahead results toward a known reference point (e.g. a
+    confirmed origin) instead of a query fragment matching stops scattered
+    across the whole service area. Prefix matches are untouched either way
+    -- already query-specific enough that geo-biasing isn't needed there, so
+    no distance_km is computed or attached for them. When ref_lat/ref_lon
+    are omitted (the default), this function is byte-for-byte identical to
+    the un-biased version: no widened pool, no re-sort, no distance_km field
+    on any result.
+    """
     data = load_gtfs_data()
     index = data._stop_index
     query_lower = query.lower().strip()
@@ -31,13 +49,29 @@ def search_stops(query: str, limit: int = 10) -> list[dict]:
     if remaining > 0:
         non_prefix = index[~prefix_mask]
         choices = non_prefix['stop_name'].tolist()
+        has_ref = ref_lat is not None and ref_lon is not None
+        # Widen the pool pulled from process.extract() when there's a
+        # reference point to re-rank against, so a closer-but-slightly-
+        # lower-scoring match isn't excluded before re-ranking gets a
+        # chance. Capped so a large `remaining` can't request an unbounded
+        # extract() pool.
+        extract_limit = min(remaining * 4, 40) if has_ref else remaining
         matches = process.extract(
-            query, choices, scorer=fuzz.WRatio, limit=remaining, processor=str.lower
+            query, choices, scorer=fuzz.WRatio, limit=extract_limit, processor=str.lower
         )
         matched_names = [m[0] for m in matches if m[1] > 0]
         fuzzy_rows = non_prefix[non_prefix['stop_name'].isin(matched_names)]
         # preserve rapidfuzz's ranked order
         fuzzy_rows = fuzzy_rows.set_index('stop_name').loc[matched_names].reset_index()
+
+        if has_ref:
+            fuzzy_rows = fuzzy_rows.copy()
+            fuzzy_rows['distance_km'] = [
+                _haversine_km(ref_lat, ref_lon, lat, lon)
+                for lat, lon in zip(fuzzy_rows['stop_lat'], fuzzy_rows['stop_lon'])
+            ]
+            fuzzy_rows = fuzzy_rows.sort_values('distance_km').head(remaining)
+
         results += list(fuzzy_rows.itertuples(index=False))
 
     results = results[:limit]
@@ -49,6 +83,12 @@ def search_stops(query: str, limit: int = 10) -> list[dict]:
             'stop_name': row.stop_name,
             'stop_lat': row.stop_lat,
             'stop_lon': row.stop_lon,
+            # Only present on fuzzy-matched rows when a reference point was
+            # given (see has_ref above) -- reuses the distance already
+            # computed for sorting rather than recomputing it here, and is
+            # omitted (not set to None) everywhere else, so downstream code
+            # can distinguish "we don't know" from "we know and it's far."
+            **({'distance_km': row.distance_km} if hasattr(row, 'distance_km') else {}),
         }
         for row in results
     ]
