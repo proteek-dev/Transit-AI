@@ -3,11 +3,18 @@ the Streamlit app in phase3/app.py. Additive only; phase3/ is untouched.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+from zoneinfo import ZoneInfo
 
 import boto3
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title='Transit-AI API')
@@ -91,3 +98,236 @@ def model_stats() -> dict:
             'end': metadata['data_window_end'],
         },
     }
+
+
+# GET /routes wraps phase3/'s own routing + prediction stack rather than
+# reimplementing any of it. phase3/ isn't a package (its modules do plain
+# `import gtfs_data`, `from ml.model_io import ...`, etc, assuming phase3/
+# itself is on sys.path) -- same fix phase3/tests/smoke_test.py already
+# uses for the same reason.
+#
+# Imported here: gtfs_data.find_trips() / find_multi_leg_trips() /
+# _direct_journey() (gtfs/routing.py's BFS engine, re-exported by
+# gtfs_data.py's facade -- app.py itself calls _direct_journey the same
+# underscore-prefixed way), prediction.enrich_trip_with_dest_stop() /
+# predict_delay() (ml/inference.py's hot path, re-exported by
+# prediction.py's facade), and route_types.MODE_BY_ROUTE_TYPE (the GTFS
+# route_type -> mode-name mapping predict_delay() itself uses internally).
+#
+# Streamlit-runtime check (see task item 4): nothing in this chain actually
+# requires a running Streamlit app. The two places that touch `streamlit`
+# -- ml/model_io.py's `load_model = st.cache_resource(...)(_load_model_impl)`
+# and config.py's get_aws_credentials()/get_s3_bucket() trying st.secrets --
+# both do `import streamlit as st` inside a try/except ImportError with a
+# working non-Streamlit fallback already built in (an in-process dict cache
+# for load_model, env-vars/.env for credentials). Since streamlit isn't in
+# this service's requirements.txt, both fall back automatically. app.py's
+# own @st.cache_data(ttl=60) around live_gtfs.fetch_trip_updates() is also
+# just a UI-layer cache on top of live_gtfs.py's own manual 60s in-process
+# cache -- moot here anyway since live GTFS-RT blending isn't used below
+# (see _predict_leg).
+PHASE3_DIR = Path(__file__).resolve().parents[2] / 'phase3'
+if str(PHASE3_DIR) not in sys.path:
+    sys.path.insert(0, str(PHASE3_DIR))
+
+import gtfs_data  # noqa: E402
+import prediction  # noqa: E402
+from route_types import MODE_BY_ROUTE_TYPE  # noqa: E402
+
+BRISBANE_TZ = ZoneInfo('Australia/Brisbane')
+
+# Mirrors phase3/app.py's own constants for this same search -> rank ->
+# truncate pipeline (CANDIDATE_POOL_SIZE, MAX_RESULTS, the 60-minute
+# window): a wider pool gets predicted so ranking-by-predicted-arrival can
+# surface a transfer journey ahead of a direct trip if it actually arrives
+# sooner, then only the top 5 are returned.
+CANDIDATE_POOL_SIZE = 10
+MAX_RESULTS = 5
+WINDOW_MINUTES = 60
+
+# gtfs_data.load_gtfs_data() (~46s: parses 900+ routes / 115K+ trips / 3M+
+# stop_times from S3) and prediction.load_model() (~10s) each cache
+# themselves in an in-process dict on first call -- lazily, by default, on
+# whichever request happens to trigger them first. Without this, the first
+# real /routes request after every container boot would eat that whole
+# ~55s cost. Instead, the startup hook below fires this off as a background
+# task (never awaited there) so uvicorn still binds its port and serves
+# /health immediately; the actual blocking pandas/xgboost calls run via
+# asyncio.to_thread so they never tie up the event loop while /health (the
+# Render health check + the cron-job.org keep-alive) or any other request
+# needs to be served concurrently. GTFS and model loads don't depend on
+# each other, so they run concurrently rather than back-to-back.
+_warmup_ready = asyncio.Event()
+
+
+async def _warmup() -> None:
+    print('[warmup] starting GTFS static load + model load in the background...')
+    started_at = time.monotonic()
+    try:
+        await asyncio.gather(
+            asyncio.to_thread(gtfs_data.load_gtfs_data),
+            asyncio.to_thread(prediction.load_model),
+        )
+    except Exception as e:
+        # Don't leave /routes awaiting a signal that would never fire --
+        # let requests through to hit the same load calls themselves,
+        # which surface as /routes' existing 503 path if still broken.
+        print(f'[warmup] failed after {time.monotonic() - started_at:.1f}s ({e}) -- /routes will retry per-request.')
+    else:
+        print(f'[warmup] complete in {time.monotonic() - started_at:.1f}s -- /routes is now warm.')
+    finally:
+        _warmup_ready.set()
+
+
+@app.on_event('startup')
+async def _on_startup() -> None:
+    asyncio.create_task(_warmup())
+
+
+def _parse_departure(departure: str | None) -> datetime:
+    """None -> naive Brisbane-local "now" (matches app.py's Departure=Now
+    handling: datetime.now(BRISBANE_TZ) then strip tzinfo, since routing.py's
+    BFS compares against naive datetimes throughout). A given ISO string
+    with an explicit offset/zone is converted to Brisbane time then
+    stripped; a naive one is treated as already being Brisbane wall-clock
+    time, same as app.py's Custom departure_mode.
+    """
+    if departure is None:
+        now = datetime.now(BRISBANE_TZ)
+        return datetime.combine(now.date(), now.time())
+    try:
+        parsed = datetime.fromisoformat(departure)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Invalid departure datetime: {departure!r} (expected ISO 8601)',
+        )
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(BRISBANE_TZ).replace(tzinfo=None)
+    return parsed
+
+
+def _predict_leg(trip: dict, dest_stop_ids: list[str], search_departure_after: datetime) -> tuple[dict, dict] | None:
+    """Enrich + predict_delay() one leg's trip -- same as app.py's
+    _predict_leg(), minus live GTFS-RT blending (live_delay always None
+    here; predict_delay() natively supports this, falling back to its
+    coverage-based Medium/Low confidence -- not a rebuild of that logic,
+    just not exercising the live-blended branch). Returns None on failure
+    rather than raising, so one bad leg doesn't take down the whole request.
+    """
+    try:
+        enriched = prediction.enrich_trip_with_dest_stop(trip, dest_stop_ids)
+        pred = prediction.predict_delay(enriched, search_departure_after, live_delay=None)
+    except Exception as e:
+        print(f'[/routes] could not predict leg (trip_id={trip.get("trip_id")!r}): {e}')
+        return None
+    return enriched, pred
+
+
+def _predict_journey_legs(journey: dict) -> list[tuple[dict, dict]] | None:
+    """All legs of a journey, enriched + predicted. None if any leg's
+    prediction failed -- unlike app.py's UI (which renders a gap and keeps
+    the journey), a JSON leg can't represent "prediction failed" inside the
+    declared response shape, so the whole journey is dropped instead.
+    """
+    legs = []
+    for leg in journey['legs']:
+        result = _predict_leg(leg['trip'], leg['dest_stop_ids'], leg['search_departure_after'])
+        if result is None:
+            return None
+        legs.append(result)
+    return legs
+
+
+def _serialize_journey(journey: dict, leg_predictions: list[tuple[dict, dict]], predicted_arrival: datetime) -> dict:
+    legs_out = []
+    for trip, pred in leg_predictions:
+        mode = trip.get('mode') or MODE_BY_ROUTE_TYPE.get(trip.get('route_type'), 'unknown')
+        leg_predicted_arrival = trip['dest_arrival_time'] + timedelta(minutes=pred['blended_delay_minutes'])
+        legs_out.append({
+            'stop_id': trip['dest_stop_id'],
+            'route_short_name': trip.get('route_short_name') or trip['route_id'],
+            'mode': mode,
+            'departure_time': trip['origin_departure_time'].isoformat(),
+            'predicted_arrival': leg_predicted_arrival.isoformat(),
+            'confidence': pred['confidence'],
+        })
+    first_departure = leg_predictions[0][0]['origin_departure_time']
+    total_predicted_duration_minutes = int(round((predicted_arrival - first_departure).total_seconds() / 60))
+    return {
+        'legs': legs_out,
+        'total_predicted_duration_minutes': total_predicted_duration_minutes,
+        'transfer_count': journey['num_transfers'],
+    }
+
+
+def _find_ranked_routes(from_stop_id: str, to_stop_id: str, departure_after: datetime) -> list[dict]:
+    """find direct + transfer journeys (gtfs_data's BFS), predict every leg
+    of every candidate, then rank by predicted (not scheduled) arrival --
+    the exact pipeline app.py runs for its trip cards. Returns [] (not an
+    error) when BFS finds nothing at all, e.g. the known Surfers Paradise ->
+    HOTA gap.
+    """
+    origin_stop_ids = [from_stop_id]
+    dest_stop_ids = [to_stop_id]
+
+    trips = gtfs_data.find_trips(origin_stop_ids, dest_stop_ids, departure_after, window_minutes=WINDOW_MINUTES)
+    transfer_journeys = gtfs_data.find_multi_leg_trips(
+        origin_stop_ids, dest_stop_ids, departure_after, window_minutes=WINDOW_MINUTES,
+        max_results=CANDIDATE_POOL_SIZE,
+    )
+    direct_journeys = [
+        gtfs_data._direct_journey(trip, dest_stop_ids, departure_after) for trip in trips[:CANDIDATE_POOL_SIZE]
+    ]
+    # find_multi_leg_trips() also runs its own depth-0 direct check
+    # internally -- filtered to num_transfers >= 1 here so those aren't
+    # double-counted against direct_journeys above (same filter app.py uses).
+    transfer_only_journeys = [j for j in transfer_journeys if j['num_transfers'] >= 1]
+    candidate_journeys = direct_journeys + transfer_only_journeys
+
+    ranked = []
+    for journey in candidate_journeys:
+        leg_predictions = _predict_journey_legs(journey)
+        if leg_predictions is None:
+            continue
+        last_trip, last_pred = leg_predictions[-1]
+        predicted_arrival = last_trip['dest_arrival_time'] + timedelta(minutes=last_pred['blended_delay_minutes'])
+        ranked.append((predicted_arrival, journey, leg_predictions))
+
+    ranked.sort(key=lambda r: r[0])
+    return [
+        _serialize_journey(journey, leg_predictions, predicted_arrival)
+        for predicted_arrival, journey, leg_predictions in ranked[:MAX_RESULTS]
+    ]
+
+
+@app.get('/routes')
+async def routes(
+    from_stop_id: str = Query(..., min_length=1),
+    to_stop_id: str = Query(..., min_length=1),
+    # Optional[str], not `str | None` -- FastAPI evaluates a route's
+    # parameter annotations at runtime via get_typed_signature() even under
+    # `from __future__ import annotations`, and Python 3.9 (still in play
+    # here -- no runtime.txt/.python-version pin) can't eval PEP 604 `|`
+    # union syntax at runtime, only PEP 585 generics like list[dict].
+    # Confirmed by reproducing the crash locally.
+    departure: Optional[str] = Query(None),
+) -> list[dict]:
+    departure_after = _parse_departure(departure)
+    # Event.is_set() is a plain attribute read -- negligible once warm, so
+    # this never adds meaningful overhead to the steady-state path. Only a
+    # request arriving mid-warm-up actually awaits, and it waits on this
+    # one shared signal rather than triggering its own redundant load.
+    if not _warmup_ready.is_set():
+        await _warmup_ready.wait()
+    try:
+        # to_thread here for the same reason _warmup() uses it: this is a
+        # sync function doing blocking pandas/xgboost work, and running it
+        # inline on an `async def` handler would tie up the event loop for
+        # its ~0.25-2s instead of the threadpool isolation a plain `def`
+        # FastAPI route would have gotten automatically.
+        return await asyncio.to_thread(_find_ranked_routes, from_stop_id, to_stop_id, departure_after)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f'Routing/prediction unavailable: {e}')

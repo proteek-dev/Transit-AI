@@ -1,3 +1,17 @@
 fastapi
 uvicorn[standard]
 boto3
+
+# Pulled in transitively by importing phase3/gtfs_data.py and
+# phase3/prediction.py for GET /routes (see main.py) -- not duplicated
+# from phase3/requirements.txt, just the subset that module chain actually
+# needs (no streamlit/folium/jupyter/etc).
+pandas
+s3fs==2025.10.0
+python-dotenv
+xgboost
+scikit-learn
+rapidfuzz
+joblib
+requests
+gtfs-realtime-bindings
