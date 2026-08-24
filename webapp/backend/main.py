@@ -155,19 +155,30 @@ WINDOW_MINUTES = 60
 # /health immediately; the actual blocking pandas/xgboost calls run via
 # asyncio.to_thread so they never tie up the event loop while /health (the
 # Render health check + the cron-job.org keep-alive) or any other request
-# needs to be served concurrently. GTFS and model loads don't depend on
-# each other, so they run concurrently rather than back-to-back.
+# needs to be served concurrently.
+#
+# GTFS and model loads run one after another, not concurrently: an earlier
+# asyncio.gather() version ran both at once, which stacks both loads' peak
+# memory footprints simultaneously -- that overshot Render free tier's
+# 512MB cap and crash-looped the container on OOM. Sequential loading
+# matches the pre-warm-up lazy-load behavior (which never OOM'd) at the
+# cost of a longer total warm-up time (~sum of both stages instead of
+# ~max of the two) -- an explicit memory-over-speed tradeoff on the free
+# tier, not an oversight.
 _warmup_ready = asyncio.Event()
 
 
 async def _warmup() -> None:
-    print('[warmup] starting GTFS static load + model load in the background...')
+    print('[warmup] starting GTFS static load, then model load, in the background...')
     started_at = time.monotonic()
     try:
-        await asyncio.gather(
-            asyncio.to_thread(gtfs_data.load_gtfs_data),
-            asyncio.to_thread(prediction.load_model),
-        )
+        gtfs_started_at = time.monotonic()
+        await asyncio.to_thread(gtfs_data.load_gtfs_data)
+        print(f'[warmup] GTFS static loaded in {time.monotonic() - gtfs_started_at:.1f}s')
+
+        model_started_at = time.monotonic()
+        await asyncio.to_thread(prediction.load_model)
+        print(f'[warmup] model loaded in {time.monotonic() - model_started_at:.1f}s')
     except Exception as e:
         # Don't leave /routes awaiting a signal that would never fire --
         # let requests through to hit the same load calls themselves,
