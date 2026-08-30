@@ -16,6 +16,12 @@ from route_types import FERRY_ROUTE_TYPE
 DATE_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 DAY_NAMES = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 
+# Column set load_stop_times_optimized() validates the S3 parquet against --
+# matches load()'s own stop_time_cols and scripts/precompute_gtfs_static.py's
+# STOP_TIME_COLS (the artifact producer), so a schema drift between the two
+# is caught explicitly rather than surfacing as a downstream KeyError.
+STOP_TIME_COLS = ['trip_id', 'stop_id', 'stop_sequence', 'arrival_time', 'departure_time']
+
 # Ferry is out of scope everywhere except the raw S3 archiver
 # (scripts/archive_gtfsrt.py, untouched) -- routes, trips, stop_times, and
 # stops are all filtered against this in load() so no ferry service can ever
@@ -65,7 +71,7 @@ class GTFSData:
         self.stop_name_by_id = None        # stop_id -> stop_name
         self.trip_headsign_by_id = None    # trip_id -> trip_headsign or None
 
-    def load(self):
+    def load(self, use_categorical_dtypes: bool = False):
         bucket, fs = _get_env()
         static_prefix = f'{bucket}/gtfs_static'
 
@@ -130,7 +136,22 @@ class GTFSData:
         ):
             stop_time_rows_loaded += len(chunk)
             chunk = chunk.assign(stop_sequence=chunk['stop_sequence'].astype('int32'))
-            stop_times_chunks.append(chunk[chunk['trip_id'].isin(non_ferry_trip_ids)])
+            chunk = chunk[chunk['trip_id'].isin(non_ferry_trip_ids)]
+            if use_categorical_dtypes:
+                # Convert per-chunk (~500k rows), before concat -- NOT on the
+                # full concatenated frame after the fact. Converting the
+                # already-concatenated ~3M-row object-dtype frame requires
+                # holding both the object and categorical representations of
+                # the WHOLE frame in memory simultaneously during that one
+                # .astype('category') call, and glibc's allocator doesn't
+                # return that transient peak to the OS afterward -- measured
+                # RSS actually went UP (901.9MB vs 655.7MB baseline) despite
+                # stop_times' own reported memory_usage() going down.
+                # Converting each chunk right after its ferry-filter slice
+                # bounds that transient peak to one chunk's size instead.
+                chunk['trip_id'] = chunk['trip_id'].astype('category')
+                chunk['stop_id'] = chunk['stop_id'].astype('category')
+            stop_times_chunks.append(chunk)
         self.stop_times = (
             pd.concat(stop_times_chunks, ignore_index=True) if stop_times_chunks
             else pd.DataFrame(columns=stop_time_cols)
@@ -154,6 +175,25 @@ class GTFSData:
         self.stops = stops_raw[stops_raw['stop_id'].isin(keep_stop_ids)].reset_index(drop=True)
         self.stops['stop_lat'] = self.stops['stop_lat'].astype('float32')
         self.stops['stop_lon'] = self.stops['stop_lon'].astype('float32')
+
+        # Optional, additive path -- only taken when a caller explicitly asks
+        # for it (see load_gtfs_data(); default False, so phase3/app.py's
+        # Streamlit call is completely unaffected). stop_times' trip_id/
+        # stop_id are already categorical at this point (converted per-chunk
+        # above, before concat). trips and stops are read as single
+        # non-chunked frames (small enough that a post-hoc convert here isn't
+        # implicated in the peak-memory regression the chunk-level change
+        # above exists to fix), so trip_id/stop_id are converted here to
+        # match stop_times' categorical dtype -- every merge/join against
+        # stop_times' trip_id/stop_id (gtfs/routing.py, _build_route_indexes(),
+        # _build_route_departure_index() below) then sees consistent
+        # categorical columns on both sides rather than mixing categorical
+        # against plain object dtype. arrival_time/departure_time are
+        # deliberately left alone -- lower repetition, and this pass isn't
+        # touching downstream time-formatting code.
+        if use_categorical_dtypes:
+            self.trips['trip_id'] = self.trips['trip_id'].astype('category')
+            self.stops['stop_id'] = self.stops['stop_id'].astype('category')
 
         print(
             f'Excluded ferry (route_type={FERRY_ROUTE_TYPE}): '
@@ -266,6 +306,128 @@ class GTFSData:
             points = self.shape_points.get(shape_id) if pd.notna(shape_id) else None
             n_points = len(points) if points is not None else 0
             print(f'  spot-check trip_id={trip_id!r} shape_id={shape_id!r}: {n_points} shape points')
+
+    def load_optimized(self):
+        """Opt-in, memory-lean sibling of load() for webapp/backend's
+        Render process -- not called by phase3/app.py's Streamlit process,
+        which keeps using load() unchanged.
+
+        Reads routes/trips/stops/calendar/calendar_dates/shapes from S3 CSV
+        exactly like load() does (they're small; not the OOM driver), but
+        sources stop_times from the precomputed S3 parquet
+        (scripts/precompute_gtfs_static.py) via load_stop_times_optimized()
+        instead of load()'s chunked stop_times.txt CSV parse -- the ~3M-row
+        table that dominates peak memory on Render's 512MB free tier.
+
+        Builds the exact same derived structures load() does
+        (_build_stop_index / _build_route_indexes / _build_route_departure_index)
+        off the resulting frames, so a GTFSData populated via this method is
+        indistinguishable, shape-wise, to anything reading it (routing.py,
+        search.py, shapes.py) from one populated via load().
+        """
+        bucket, fs = _get_env()
+        static_prefix = f'{bucket}/gtfs_static'
+
+        entries = fs.ls(static_prefix)
+        snapshot_dates = sorted([
+            e.rstrip('/').split('/')[-1] for e in entries
+            if DATE_PATTERN.match(e.rstrip('/').split('/')[-1])
+        ])
+        if not snapshot_dates:
+            raise FileNotFoundError(f'No YYYY-MM-DD snapshots found under s3://{static_prefix}')
+
+        self.snapshot_date = max(snapshot_dates)
+        print(f'Loading static GTFS snapshot (optimized stop_times): {self.snapshot_date}')
+
+        snapshot_root = f's3://{static_prefix}/{self.snapshot_date}'
+
+        # --- Same ferry-exclusion pipeline as load() (routes -> trips ->
+        # stop_times -> stops), same usecols/dtype choices for the small
+        # tables. Only stop_times' source differs (parquet, not chunked CSV). ---
+        routes_raw = pd.read_csv(
+            f'{snapshot_root}/routes.txt',
+            usecols=['route_id', 'route_short_name', 'route_long_name', 'route_type'],
+            dtype=str,
+        )
+        routes_raw = routes_raw.assign(route_type=routes_raw['route_type'].astype('int32'))
+        ferry_route_ids = set(routes_raw.loc[routes_raw['route_type'] == FERRY_ROUTE_TYPE, 'route_id'])
+        self.routes = routes_raw[routes_raw['route_type'] != FERRY_ROUTE_TYPE].reset_index(drop=True)
+
+        trips_raw = pd.read_csv(
+            f'{snapshot_root}/trips.txt',
+            usecols=['trip_id', 'route_id', 'service_id', 'shape_id', 'trip_headsign'],
+            dtype=str,
+        )
+        self.trips = trips_raw[~trips_raw['route_id'].isin(ferry_route_ids)].reset_index(drop=True)
+        non_ferry_trip_ids = set(self.trips['trip_id'])
+
+        # The parquet artifact is unfiltered (see scripts/precompute_gtfs_static.py's
+        # docstring) -- ferry exclusion against non_ferry_trip_ids happens here,
+        # same cross-reference load()'s chunk loop does against stop_times.txt.
+        self.stop_times = load_stop_times_optimized(non_ferry_trip_ids=non_ferry_trip_ids)
+        non_ferry_stop_ids = set(self.stop_times['stop_id'])
+
+        stops_raw = pd.read_csv(
+            f'{snapshot_root}/stops.txt',
+            usecols=['stop_id', 'stop_name', 'stop_lat', 'stop_lon', 'parent_station'],
+            dtype=str,
+        )
+        kept_parent_ids = set(
+            stops_raw.loc[stops_raw['stop_id'].isin(non_ferry_stop_ids), 'parent_station'].dropna()
+        )
+        keep_stop_ids = non_ferry_stop_ids | kept_parent_ids
+        self.stops = stops_raw[stops_raw['stop_id'].isin(keep_stop_ids)].reset_index(drop=True)
+        self.stops['stop_lat'] = self.stops['stop_lat'].astype('float32')
+        self.stops['stop_lon'] = self.stops['stop_lon'].astype('float32')
+
+        # stop_times' trip_id/stop_id are already categorical (parquet-sourced,
+        # see load_stop_times_optimized()) -- match that on trips/stops here,
+        # same as load()'s use_categorical_dtypes=True path, so every merge
+        # against stop_times downstream (_build_route_indexes(),
+        # _build_route_departure_index()) sees consistent dtypes on both sides.
+        self.trips['trip_id'] = self.trips['trip_id'].astype('category')
+        self.stops['stop_id'] = self.stops['stop_id'].astype('category')
+
+        self.calendar = pd.read_csv(
+            f'{snapshot_root}/calendar.txt',
+            usecols=['service_id', *DAY_NAMES, 'start_date', 'end_date'],
+            dtype=str,
+        )
+        for day in DAY_NAMES:
+            self.calendar[day] = self.calendar[day].astype('int32')
+        self.calendar['start_date'] = self.calendar['start_date'].astype('int32')
+        self.calendar['end_date'] = self.calendar['end_date'].astype('int32')
+
+        self.calendar_dates = pd.read_csv(
+            f'{snapshot_root}/calendar_dates.txt',
+            usecols=['service_id', 'date', 'exception_type'],
+            dtype=str,
+        )
+
+        shapes_raw = pd.read_csv(
+            f'{snapshot_root}/shapes.txt',
+            usecols=['shape_id', 'shape_pt_lat', 'shape_pt_lon', 'shape_pt_sequence'],
+            dtype=str,
+        )
+        shapes_raw = shapes_raw.assign(
+            shape_pt_lat=shapes_raw['shape_pt_lat'].astype('float32'),
+            shape_pt_lon=shapes_raw['shape_pt_lon'].astype('float32'),
+            shape_pt_sequence=shapes_raw['shape_pt_sequence'].astype('int32'),
+        ).sort_values(['shape_id', 'shape_pt_sequence'])
+        self.shape_points = {
+            shape_id: list(zip(group['shape_pt_lat'], group['shape_pt_lon']))
+            for shape_id, group in shapes_raw.groupby('shape_id', sort=False)
+        }
+
+        self._build_stop_index()
+        self._build_route_indexes()
+        self._build_route_departure_index()
+
+        print(
+            f'Loaded snapshot {self.snapshot_date} (optimized stop_times): '
+            f'{len(self.stops):,} stops, {len(self.routes):,} routes, '
+            f'{len(self.trips):,} trips, {len(self.stop_times):,} stop_times'
+        )
 
     def _build_stop_index(self):
         # Platforms reference a parent_station (e.g. tram/train platforms all
@@ -430,13 +592,96 @@ class GTFSData:
         return (active | added) - removed
 
 
+def load_stop_times_optimized(non_ferry_trip_ids: set | None = None) -> pd.DataFrame:
+    """Opt-in stop_times loader for memory-constrained callers (webapp/backend's
+    Render process) -- reads the precomputed, already-categorical-dtyped
+    parquet artifact from S3 (scripts/precompute_gtfs_static.py) via a single
+    pd.read_parquet() call, same S3-URI-read pattern as
+    diagnostics/verify_optimized_read.py, instead of GTFSData.load()'s
+    chunked stop_times.txt CSV parse. Does not touch, wrap, or replace that
+    CSV path -- phase3/app.py's Streamlit process is completely unaffected.
+
+    Returns the same columns GTFSData.load() populates self.stop_times with
+    (trip_id, stop_id, stop_sequence, arrival_time, departure_time) -- a
+    drop-in column-for-column, usable by anything currently reading that
+    frame. dtypes are a strict superset of load(use_categorical_dtypes=True)'s:
+    trip_id/stop_id/arrival_time/departure_time all come back as category
+    (not just trip_id/stop_id) and stop_sequence as int32 -- confirmed
+    compatible with downstream code (_parse_gtfs_time()'s .str.split() and
+    the trip_id/stop_id merges in _build_route_indexes() /
+    _build_route_departure_index() both work unchanged against categorical
+    input).
+
+    non_ferry_trip_ids, when given, ferry-filters the frame the same way
+    GTFSData.load() does -- the parquet artifact itself is unfiltered (see
+    scripts/precompute_gtfs_static.py's docstring: ferry exclusion was
+    deliberately left to this follow-up wiring step).
+
+    Raises rather than silently falling back to the CSV path on any S3 read
+    failure (missing artifact, bad credentials) or schema mismatch --
+    callers that opted into this for its memory savings need to know
+    immediately if the optimized artifact isn't there, not silently eat the
+    CSV parse's memory cost behind their back.
+    """
+    bucket, _fs = _get_env()
+    parquet_uri = f's3://{bucket}/phase3/gtfs_static_optimized/latest/stop_times.parquet'
+
+    try:
+        stop_times = pd.read_parquet(parquet_uri)
+    except Exception as e:
+        raise RuntimeError(
+            f'Failed to read optimized stop_times parquet from {parquet_uri}: {e}. '
+            f'Has scripts/precompute_gtfs_static.py been run for the current snapshot?'
+        ) from e
+
+    missing_cols = [c for c in STOP_TIME_COLS if c not in stop_times.columns]
+    if missing_cols:
+        raise RuntimeError(
+            f'Optimized stop_times parquet at {parquet_uri} is missing expected column(s) '
+            f'{missing_cols} (got {list(stop_times.columns)}) -- schema drift from '
+            f'scripts/precompute_gtfs_static.py?'
+        )
+
+    if non_ferry_trip_ids is not None:
+        stop_times = stop_times[stop_times['trip_id'].isin(non_ferry_trip_ids)].reset_index(drop=True)
+
+    return stop_times
+
+
 _gtfs_cache = {}
 
 
-def load_gtfs_data(force_reload: bool = False) -> GTFSData:
-    """Load (or return the cached) parsed static GTFS snapshot."""
+def load_gtfs_data(force_reload: bool = False, use_categorical_dtypes: bool = False) -> GTFSData:
+    """Load (or return the cached) parsed static GTFS snapshot.
+
+    use_categorical_dtypes only affects a fresh load -- once cached, later
+    calls (with any combination of these args) return the same cached
+    object as-is. Not an issue in practice: phase3/app.py's Streamlit
+    process and webapp/backend/'s process are separate processes with their
+    own cache, and each only ever calls this with one fixed set of args for
+    its process's lifetime (see webapp/backend/main.py's warm-up).
+    """
     if force_reload or 'data' not in _gtfs_cache:
         data = GTFSData()
-        data.load()
+        data.load(use_categorical_dtypes=use_categorical_dtypes)
+        _gtfs_cache['data'] = data
+    return _gtfs_cache['data']
+
+
+def load_gtfs_data_optimized(force_reload: bool = False) -> GTFSData:
+    """Opt-in sibling of load_gtfs_data() for webapp/backend's Render process.
+
+    Populates the SAME shared _gtfs_cache this module's load_gtfs_data()
+    reads from, via GTFSData.load_optimized() instead of GTFSData.load().
+    This matters, not just for symmetry: phase3/gtfs/routing.py's
+    find_trips() / find_multi_leg_trips() / _direct_journey() all call the
+    plain load_gtfs_data() (no args) internally to fetch the cached
+    instance -- populating a separate cache here would leave those calls
+    re-triggering their own full stop_times.txt CSV parse on first use,
+    silently defeating the point of warming up with the lean parquet path.
+    """
+    if force_reload or 'data' not in _gtfs_cache:
+        data = GTFSData()
+        data.load_optimized()
         _gtfs_cache['data'] = data
     return _gtfs_cache['data']

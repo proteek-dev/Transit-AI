@@ -22,3 +22,7 @@ phase3/model/
 # .streamlit/secrets.toml.example is the template and IS committed.
 .streamlit/secrets.toml
 phase3/.streamlit/secrets.toml
+
+# Diagnostic cache artifacts (e.g. ABS LGA GeoJSON fetched by
+# diagnostics/corridor_scope_census.py) — regenerable, not committed.
+diagnostics/cache/

@@ -14,8 +14,21 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import boto3
+import psutil
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+# Memory visibility for diagnosing Render's free-tier 512MB OOM crash --
+# purely external process-level observability (psutil reads this process's
+# own RSS), not something that touches or wraps phase3/ code.
+_process = psutil.Process()
+
+
+def _rss_mb() -> float:
+    return _process.memory_info().rss / (1024 * 1024)
+
+
+print(f'[startup][mem] baseline RSS: {_rss_mb():.1f}MB')
 
 app = FastAPI(title='Transit-AI API')
 
@@ -111,8 +124,13 @@ def model_stats() -> dict:
 # gtfs_data.py's facade -- app.py itself calls _direct_journey the same
 # underscore-prefixed way), prediction.enrich_trip_with_dest_stop() /
 # predict_delay() (ml/inference.py's hot path, re-exported by
-# prediction.py's facade), and route_types.MODE_BY_ROUTE_TYPE (the GTFS
-# route_type -> mode-name mapping predict_delay() itself uses internally).
+# prediction.py's facade), route_types.MODE_BY_ROUTE_TYPE (the GTFS
+# route_type -> mode-name mapping predict_delay() itself uses internally),
+# and gtfs.loader.load_gtfs_data_optimized() -- imported directly from
+# gtfs.loader rather than through gtfs_data.py's facade, since that facade
+# is out of scope for this change; populates the same shared GTFSData cache
+# gtfs_data.find_trips() etc. read from (see its docstring), just via S3's
+# precomputed stop_times parquet instead of parsing stop_times.txt.
 #
 # Streamlit-runtime check (see task item 4): nothing in this chain actually
 # requires a running Streamlit app. The two places that touch `streamlit`
@@ -132,6 +150,7 @@ if str(PHASE3_DIR) not in sys.path:
 
 import gtfs_data  # noqa: E402
 import prediction  # noqa: E402
+from gtfs.loader import load_gtfs_data_optimized  # noqa: E402
 from route_types import MODE_BY_ROUTE_TYPE  # noqa: E402
 
 BRISBANE_TZ = ZoneInfo('Australia/Brisbane')
@@ -173,7 +192,18 @@ async def _warmup() -> None:
     started_at = time.monotonic()
     try:
         gtfs_started_at = time.monotonic()
-        await asyncio.to_thread(gtfs_data.load_gtfs_data)
+        # load_gtfs_data_optimized(): this process's own opt-in to
+        # gtfs/loader.py's parquet-backed stop_times path (reads the
+        # precomputed S3 parquet from scripts/precompute_gtfs_static.py
+        # instead of parsing stop_times.txt) -- cuts out stop_times'
+        # dominant share of peak RSS (the OOM driver on Render's 512MB free
+        # tier), the same rows the earlier use_categorical_dtypes=True path
+        # optimized the dtype of but still had to parse+chunk from CSV.
+        # Populates the same shared cache gtfs_data.py's routing helpers
+        # (find_trips() etc.) read from internally via load_gtfs_data() --
+        # see load_gtfs_data_optimized()'s docstring. phase3/app.py's
+        # Streamlit process never calls this and is unaffected.
+        await asyncio.to_thread(load_gtfs_data_optimized)
         print(f'[warmup] GTFS static loaded in {time.monotonic() - gtfs_started_at:.1f}s')
 
         model_started_at = time.monotonic()
@@ -190,9 +220,29 @@ async def _warmup() -> None:
         _warmup_ready.set()
 
 
+async def _sample_memory_during_warmup() -> None:
+    """Logs this process's RSS every ~1s for as long as _warmup() is still
+    running, so an OOM that happens before the "GTFS static loaded" log
+    line (i.e. during the load itself, not after it) is visible in Render's
+    logs. Runs alongside _warmup() as its own task -- doesn't call into or
+    wrap any phase3/ code, just observes the same process externally.
+    """
+    started_at = time.monotonic()
+    while not _warmup_ready.is_set():
+        elapsed = time.monotonic() - started_at
+        print(f'[warmup][mem] {elapsed:.0f}s: {_rss_mb():.1f}MB')
+        # Sleep up to 1s, but wake immediately (without an extra sample) if
+        # warm-up finishes mid-sleep -- avoids sampling forever after warm-up.
+        try:
+            await asyncio.wait_for(_warmup_ready.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+
+
 @app.on_event('startup')
 async def _on_startup() -> None:
     asyncio.create_task(_warmup())
+    asyncio.create_task(_sample_memory_during_warmup())
 
 
 def _parse_departure(departure: str | None) -> datetime:
