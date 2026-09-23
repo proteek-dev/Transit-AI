@@ -172,9 +172,10 @@ WINDOW_MINUTES = 60
 # ~55s cost. Instead, the startup hook below fires this off as a background
 # task (never awaited there) so uvicorn still binds its port and serves
 # /health immediately; the actual blocking pandas/xgboost calls run via
-# asyncio.to_thread so they never tie up the event loop while /health (the
-# Render health check + the cron-job.org keep-alive) or any other request
-# needs to be served concurrently.
+# asyncio.to_thread so they never tie up the event loop while /health or
+# any other request needs to be served concurrently. (Keep-alive strategy
+# for Cloud Run -- min-instances vs. scale-to-zero -- is still being
+# decided; /health stays useful either way.)
 #
 # GTFS and model loads run one after another, not concurrently: an earlier
 # asyncio.gather() version ran both at once, which stacks both loads' peak

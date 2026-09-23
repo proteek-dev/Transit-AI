@@ -1,0 +1,45 @@
+# Build context for webapp/backend/Dockerfile (Cloud Run backend image).
+# Built from the repo root: docker build -f webapp/backend/Dockerfile -t <image> .
+
+.git/
+.github/
+.devcontainer/
+.claude/
+.streamlit/
+.ruff_cache/
+.vscode/
+.idea/
+**/__pycache__/
+**/*.pyc
+**/.DS_Store
+.env
+.env.*
+!.env.example
+node_modules/
+
+# Frontend isn't needed to build the backend image
+webapp/frontend/
+
+# Repo-root dev/training/notebook tooling and generated output -- not
+# runtime deps of the deployed backend
+notebooks/
+pipeline/
+scripts/
+diagnostics/
+logs/
+config/
+requirements.txt
+
+# phase3/ subtree NOT reached by webapp/backend/main.py's import chain
+# (webapp/backend/Dockerfile copies only: phase3/config.py, route_types.py,
+# gtfs_data.py, live_gtfs.py, prediction.py, phase3/gtfs/, phase3/ml/ --
+# keep those OUT of this ignore list). Excluded here: the Streamlit app
+# itself, UI helpers, tests, and phase3/model/ (.gitignore'd model
+# artifacts -- fetched from S3 at runtime, never baked into the image).
+phase3/app.py
+phase3/map_picker.py
+phase3/ui/
+phase3/tests/
+phase3/model/
+phase3/.streamlit/
+phase3/.ruff_cache/

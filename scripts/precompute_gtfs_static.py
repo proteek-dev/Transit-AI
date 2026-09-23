@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Precompute an already-optimized stop_times.parquet for the GTFS static
-snapshot, upstream of Render's memory-constrained /routes backend.
+snapshot, upstream of the memory-constrained /routes backend.
 
 WHY: webapp/backend's /routes endpoint OOMs (peaks ~851MB RSS) parsing
-stop_times.txt (~3M rows) inside a 512MB-constrained Render process --
+stop_times.txt (~3M rows) inside a memory-constrained deployment process --
 phase3/gtfs/loader.py's GTFSData.load() already reads it in per-chunk
 category-dtype-converted batches (the `use_categorical_dtypes=True` path,
 see loader.py's stop_time_cols chunk loop), but even that optimized parse
 still costs real transient memory to run in the first place. This script
 does that same parse ONCE, upstream, on a machine with real RAM headroom
 (this Mac, or the archiver EC2 -- either has plenty for a 3M-row file), and
-writes the finished artifact to S3 so Render can eventually just read a
-lean parquet file directly instead of re-parsing the raw CSV every warm-up.
+writes the finished artifact to S3 so the deployed backend can eventually
+just read a lean parquet file directly instead of re-parsing the raw CSV
+every warm-up.
 
 Wiring loader.py to actually READ this artifact is a separate follow-up
 prompt -- this script only produces it. Standalone; does not import from or
@@ -46,8 +47,9 @@ chunks being concatenated don't all share identical categories -- which is
 near-guaranteed across ~500k-row slices of a 3M-row file. Confirmed via
 diagnostics/verify_optimized_read.py: the saved parquet's trip_id/stop_id
 came back as plain object (pandas_type 'unicode' in the file's own embedded
-schema metadata), and read-back RSS was 651.4MB -- still over Render's
-512MB cap, because the persisted artifact was never actually categorical.
+schema metadata), and read-back RSS was 651.4MB -- still over the
+memory-constrained deployment target's budget, because the persisted
+artifact was never actually categorical.
 
 Fixed by building ONE shared pandas.CategoricalDtype per column (from a
 lightweight first pass reading ONLY the CATEGORY_COLS columns across the

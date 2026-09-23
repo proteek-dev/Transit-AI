@@ -1,11 +1,11 @@
 import type { ModelStats, RouteOption } from './types';
 
 // NEXT_PUBLIC_ prefix required for a browser-visible env var (Next.js only
-// inlines NEXT_PUBLIC_* into the client bundle). Falls back to the live
-// Render backend for local dev so this works with zero .env setup; set
-// NEXT_PUBLIC_API_BASE_URL to override (e.g. a local backend on :8000).
+// inlines NEXT_PUBLIC_* into the client bundle). Falls back to the standard
+// local FastAPI dev port so this works with zero .env setup; set
+// NEXT_PUBLIC_API_BASE_URL to point at a deployed backend.
 export const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? 'https://transit-ai-isne.onrender.com';
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
 
 export class ApiError extends Error {
   constructor(

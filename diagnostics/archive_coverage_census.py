@@ -138,7 +138,7 @@ def census_one_partition(fs, bucket: str, rt_prefix: str, source_date: str,
 def census_static_snapshot(fs, bucket: str) -> dict:
     """Same snapshot-selection logic as phase3/gtfs/loader.py's
     GTFSData.load(): the latest YYYY-MM-DD snapshot under gtfs_static/ --
-    the dataset the Render OOM issue is about.
+    the dataset the memory-constrained-deployment OOM issue is about.
     """
     static_prefix = f'{bucket}/gtfs_static'
     static_dates = list_date_partitions(fs, static_prefix)

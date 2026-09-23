@@ -16,6 +16,10 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ## Backend
 
-By default this app talks to the live Render-hosted backend. Set
+By default this app talks to a local backend at `http://localhost:8000`. Set
 `NEXT_PUBLIC_API_BASE_URL` (see `.env` / your deployment platform's env vars)
-to point at a different backend, e.g. one running locally.
+to point at a different backend, e.g. a deployed one.
+
+## Deployment
+
+Migrating to Google Cloud Run — instructions pending Dockerfile.

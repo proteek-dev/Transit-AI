@@ -309,15 +309,17 @@ class GTFSData:
 
     def load_optimized(self):
         """Opt-in, memory-lean sibling of load() for webapp/backend's
-        Render process -- not called by phase3/app.py's Streamlit process,
-        which keeps using load() unchanged.
+        memory-constrained deployment process -- not called by
+        phase3/app.py's Streamlit process, which keeps using load()
+        unchanged.
 
         Reads routes/trips/stops/calendar/calendar_dates/shapes from S3 CSV
         exactly like load() does (they're small; not the OOM driver), but
         sources stop_times from the precomputed S3 parquet
         (scripts/precompute_gtfs_static.py) via load_stop_times_optimized()
         instead of load()'s chunked stop_times.txt CSV parse -- the ~3M-row
-        table that dominates peak memory on Render's 512MB free tier.
+        table that dominates peak memory on a memory-constrained deployment
+        target.
 
         Builds the exact same derived structures load() does
         (_build_stop_index / _build_route_indexes / _build_route_departure_index)
@@ -452,6 +454,27 @@ class GTFSData:
         turnback_mask = stops['stop_name'].str.contains('turnback', case=False, na=False)
         self._turnback_excluded_names = sorted(stops.loc[turnback_mask, 'stop_name'].unique())
         searchable_stops = stops.loc[~turnback_mask]
+
+        # stop_id can be categorical dtype here (GTFSData.load_optimized()'s
+        # path sets self.stops['stop_id'] to category). The stop_ids
+        # aggregation below returns a list per group; pandas then tries to
+        # cast that aggregation OUTPUT back to the SOURCE column's
+        # categorical dtype (obj.array._cast_pointwise_result internally),
+        # which raises "unhashable type: 'list'" -- a list can't be hashed
+        # into a category code. This happens regardless of what the groupby
+        # callable does with its input Series, since the failure is in
+        # re-casting the RESULT after aggregation, not in reading the
+        # source (an earlier fix that cast inside the lambda didn't help,
+        # for exactly this reason). Casting stop_id to object on this local
+        # searchable_stops copy -- not self.stops -- removes the
+        # categorical dtype pandas would otherwise try to cast the
+        # list-valued result back into. self.stops['stop_id'] and the
+        # zip() below (which reads the original `stops` variable, not
+        # searchable_stops) are unaffected and keep whatever dtype they
+        # already had.
+        searchable_stops = searchable_stops.assign(
+            stop_id=searchable_stops['stop_id'].astype(object)
+        )
 
         grouped = searchable_stops.assign(canonical_name=canonical_name).groupby(
             'canonical_name', sort=False
@@ -594,7 +617,7 @@ class GTFSData:
 
 def load_stop_times_optimized(non_ferry_trip_ids: set | None = None) -> pd.DataFrame:
     """Opt-in stop_times loader for memory-constrained callers (webapp/backend's
-    Render process) -- reads the precomputed, already-categorical-dtyped
+    deployment process) -- reads the precomputed, already-categorical-dtyped
     parquet artifact from S3 (scripts/precompute_gtfs_static.py) via a single
     pd.read_parquet() call, same S3-URI-read pattern as
     diagnostics/verify_optimized_read.py, instead of GTFSData.load()'s
@@ -669,7 +692,8 @@ def load_gtfs_data(force_reload: bool = False, use_categorical_dtypes: bool = Fa
 
 
 def load_gtfs_data_optimized(force_reload: bool = False) -> GTFSData:
-    """Opt-in sibling of load_gtfs_data() for webapp/backend's Render process.
+    """Opt-in sibling of load_gtfs_data() for webapp/backend's
+    memory-constrained deployment process.
 
     Populates the SAME shared _gtfs_cache this module's load_gtfs_data()
     reads from, via GTFSData.load_optimized() instead of GTFSData.load().
