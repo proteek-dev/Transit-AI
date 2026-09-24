@@ -269,6 +269,13 @@ def main() -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     peak_rss_mb = max(rss for _, rss in _mem_checkpoints)
+    # Greppable single-line marker for log scraping (e.g. `grep PRECOMPUTE_PEAK_RSS_MB`
+    # over CloudWatch/journalctl output) -- plain KEY=VALUE, no thousands separator,
+    # so it parses directly as a float. Printed before the human-readable SUMMARY
+    # block below (and before the S3-write-verification check that can raise), so
+    # it's emitted as early as possible once the peak is known, same as every other
+    # value this run already knows before it finishes.
+    print(f'PRECOMPUTE_PEAK_RSS_MB={peak_rss_mb:.1f}')
 
     print('\n' + '=' * 100)
     print('SUMMARY -- GTFS static stop_times precompute')
