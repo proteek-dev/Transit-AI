@@ -77,10 +77,12 @@ Usage:
 """
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -238,7 +240,46 @@ def main() -> None:
           f'selection phase3/gtfs/loader.py uses)\n')
 
     raw_csv_key = f'{static_prefix}/{snapshot_date}/stop_times.txt'
-    raw_csv_size_bytes = fs.info(raw_csv_key)['size']
+    raw_csv_info = fs.info(raw_csv_key)
+    raw_csv_size_bytes = raw_csv_info['size']
+    # ETag persisted into the _manifest.json sidecar below (source_etag) --
+    # taken from this same fs.info() HEAD call already made for
+    # raw_csv_size_bytes, rather than a second S3 call later.
+    raw_csv_etag = raw_csv_info.get('ETag') or raw_csv_info.get('etag')
+
+    # Output URIs resolved here -- not later, where they used to live inside
+    # the upload try/finally block below -- so both the idempotency
+    # pre-check immediately below and the upload block further down share
+    # one definition. Matches phase3/gtfs/loader.py's
+    # load_stop_times_optimized(), which reads this same fixed
+    # phase3/gtfs_static_optimized/latest/stop_times.parquet key.
+    output_prefix = f'{bucket}/phase3/gtfs_static_optimized'
+    dated_uri = f's3://{output_prefix}/{snapshot_date}/stop_times.parquet'
+    latest_uri = f's3://{output_prefix}/latest/stop_times.parquet'
+    manifest_uri = f's3://{output_prefix}/latest/_manifest.json'
+
+    # --- Idempotency pre-check -- BEFORE any read of stop_times.txt's rows
+    # (build_shared_category_dtypes()/load_and_optimize_stop_times() below
+    # are the expensive, full-file chunked reads; the fs.info() HEAD call
+    # above is metadata-only, not a row read). Makes daily cron-mode runs
+    # cheap when gtfs_static/ hasn't published a new date since the last
+    # run: if today's dated parquet is already on S3 AND latest/'s own
+    # manifest confirms it was built from this same date, there's nothing
+    # new to do. ---
+    if fs.exists(dated_uri) and fs.exists(manifest_uri):
+        try:
+            with fs.open(manifest_uri) as f:
+                existing_manifest = json.load(f)
+            already_current = existing_manifest.get('source_snapshot_date') == snapshot_date
+        except Exception as e:
+            # A missing/corrupt manifest should never block a legitimate
+            # run -- fall through to the normal (expensive but correct)
+            # pipeline below instead of raising here.
+            print(f'[IDEMPOTENCY CHECK] Could not read/parse {manifest_uri} ({e}) -- proceeding with full run.')
+            already_current = False
+        if already_current:
+            print(f'IDEMPOTENT_SKIP: latest already at {snapshot_date}')
+            return
 
     category_dtypes = build_shared_category_dtypes(snapshot_root)
     stop_times, rows_processed = load_and_optimize_stop_times(snapshot_root, category_dtypes)
@@ -250,10 +291,8 @@ def main() -> None:
         _log_mem('after local parquet write')
         parquet_size_bytes = local_parquet_path.stat().st_size
 
-        output_prefix = f'{bucket}/phase3/gtfs_static_optimized'
-        dated_uri = f's3://{output_prefix}/{snapshot_date}/stop_times.parquet'
-        latest_uri = f's3://{output_prefix}/latest/stop_times.parquet'
-
+        # output_prefix/dated_uri/latest_uri/manifest_uri already resolved
+        # above, ahead of the idempotency pre-check -- reused as-is here.
         print(f'\nUploading to S3 (dated, canonical) -> {dated_uri}')
         fs.put(str(local_parquet_path), dated_uri)
         # S3-side copy for the latest/ pointer -- same fs.copy() promotion
@@ -263,12 +302,33 @@ def main() -> None:
         print(f'Copying (S3-side) to latest pointer -> {latest_uri}')
         fs.copy(dated_uri, latest_uri)
 
+        # --- _manifest.json sidecar -- same local-write-then-fs.put()
+        # convention phase3/ml/training.py / phase3/ml/model_io.py use for
+        # training_metadata.json (json.dump() to a local file first, then a
+        # separate fs.put() upload -- no direct fs.open(uri, 'w') write to
+        # S3). peak_rss_mb computed here (moved up from its old spot after
+        # this try/finally block, below) since no _log_mem() checkpoint
+        # fires after this point anyway -- identical final value, just
+        # available where the manifest needs it. ---
+        peak_rss_mb = max(rss for _, rss in _mem_checkpoints)
+        manifest = {
+            'source_snapshot_date': snapshot_date,
+            'source_row_count': rows_processed,
+            'source_etag': raw_csv_etag,
+            'written_at': datetime.now(timezone.utc).isoformat(),
+            'peak_rss_mb': peak_rss_mb,
+        }
+        local_manifest_path = tmp_dir / '_manifest.json'
+        with open(local_manifest_path, 'w') as f:
+            json.dump(manifest, f)
+        print(f'Writing manifest sidecar -> {manifest_uri}')
+        fs.put(str(local_manifest_path), manifest_uri)
+
         dated_ok = fs.exists(dated_uri)
         latest_ok = fs.exists(latest_uri)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    peak_rss_mb = max(rss for _, rss in _mem_checkpoints)
     # Greppable single-line marker for log scraping (e.g. `grep PRECOMPUTE_PEAK_RSS_MB`
     # over CloudWatch/journalctl output) -- plain KEY=VALUE, no thousands separator,
     # so it parses directly as a float. Printed before the human-readable SUMMARY
