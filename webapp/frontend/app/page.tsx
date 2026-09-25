@@ -92,7 +92,7 @@ function ModelStatsSection({ state }: { state: LoadState<ModelStats> }) {
 
 function RouteHeroSection({ state }: { state: LoadState<RouteOption[]> }) {
   if (state.status === 'loading') {
-    return <p>Loading live predictions... this can take up to a minute on first load.</p>;
+    return <p>Loading live predictions...</p>;
   }
   if (state.status === 'error') {
     return <p style={{ color: '#b00020' }}>Error loading routes: {state.message}</p>;
