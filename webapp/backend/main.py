@@ -70,7 +70,7 @@ _training_metadata: dict | None = None
 _training_metadata_fetch_error: str | None = None
 
 
-def _fetch_training_metadata_from_s3() -> dict:
+def _fetch_s3_json(key: str) -> dict:
     bucket = os.environ.get(S3_BUCKET_ENV_VAR)
     if not bucket:
         raise RuntimeError(f'{S3_BUCKET_ENV_VAR} environment variable is not set')
@@ -78,8 +78,12 @@ def _fetch_training_metadata_from_s3() -> dict:
     # credential chain (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
     # AWS_DEFAULT_REGION env vars here) -- nothing hardcoded.
     s3 = boto3.client('s3')
-    response = s3.get_object(Bucket=bucket, Key=S3_METADATA_KEY)
+    response = s3.get_object(Bucket=bucket, Key=key)
     return json.loads(response['Body'].read())
+
+
+def _fetch_training_metadata_from_s3() -> dict:
+    return _fetch_s3_json(S3_METADATA_KEY)
 
 
 try:
@@ -89,6 +93,67 @@ except Exception as e:
     # it as a 503 from /model/stats instead (see below).
     _training_metadata_fetch_error = str(e)
     print(f'Startup: failed to fetch training_metadata.json from S3 ({e}) -- /model/stats will return 503.')
+
+
+# data_snapshot freshness inputs for /model/stats, cached the same way as
+# training_metadata.json above. Unlike that fetch, a failure here doesn't
+# 503 the endpoint -- the affected data_snapshot field is just null.
+#
+# Feature manifest: same _latest.json phase3/ml/training.py reads;
+# source_date_range is [first, last] feature date, so its max is the last
+# day of features. GTFS manifest: the _manifest.json sidecar
+# scripts/precompute_gtfs_static.py writes next to the 'latest' parquet the
+# loader reads -- re-fetched after each warm-up GTFS load (see _warmup())
+# so it tracks what's actually in memory.
+S3_FEATURE_MANIFEST_KEY = 'ml_features/v0_feature_snapshot/_latest.json'
+S3_GTFS_MANIFEST_KEY = 'phase3/gtfs_static_optimized/latest/_manifest.json'
+HEALTHY_STOP_TIMES_MIN_ROWS = 1_000_000
+
+_features_through: str | None = None
+_gtfs_static_snapshot: str | None = None
+
+
+def _refresh_features_through() -> None:
+    global _features_through
+    try:
+        date_range = _fetch_s3_json(S3_FEATURE_MANIFEST_KEY).get('source_date_range') or []
+        _features_through = max(date_range) if date_range else None
+    except Exception as e:
+        _features_through = None
+        print(f'Startup: failed to fetch feature _latest.json from S3 ({e}) -- features_through will be null.')
+
+
+def _refresh_gtfs_static_snapshot() -> None:
+    global _gtfs_static_snapshot
+    try:
+        _gtfs_static_snapshot = _fetch_s3_json(S3_GTFS_MANIFEST_KEY).get('source_snapshot_date')
+    except Exception as e:
+        _gtfs_static_snapshot = None
+        print(f'Failed to fetch GTFS _manifest.json from S3 ({e}) -- gtfs_static_snapshot will be null.')
+
+
+_refresh_features_through()
+_refresh_gtfs_static_snapshot()
+
+
+def _graph_status() -> str:
+    """'healthy' at >= HEALTHY_STOP_TIMES_MIN_ROWS stop_times rows, 'empty'
+    at 0 rows or before warm-up has populated the GTFS cache, 'unknown'
+    otherwise (including a non-zero count below the threshold, e.g. the
+    ~714K-row stale-parquet symptom diagnostics/snapshot_integrity_check.py
+    investigates). Reads the loader's shared cache directly rather than via
+    load_gtfs_data(), which would trigger a full load if it's still cold.
+    """
+    try:
+        data = gtfs_loader._gtfs_cache.get('data')
+        if data is None or data.stop_times is None:
+            return 'empty'
+        rows = len(data.stop_times)
+    except Exception:
+        return 'unknown'
+    if rows == 0:
+        return 'empty'
+    return 'healthy' if rows >= HEALTHY_STOP_TIMES_MIN_ROWS else 'unknown'
 
 
 @app.get('/model/stats')
@@ -109,6 +174,12 @@ def model_stats() -> dict:
         'training_window': {
             'start': metadata['data_window_start'],
             'end': metadata['data_window_end'],
+        },
+        'data_snapshot': {
+            'features_through': _features_through,
+            'model_trained_through': metadata['data_window_end'],
+            'gtfs_static_snapshot': _gtfs_static_snapshot,
+            'graph_status': _graph_status(),
         },
     }
 
@@ -150,6 +221,7 @@ if str(PHASE3_DIR) not in sys.path:
 
 import gtfs_data  # noqa: E402
 import prediction  # noqa: E402
+from gtfs import loader as gtfs_loader  # noqa: E402
 from gtfs.loader import load_gtfs_data_optimized  # noqa: E402
 from route_types import MODE_BY_ROUTE_TYPE  # noqa: E402
 
@@ -206,6 +278,7 @@ async def _warmup() -> None:
         # Streamlit process never calls this and is unaffected.
         await asyncio.to_thread(load_gtfs_data_optimized)
         print(f'[warmup] GTFS static loaded in {time.monotonic() - gtfs_started_at:.1f}s')
+        await asyncio.to_thread(_refresh_gtfs_static_snapshot)
 
         model_started_at = time.monotonic()
         await asyncio.to_thread(prediction.load_model)
