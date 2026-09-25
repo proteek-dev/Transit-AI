@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import DataFreshness from '@/components/DataFreshness';
 import RouteHero from '@/components/RouteHero';
 import { ApiError, fetchModelStats, fetchRoutes } from '@/lib/api';
 import { FROM_STOP_ID, TO_STOP_ID } from '@/lib/corridor';
@@ -63,6 +64,8 @@ export default function Home() {
         <h2>Top route</h2>
         <RouteHeroSection state={routesState} />
       </section>
+
+      {statsState.status === 'success' && <DataFreshness snapshot={statsState.data.data_snapshot} />}
     </main>
   );
 }
@@ -100,8 +103,8 @@ function RouteHeroSection({ state }: { state: LoadState<RouteOption[]> }) {
   if (state.data.length === 0) {
     return (
       <p>
-        No routes found for this stop pair right now (BFS returned zero results — see lib/corridor.ts for
-        platform-swap notes).
+        No routes found for this stop pair at the current time. Try a different corridor pair (see
+        lib/corridor.ts).
       </p>
     );
   }

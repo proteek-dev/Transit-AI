@@ -33,6 +33,17 @@ export interface RouteOption {
   transfer_count: number;
 }
 
+/** /model/stats' data_snapshot block. Dates are ISO 'YYYY-MM-DD'; each is
+ * null when the backend couldn't read its source manifest at startup.
+ * model_trained_through mirrors training_window.end.
+ */
+export interface DataSnapshot {
+  features_through: string | null;
+  model_trained_through: string | null;
+  gtfs_static_snapshot: string | null;
+  graph_status: 'healthy' | 'empty' | 'unknown';
+}
+
 export interface ModelStats {
   training_rows: number;
   days_archived: number;
@@ -44,4 +55,5 @@ export interface ModelStats {
     start: string;
     end: string;
   };
+  data_snapshot: DataSnapshot;
 }
