@@ -65,7 +65,9 @@ export default function Home() {
         <RouteHeroSection state={routesState} />
       </section>
 
-      {statsState.status === 'success' && <DataFreshness snapshot={statsState.data.data_snapshot} />}
+      {statsState.status === 'success' && statsState.data.data_snapshot && (
+        <DataFreshness snapshot={statsState.data.data_snapshot} />
+      )}
     </main>
   );
 }

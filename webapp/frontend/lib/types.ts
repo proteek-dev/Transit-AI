@@ -55,5 +55,5 @@ export interface ModelStats {
     start: string;
     end: string;
   };
-  data_snapshot: DataSnapshot;
+  data_snapshot?: DataSnapshot;
 }
