@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from 'react';
 import DataFreshness from '@/components/DataFreshness';
-import RouteHero from '@/components/RouteHero';
+import RouteHero, { type RouteDataStatus } from '@/components/RouteHero';
 import { ApiError, fetchModelStats, fetchRoutes } from '@/lib/api';
 import { FROM_STOP_ID, TO_STOP_ID } from '@/lib/corridor';
+import { makeDemoRoute } from '@/lib/demoRoute';
 import type { ModelStats, RouteOption } from '@/lib/types';
 
 type LoadState<T> =
@@ -48,6 +49,17 @@ export default function Home() {
     };
   }, []);
 
+  const [demoRoute] = useState(() => makeDemoRoute());
+  const displayRoute =
+    routesState.status === 'success' && routesState.data.length > 0 ? routesState.data[0] : demoRoute;
+  const dataStatus: RouteDataStatus =
+    routesState.status === 'success'
+      ? routesState.data.length > 0
+        ? 'live'
+        : 'empty'
+      : routesState.status;
+  const routesErrorMessage = routesState.status === 'error' ? routesState.message : undefined;
+
   return (
     <main style={{ maxWidth: 720, margin: '0 auto', padding: '2rem 1rem', fontFamily: 'system-ui, sans-serif', lineHeight: 1.5 }}>
       <h1>Transit AI</h1>
@@ -62,7 +74,7 @@ export default function Home() {
 
       <section style={{ marginTop: '2rem' }}>
         <h2>Top route</h2>
-        <RouteHeroSection state={routesState} />
+        <RouteHero route={displayRoute} status={dataStatus} errorMessage={routesErrorMessage} />
       </section>
 
       {statsState.status === 'success' && statsState.data.data_snapshot && (
@@ -93,22 +105,4 @@ function ModelStatsSection({ state }: { state: LoadState<ModelStats> }) {
       </li>
     </ul>
   );
-}
-
-function RouteHeroSection({ state }: { state: LoadState<RouteOption[]> }) {
-  if (state.status === 'loading') {
-    return <p>Loading live predictions...</p>;
-  }
-  if (state.status === 'error') {
-    return <p style={{ color: '#b00020' }}>Error loading routes: {state.message}</p>;
-  }
-  if (state.data.length === 0) {
-    return (
-      <p>
-        No routes found for this stop pair at the current time. Try a different corridor pair (see
-        lib/corridor.ts).
-      </p>
-    );
-  }
-  return <RouteHero route={state.data[0]} />;
 }

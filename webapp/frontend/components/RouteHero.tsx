@@ -55,12 +55,46 @@ function formatHHMM(iso: string): string {
  * leg count, including a single direct leg (no connecting line rendered
  * when there's nothing to connect).
  */
-export default function RouteHero({ route }: { route: RouteOption }) {
+export type RouteDataStatus = 'live' | 'loading' | 'error' | 'empty';
+
+const BANNER_COPY: Record<Exclude<RouteDataStatus, 'live'>, string> = {
+  loading: 'Loading live predictions — showing example journey',
+  error: 'Live data unavailable — showing example journey',
+  empty: 'No live routes for this stop pair — showing example journey',
+};
+
+export default function RouteHero({
+  route,
+  status = 'live',
+  errorMessage,
+}: {
+  route: RouteOption;
+  status?: RouteDataStatus;
+  errorMessage?: string;
+}) {
   const { legs, total_predicted_duration_minutes, transfer_count } = route;
   const firstLeg = legs[0];
 
   return (
     <div style={{ padding: '1.5rem', border: '1px solid #ddd', borderRadius: 12 }}>
+      {status !== 'live' && (
+        // Negative margins cancel the card's 1.5rem padding so the strip
+        // spans the full card width, flush with its rounded top edge.
+        <div
+          title={status === 'error' ? errorMessage : undefined}
+          style={{
+            margin: '-1.5rem -1.5rem 1rem',
+            padding: '0.5rem',
+            background: '#f9fafb',
+            borderBottom: '1px solid #e5e7eb',
+            borderRadius: '12px 12px 0 0',
+            fontSize: '0.85em',
+            color: '#4b5563',
+          }}
+        >
+          {BANNER_COPY[status]}
+        </div>
+      )}
       <motion.p
         initial={{ opacity: 0, y: -6 }}
         animate={{ opacity: 1, y: 0 }}

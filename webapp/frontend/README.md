@@ -18,7 +18,8 @@ Open [http://localhost:3000](http://localhost:3000).
 
 By default this app talks to a local backend at `http://localhost:8000`. Set
 `NEXT_PUBLIC_API_BASE_URL` (see `.env` / your deployment platform's env vars)
-to point at a different backend, e.g. a deployed one.
+to point at a different backend, e.g. a deployed one. New devs should copy
+`.env.example` to `.env.local` to start against the deployed backend.
 
 ## Deployment
 
