@@ -10,7 +10,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -223,6 +223,7 @@ import gtfs_data  # noqa: E402
 import prediction  # noqa: E402
 from gtfs import loader as gtfs_loader  # noqa: E402
 from gtfs.loader import load_gtfs_data_optimized  # noqa: E402
+from gtfs.search import search_stops  # noqa: E402
 from route_types import MODE_BY_ROUTE_TYPE  # noqa: E402
 
 BRISBANE_TZ = ZoneInfo('Australia/Brisbane')
@@ -258,6 +259,8 @@ WINDOW_MINUTES = 60
 # ~max of the two) -- an explicit memory-over-speed tradeoff on the free
 # tier, not an oversight.
 _warmup_ready = asyncio.Event()
+# Set to True if _warmup()'s work crashes — checked by _wait_for_warmup() in /routes and /stops/search below.
+_warmup_failed: bool = False
 
 
 async def _warmup() -> None:
@@ -284,10 +287,13 @@ async def _warmup() -> None:
         await asyncio.to_thread(prediction.load_model)
         print(f'[warmup] model loaded in {time.monotonic() - model_started_at:.1f}s')
     except Exception as e:
-        # Don't leave /routes awaiting a signal that would never fire --
-        # let requests through to hit the same load calls themselves,
-        # which surface as /routes' existing 503 path if still broken.
-        print(f'[warmup] failed after {time.monotonic() - started_at:.1f}s ({e}) -- /routes will retry per-request.')
+        # _warmup_failed is checked by _wait_for_warmup() so requests fail
+        # fast with 503 instead of retrying the same load on the request
+        # path (the pre-guard behavior — see learnings.md's OOM section for
+        # why that path is dangerous).
+        global _warmup_failed
+        _warmup_failed = True
+        print(f'[warmup] failed after {time.monotonic() - started_at:.1f}s ({e}) -- /routes requests will return 503 until restart.')
     else:
         print(f'[warmup] complete in {time.monotonic() - started_at:.1f}s -- /routes is now warm.')
     finally:
@@ -436,6 +442,22 @@ def _find_ranked_routes(from_stop_id: str, to_stop_id: str, departure_after: dat
     ]
 
 
+async def _wait_for_warmup() -> None:
+    """Await warmup completion. Raises HTTPException 503 if warmup crashed.
+
+    Called by every request handler that reads GTFS data. Consolidates
+    the wait-then-check pattern so /routes and /stops/search can't drift
+    apart on how they handle a failed startup.
+    """
+    if not _warmup_ready.is_set():
+        await _warmup_ready.wait()
+    if _warmup_failed:
+        raise HTTPException(
+            status_code=503,
+            detail='Backend warm-up failed at startup; check server logs.',
+        )
+
+
 @app.get('/routes')
 async def routes(
     from_stop_id: str = Query(..., min_length=1),
@@ -449,12 +471,7 @@ async def routes(
     departure: Optional[str] = Query(None),
 ) -> list[dict]:
     departure_after = _parse_departure(departure)
-    # Event.is_set() is a plain attribute read -- negligible once warm, so
-    # this never adds meaningful overhead to the steady-state path. Only a
-    # request arriving mid-warm-up actually awaits, and it waits on this
-    # one shared signal rather than triggering its own redundant load.
-    if not _warmup_ready.is_set():
-        await _warmup_ready.wait()
+    await _wait_for_warmup()
     try:
         # to_thread here for the same reason _warmup() uses it: this is a
         # sync function doing blocking pandas/xgboost work, and running it
@@ -466,3 +483,30 @@ async def routes(
         raise
     except Exception as e:
         raise HTTPException(status_code=503, detail=f'Routing/prediction unavailable: {e}')
+
+
+@app.get('/stops/search')
+async def stops_search(
+    q: str = Query(..., min_length=1, max_length=100),
+    # ge=1 is load-bearing: search_stops() slices results[:limit], so a
+    # negative limit would silently drop results from the end.
+    limit: int = Query(10, ge=1, le=50),
+    # Optional[float], not `float | None` -- same Python 3.9 runtime-eval
+    # constraint as /routes' departure param above.
+    lat: Optional[float] = Query(None, ge=-90, le=90),
+    lon: Optional[float] = Query(None, ge=-180, le=180),
+) -> List[Dict[str, Any]]:
+    """Typeahead stop search -- thin wrapper over phase3/gtfs/search.py's
+    search_stops(). Returns its dicts as-is (distance_km only present on
+    geo-biased fuzzy matches), so no response_model: forcing that key
+    Optional would add nulls to the wire shape.
+    """
+    if (lat is None) != (lon is None):
+        raise HTTPException(status_code=422, detail='lat and lon must be provided together or both omitted')
+    await _wait_for_warmup()
+    try:
+        return await asyncio.to_thread(search_stops, q, limit=limit, ref_lat=lat, ref_lon=lon)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f'Stop search unavailable: {e}')
