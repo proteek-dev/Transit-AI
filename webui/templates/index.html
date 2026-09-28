@@ -1,61 +1,85 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Transit AI</title>
-    <link rel="stylesheet" href="/static/app.css">
-    <script src="/static/app.js" defer></script>
-  </head>
-  <body>
-    <header class="site-header">
-      <h1>Transit AI</h1>
-      <p class="tagline">Predicted arrivals for South East Queensland bus, train and tram.</p>
-    </header>
+{% extends 'base.html' %}
 
-    <main>
-      <form id="route-form" class="route-form" novalidate>
-        <div class="field">
-          <label id="from-label" for="from-input">From</label>
-          <div class="combo">
-            <input id="from-input" type="text" autocomplete="off" spellcheck="false"
-                   placeholder="Search for a stop"
-                   role="combobox" aria-autocomplete="list" aria-expanded="false"
-                   aria-controls="from-listbox">
-            <div id="from-dropdown" class="dropdown" hidden>
-              <p id="from-note" class="dropdown-note" hidden></p>
-              <ul id="from-listbox" class="options" role="listbox" aria-labelledby="from-label"></ul>
-            </div>
-          </div>
+{% block page %}search{% endblock %}
+
+{% block head %}
+<!-- Leaflet 1.9.4 from unpkg: the single CDN exception for the
+     single-process webui rebuild (no npm, no bundler). SRI-pinned.
+     Search page only -- results has no map. -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+{% endblock %}
+
+{% block content %}
+<main>
+  <h1 class="sr-only">Transit AI — plan a trip</h1>
+  <p class="tagline">Predicted arrivals for South East Queensland bus, train and tram.</p>
+
+  <form id="route-form" class="route-form" novalidate>
+    <div class="field">
+      <label id="from-label" for="from-input">From</label>
+      <div class="combo has-action">
+        <input id="from-input" type="text" autocomplete="off" spellcheck="false"
+               placeholder="Search for a stop"
+               role="combobox" aria-autocomplete="list" aria-expanded="false"
+               aria-controls="from-listbox" aria-describedby="from-hint">
+        <!-- Pin icon is appended by app.js (icons.js, DOM-built). -->
+        <button id="locate-button" class="locate" type="button"
+                aria-label="Use my location" title="Use my location">
+          <span id="locate-dot" class="locate-dot" hidden></span>
+        </button>
+        <div id="from-dropdown" class="dropdown" hidden>
+          <p id="from-note" class="dropdown-note" hidden></p>
+          <ul id="from-listbox" class="options" role="listbox" aria-labelledby="from-label"></ul>
         </div>
+      </div>
+      <p id="from-hint" class="field-hint" aria-live="polite" hidden></p>
+    </div>
 
-        <div class="field">
-          <label id="to-label" for="to-input">To</label>
-          <div class="combo">
-            <input id="to-input" type="text" autocomplete="off" spellcheck="false"
-                   placeholder="Search for a stop"
-                   role="combobox" aria-autocomplete="list" aria-expanded="false"
-                   aria-controls="to-listbox">
-            <div id="to-dropdown" class="dropdown" hidden>
-              <p id="to-note" class="dropdown-note" hidden></p>
-              <ul id="to-listbox" class="options" role="listbox" aria-labelledby="to-label"></ul>
-            </div>
-          </div>
+    <div class="field">
+      <label id="to-label" for="to-input">To</label>
+      <div class="combo">
+        <input id="to-input" type="text" autocomplete="off" spellcheck="false"
+               placeholder="Search for a stop"
+               role="combobox" aria-autocomplete="list" aria-expanded="false"
+               aria-controls="to-listbox">
+        <div id="to-dropdown" class="dropdown" hidden>
+          <p id="to-note" class="dropdown-note" hidden></p>
+          <ul id="to-listbox" class="options" role="listbox" aria-labelledby="to-label"></ul>
         </div>
+      </div>
+    </div>
 
-        <button id="submit" class="submit" type="submit">Find routes</button>
-      </form>
+    <button id="submit" class="submit" type="submit">Find routes</button>
+  </form>
 
-      <section class="results-section" aria-label="Routes">
-        <p id="status" class="status" role="status" aria-live="polite"></p>
-        <ol id="results" class="results"></ol>
-      </section>
-    </main>
+  <!-- Validation messages only; loading/empty/error live on /results. -->
+  <p id="status" class="status" role="status" aria-live="polite"></p>
 
-    <footer>
-      <p>Schedule snapshot: {{ schedule_snapshot }}</p>
-      <p>Model trained: {{ model_trained }}</p>
-      <p>Features through: {{ features_through }}</p>
-    </footer>
-  </body>
-</html>
+  <section class="nearby-section" aria-label="Stops near you">
+    <!-- Nearby-overview header: which field a pin tap fills. Shown by
+         renderMap() in the nearby view only. -->
+    <div id="map-header" class="map-header" hidden>
+      <p id="pin-target-label" class="map-header-label" aria-live="polite"></p>
+      <div id="pin-target" class="pin-target" role="toolbar" aria-label="Field a pin tap fills">
+        <button type="button" class="pin-target-option" data-target="from" aria-pressed="true">
+          <span class="pin-target-role">From</span>
+          <span class="pin-target-value"></span>
+        </button>
+        <button type="button" class="pin-target-option" data-target="to" aria-pressed="false" tabindex="-1">
+          <span class="pin-target-role">To</span>
+          <span class="pin-target-value"></span>
+        </button>
+      </div>
+    </div>
+    <!-- Map slot: hidden until "Use my location" finds stops nearby;
+         app.js's renderMap() is the only thing that shows, hides or redraws it. -->
+    <div id="map" class="map" role="region" aria-label="Map of stops near you" hidden></div>
+  </section>
+</main>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="" defer></script>
+{% endblock %}

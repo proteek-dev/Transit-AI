@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 import boto3
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -98,6 +99,13 @@ async def lifespan(app: FastAPI):
         '[webui] gtfs loaded snapshot=%s rows=%d',
         app.state.gtfs.snapshot_date, len(app.state.gtfs.stop_times),
     )
+    # stop_id -> (stop_name, lat, lon) off the stop table just loaded, for the
+    # /routes legs' from_stop / to_stop. Built once here, not per request.
+    stops = app.state.gtfs.stops
+    app.state.stop_lookup = {
+        str(sid): (str(name), round(float(lat), 6), round(float(lon), 6))
+        for sid, name, lat, lon in zip(stops['stop_id'], stops['stop_name'], stops['stop_lat'], stops['stop_lon'])
+    }
 
     logger.info('[webui] loading model…')
     app.state.model = model_io.load_model()
@@ -164,6 +172,34 @@ def index(request: Request):
         'schedule_snapshot': _schedule_snapshot(state),
         'model_trained': _model_trained(state),
         'features_through': _features_through(state),
+    })
+
+
+@app.get('/results')
+def results_page(
+    request: Request,
+    # `from` is a Python keyword, hence the aliases (to/departure aliased too
+    # for consistency). All optional here so a missing one redirects rather
+    # than 422s.
+    from_stop_id: Optional[str] = Query(None, alias='from'),
+    to_stop_id: Optional[str] = Query(None, alias='to'),
+    departure: Optional[str] = Query(None, alias='departure'),
+):
+    """Results page shell. The page fetches /routes itself from the echoed
+    params, so a pasted /results URL works with no search-page state.
+    """
+    from_stop_id = (from_stop_id or '').strip()
+    to_stop_id = (to_stop_id or '').strip()
+    if not from_stop_id or not to_stop_id:
+        return RedirectResponse('/', status_code=302)
+    state = request.app.state
+    return templates.TemplateResponse(request, 'results.html', {
+        'schedule_snapshot': _schedule_snapshot(state),
+        'model_trained': _model_trained(state),
+        'features_through': _features_through(state),
+        'from_stop_id': from_stop_id,
+        'to_stop_id': to_stop_id,
+        'departure': (departure or '').strip() or None,
     })
 
 
@@ -282,6 +318,40 @@ def stops_search(
     return [_to_stop_search_result(r) for r in rows]
 
 
+def _to_nearby_stop(row: dict) -> dict:
+    """One nearest_stops() dict -> StopSearchResult + distance_km + mode.
+    nearest_stops() splits multi-mode stations into one row per mode, so
+    route_types always has exactly one entry; mode is derived from it with
+    the same mapping /routes legs use, so the map can colour the pin.
+    """
+    from route_types import MODE_BY_ROUTE_TYPE
+
+    out = _to_stop_search_result(row)
+    out['distance_km'] = float(row['distance_km'])
+    route_types = row.get('route_types') or []
+    out['mode'] = MODE_BY_ROUTE_TYPE.get(int(route_types[0]), 'unknown') if route_types else 'unknown'
+    return out
+
+
+@app.get('/stops/nearby')
+def stops_nearby(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+    limit: int = Query(15, ge=1, le=50),
+) -> list:
+    """Nearest useful stops to (lat, lon) -- wraps phase3/gtfs/search.py's
+    nearest_stops(), which ranks by distance blended with service frequency
+    (not pure distance) and reads the GTFS cache lifespan already warmed.
+    """
+    from gtfs.search import nearest_stops
+
+    try:
+        rows = nearest_stops(lat, lon, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f'Nearby stops unavailable: {e}')
+    return [_to_nearby_stop(r) for r in rows]
+
+
 def _parse_departure(departure: str | None) -> datetime:
     """None -> naive Brisbane-local "now" (routing.py compares naive datetimes
     throughout). An ISO string with an offset is converted to Brisbane time
@@ -331,13 +401,100 @@ def _predict_journey_legs(journey: dict) -> list[tuple[dict, dict]] | None:
     return legs
 
 
-def _serialize_journey(journey: dict, leg_predictions: list[tuple[dict, dict]], predicted_arrival: datetime) -> dict:
+def _stop_ref(stop_id: str, fallback_name: str | None, stop_lookup: dict) -> dict:
+    """A leg endpoint for the map: {stop_id, stop_name, lat, lon}. lat/lon are
+    null only if the stop_id is somehow missing from the loaded stop table.
+    """
+    name, lat, lon = stop_lookup.get(str(stop_id), (fallback_name or str(stop_id), None, None))
+    return {'stop_id': str(stop_id), 'stop_name': name, 'lat': lat, 'lon': lon}
+
+
+def _leg_shape(trip_id: str, origin_stop_id: str, dest_stop_id: str) -> list[list[float]] | None:
+    """The leg's ridden segment of its trip shape as [[lat, lon], ...], or None
+    when the trip has no shape. No straight-line stand-in here -- the client
+    draws that fallback. A lookup failure degrades to None rather than
+    dropping the route.
+    """
+    from gtfs.shapes import get_trip_shape_points
+
+    try:
+        points = get_trip_shape_points(trip_id, origin_stop_id=origin_stop_id, dest_stop_id=dest_stop_id)
+    except Exception as e:
+        logger.warning('[webui] /routes could not load shape (trip_id=%r): %s', trip_id, e)
+        return None
+    if not points:
+        return None
+    # Shape points are float32; round so JSON doesn't carry float32 noise digits.
+    return [[round(float(lat), 6), round(float(lon), 6)] for lat, lon in points]
+
+
+def _hhmm(seconds: int) -> str:
+    """GTFS seconds-since-service-day-start -> "HH:MM", hours wrapped at 24
+    ("24:15" -> "00:15"), the way TransLink displays after-midnight times.
+    """
+    return f'{(seconds // 3600) % 24:02d}:{(seconds % 3600) // 60:02d}'
+
+
+def _leg_stops(
+    trip: dict, origin_stop_id: str, dest_stop_id: str, stop_lookup: dict, is_first: bool, is_last: bool,
+) -> list[dict]:
+    """Every stop the leg's trip visits from origin to destination inclusive,
+    in stop_sequence order, for the /results timeline.
+
+    Read from GTFSData.route_trip_stops (route_id -> trip_id -> {stop_id:
+    (stop_sequence, arrival_seconds)}), the in-memory index the loader built
+    at startup -- no disk or stop_times scan per call. That index is keyed by
+    stop_id, so a loop trip visiting the same stop twice keeps only its last
+    visit; known and accepted (~none on the Gold Coast <-> Brisbane corridor).
+
+    is_transfer_point marks the leg's own endpoints that sit between legs:
+    the origin unless this is the first leg, the destination unless it's the
+    last. Falls back to just the two endpoints if the index lookup misses.
+    """
+    from gtfs import loader as gtfs_loader
+
+    def stop(stop_id: str, name: str | None, seconds: int | None, transfer: bool) -> dict:
+        ref = _stop_ref(stop_id, name, stop_lookup)
+        ref['scheduled_time'] = _hhmm(seconds) if seconds is not None else None
+        ref['is_transfer_point'] = transfer
+        return ref
+
+    data = gtfs_loader.load_gtfs_data()
+    visits = (data.route_trip_stops or {}).get(trip['route_id'], {}).get(trip['trip_id'])
+    if visits and origin_stop_id in visits and dest_stop_id in visits:
+        lo, hi = visits[origin_stop_id][0], visits[dest_stop_id][0]
+        if lo < hi:
+            ordered = sorted(
+                (seq, str(sid), arr) for sid, (seq, arr) in visits.items() if lo <= seq <= hi
+            )
+            last = len(ordered) - 1
+            return [
+                stop(sid, None, int(arr),
+                     (i == 0 and not is_first) or (i == last and not is_last))
+                for i, (seq, sid, arr) in enumerate(ordered)
+            ]
+
+    logger.warning('[webui] /routes: no stop sequence for trip_id=%r; endpoints only', trip.get('trip_id'))
+    dep, arr = trip['origin_departure_time'], trip['dest_arrival_time']
+    return [
+        stop(origin_stop_id, trip.get('origin_stop_name'), dep.hour * 3600 + dep.minute * 60, not is_first),
+        stop(dest_stop_id, trip.get('dest_stop_name'), arr.hour * 3600 + arr.minute * 60, not is_last),
+    ]
+
+
+def _serialize_journey(
+    journey: dict, leg_predictions: list[tuple[dict, dict]], predicted_arrival: datetime, stop_lookup: dict,
+) -> dict:
     from route_types import MODE_BY_ROUTE_TYPE
 
     legs_out = []
-    for trip, pred in leg_predictions:
+    last_leg = len(leg_predictions) - 1
+    for leg_index, (trip, pred) in enumerate(leg_predictions):
         mode = trip.get('mode') or MODE_BY_ROUTE_TYPE.get(trip.get('route_type'), 'unknown')
         leg_predicted_arrival = trip['dest_arrival_time'] + timedelta(minutes=pred['blended_delay_minutes'])
+        trip_id = str(trip['trip_id'])
+        origin_stop_id = str(trip['origin_stop_id'])
+        dest_stop_id = str(trip['dest_stop_id'])
         legs_out.append({
             'stop_id': trip['dest_stop_id'],
             'route_short_name': trip.get('route_short_name') or trip['route_id'],
@@ -345,6 +502,16 @@ def _serialize_journey(journey: dict, leg_predictions: list[tuple[dict, dict]], 
             'departure_time': trip['origin_departure_time'].isoformat(),
             'predicted_arrival': leg_predicted_arrival.isoformat(),
             'confidence': pred['confidence'],
+            # Additive map fields (Pass 5); the fields above are unchanged.
+            'trip_id': trip_id,
+            'from_stop': _stop_ref(origin_stop_id, trip.get('origin_stop_name'), stop_lookup),
+            'to_stop': _stop_ref(dest_stop_id, trip.get('dest_stop_name'), stop_lookup),
+            'shape': _leg_shape(trip_id, origin_stop_id, dest_stop_id),
+            # Pass 9: ordered stops for the /results timeline.
+            'stops': _leg_stops(
+                trip, origin_stop_id, dest_stop_id, stop_lookup,
+                is_first=leg_index == 0, is_last=leg_index == last_leg,
+            ),
         })
     first_departure = leg_predictions[0][0]['origin_departure_time']
     total_predicted_duration_minutes = int(round((predicted_arrival - first_departure).total_seconds() / 60))
@@ -367,7 +534,9 @@ def _expand_stop_group(stop_id: str) -> list[str]:
     return group
 
 
-def _find_ranked_routes(from_stop_id: str, to_stop_id: str, departure_after: datetime) -> list[dict]:
+def _find_ranked_routes(
+    from_stop_id: str, to_stop_id: str, departure_after: datetime, stop_lookup: dict,
+) -> list[dict]:
     """Direct + transfer journeys (gtfs_data's BFS), every leg predicted,
     ranked by predicted (not scheduled) arrival -- the same pipeline
     phase3/app.py runs for its cards. Returns [] (not an error) when BFS finds
@@ -407,7 +576,7 @@ def _find_ranked_routes(from_stop_id: str, to_stop_id: str, departure_after: dat
 
     ranked.sort(key=lambda r: r[0])
     return [
-        _serialize_journey(journey, leg_predictions, predicted_arrival)
+        _serialize_journey(journey, leg_predictions, predicted_arrival, stop_lookup)
         for predicted_arrival, journey, leg_predictions in ranked[:MAX_RESULTS]
     ]
 
@@ -437,7 +606,7 @@ def routes(
         id(state_model), model_io.load_model() is state_model, inference.load_model is model_io.load_model,
     )
     try:
-        return _find_ranked_routes(from_stop_id, to_stop_id, departure_after)
+        return _find_ranked_routes(from_stop_id, to_stop_id, departure_after, request.app.state.stop_lookup)
     except HTTPException:
         raise
     except Exception as e:

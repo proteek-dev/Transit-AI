@@ -1,0 +1,49 @@
+{% extends 'base.html' %}
+
+{% block title %}Routes · Transit AI{% endblock %}
+
+{% block page %}results{% endblock %}
+
+{% block header_nav %}
+<a class="back-link" href="/">← Back to search</a>
+{% endblock %}
+
+{% block content %}
+<main data-from="{{ from_stop_id }}" data-to="{{ to_stop_id }}" data-departure="{{ departure or '' }}">
+  <h1 class="sr-only">Routes</h1>
+  <p id="status" class="status" role="status" aria-live="polite"></p>
+
+  <section id="route-strip" class="route-strip" aria-labelledby="route-heading" hidden>
+    <h2 id="route-heading" class="section-label">Route</h2>
+    <!-- Station timeline for the active card: app.js fills it once /routes
+         returns and redraws it on every active-card change. -->
+    <figure id="timeline" class="timeline" hidden>
+      <div class="timeline-scroll"></div>
+      <div class="popover timeline-popover" hidden>
+        <span class="popover-role"></span>
+        <span class="popover-name"></span>
+        <span class="popover-time"></span>
+      </div>
+      <p class="sr-only timeline-live" aria-live="polite"></p>
+    </figure>
+    <ol id="top-pick" class="results results-top"></ol>
+  </section>
+
+  <section id="alternatives-section" class="alternatives" aria-labelledby="alternatives-heading" hidden>
+    <h2 id="alternatives-heading" class="section-label">Alternatives</h2>
+    <ol id="alternatives" class="results results-alt"></ol>
+  </section>
+
+  <div id="results-empty" class="empty-state" aria-live="polite" hidden>
+    <p id="results-empty-message" class="empty-state-message"></p>
+    <a class="back-link" href="/">← Back to search</a>
+  </div>
+
+  <div class="results-bottom-row">
+    {# Reserved for the contextual pill ("LEAVE NOW" etc.) -- the next pass fills it. #}
+    <span class="context-pill-slot"></span>
+    {% set repo = repo_url | default('https://github.com/proteek-dev/Transit-AI') %}
+    <a class="repo-link" href="{{ repo }}">{{ repo | replace('https://', '') }}</a>
+  </div>
+</main>
+{% endblock %}
