@@ -1034,6 +1034,290 @@ h1 {
   outline-offset: 2px;
 }
 
+/* ── Hero: the active route (Session 40) ─────────────────── */
+
+.hero {
+  padding: var(--space-6);
+  background: var(--surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+}
+
+/* Journey confidence: a 3px left accent only (hook for the contextual
+   pill and the auto-open-alternatives rule later). */
+.hero.conf-low { border-left: 3px solid var(--pill-low-border); }
+.hero.conf-medium { border-left: 3px solid var(--pill-medium-border); }
+.hero.conf-high { border-left: 3px solid var(--pill-high-border); }
+
+.hero-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.hero-leave-by {
+  display: flex;
+  flex-direction: column;
+}
+
+.hero-leave-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.hero-leave-time {
+  font-size: 2.25rem;
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.hero-status {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-1);
+}
+
+.hero-status[hidden] {
+  display: none;
+}
+
+.hero-status-pill {
+  display: inline-block;
+  padding: 2px var(--space-3);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+}
+
+.hero-status-pill.status-ontime {
+  color: var(--pill-high-text);
+  background: var(--pill-high-bg);
+  border-color: var(--pill-high-border);
+}
+
+.hero-status-pill.status-late {
+  color: var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger) 18%, transparent);
+  border-color: color-mix(in srgb, var(--color-danger) 40%, transparent);
+}
+
+.hero-status-pill.status-early {
+  color: var(--pill-medium-text);
+  background: var(--pill-medium-bg);
+  border-color: var(--pill-medium-border);
+}
+
+.hero-status-caption {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+}
+
+.hero-legs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* ── Results columns: hero + model stats card (Session 40) ─ */
+
+.results-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 200px;
+  gap: var(--space-5);
+  align-items: start;
+}
+
+/* No model_stats: the hero takes the full width. */
+.results-columns.is-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.results-main {
+  min-width: 0;
+}
+
+.model-stats-card {
+  align-self: start;
+  padding: var(--space-5);
+  background: var(--surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+}
+
+.model-stats-card[hidden] {
+  display: none;
+}
+
+/* Stats card and its column appear only alongside a rendered route:
+   app.js sets has-results on a non-empty /routes response and clears it
+   while loading and on empty/error. :not([hidden]) keeps a server-hidden
+   card (model_stats None) hidden even then. */
+.model-stats-card {
+  display: none;
+}
+
+.results-columns.has-results .model-stats-card:not([hidden]) {
+  display: block;
+}
+
+.results-columns:not(.has-results) {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* Two columns only above 720px; below it the stats card stacks under
+   the hero (DOM order), full width. */
+@media (max-width: 720px) {
+  .results-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.model-stats-title {
+  margin: 0 0 var(--space-3);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.model-stats-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+}
+
+.model-stats-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  font-size: 0.85rem;
+}
+
+.model-stats-row dt {
+  color: var(--text-secondary);
+}
+
+.model-stats-row dd {
+  margin-inline-start: 0;
+  color: var(--text-primary);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Alternatives disclosure (Session 40) ───────────────── */
+/* No border or margin of its own: the cards carry the visual weight, and
+   .route-strip's margin-bottom already spaces it from the hero. */
+
+.alternatives-disclosure {
+  display: block;
+}
+
+.alternatives-disclosure[hidden] {
+  display: none;
+}
+
+.alternatives-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) 0;
+  list-style: none;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.alternatives-summary::-webkit-details-marker {
+  display: none;
+}
+
+.alternatives-summary::before {
+  content: "▸";
+  display: inline-block;
+  transition: transform 150ms ease;
+}
+
+.alternatives-disclosure[open] .alternatives-summary::before {
+  transform: rotate(90deg);
+}
+
+.alternatives-summary:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .alternatives-summary::before {
+    transition: none;
+  }
+}
+
+/* ── Contextual pill (results bottom row, Session 40) ───── */
+/* Same shape as .pill; app.js adds these to .context-pill-slot. Not
+   interactive, so no hover/focus/transition rules. */
+
+.pill-context {
+  display: inline-block;
+  padding: 2px var(--space-3);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid;
+  border-radius: 999px;
+}
+
+.pill-context-danger {
+  color: var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger) 18%, transparent);
+  border-color: color-mix(in srgb, var(--color-danger) 40%, transparent);
+}
+
+.pill-context-warn {
+  color: var(--pill-medium-text);
+  background: var(--pill-medium-bg);
+  border-color: var(--pill-medium-border);
+}
+
+.pill-context-accent {
+  color: var(--brand-accent);
+  background: color-mix(in srgb, var(--brand-accent) 18%, transparent);
+  border-color: color-mix(in srgb, var(--brand-accent) 40%, transparent);
+}
+
+.pill-context-ok {
+  color: var(--color-ok);
+  background: color-mix(in srgb, var(--color-ok) 18%, transparent);
+  border-color: color-mix(in srgb, var(--color-ok) 40%, transparent);
+}
+
+.pill-context-muted {
+  color: var(--text-secondary);
+  background: var(--border-subtle);
+}
+
 /* ── Small screens ──────────────────────────────────────── */
 
 @media (max-width: 480px) {
@@ -1051,6 +1335,32 @@ h1 {
 
   .results-top .card {
     padding: var(--space-4);
+  }
+
+  .hero {
+    padding: var(--space-5);
+  }
+
+  /* Status drops under leave-by, left-aligned. */
+  .hero-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .hero-status {
+    align-items: flex-start;
+  }
+
+  .hero-leave-time {
+    font-size: 1.75rem;
+  }
+
+  .model-stats-card {
+    padding: var(--space-4);
+  }
+
+  .alternatives-summary {
+    padding: var(--space-2) 0;
   }
 
   .route-form {

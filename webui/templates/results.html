@@ -13,26 +13,83 @@
   <h1 class="sr-only">Routes</h1>
   <p id="status" class="status" role="status" aria-live="polite"></p>
 
-  <section id="route-strip" class="route-strip" aria-labelledby="route-heading" hidden>
-    <h2 id="route-heading" class="section-label">Route</h2>
-    <!-- Station timeline for the active card: app.js fills it once /routes
-         returns and redraws it on every active-card change. -->
-    <figure id="timeline" class="timeline" hidden>
-      <div class="timeline-scroll"></div>
-      <div class="popover timeline-popover" hidden>
-        <span class="popover-role"></span>
-        <span class="popover-name"></span>
-        <span class="popover-time"></span>
-      </div>
-      <p class="sr-only timeline-live" aria-live="polite"></p>
-    </figure>
-    <ol id="top-pick" class="results results-top"></ol>
-  </section>
+  {# Hero column + model stats card. is-single drops the stats column when
+     model_stats is None, so the hero takes the full width. #}
+  <div class="results-columns{% if not model_stats %} is-single{% endif %}">
+    <div class="results-main">
+      <section id="route-strip" class="route-strip" aria-labelledby="route-heading" hidden>
+        <h2 id="route-heading" class="section-label">Route</h2>
+        <!-- Station timeline for the active card: app.js fills it once /routes
+             returns and redraws it on every active-card change. -->
+        <figure id="timeline" class="timeline" hidden>
+          <div class="timeline-scroll"></div>
+          <div class="popover timeline-popover" hidden>
+            <span class="popover-role"></span>
+            <span class="popover-name"></span>
+            <span class="popover-time"></span>
+          </div>
+          <p class="sr-only timeline-live" aria-live="polite"></p>
+        </figure>
+        <!-- Hero: the active route (the top pick until an alternative is
+             chosen). app.js's renderHero() fills every slot; no text here. -->
+        <section id="top-pick" class="hero" aria-live="polite">
+          <div class="hero-header">
+            <div class="hero-leave-by">
+              <span class="hero-leave-label">Leave by</span>
+              <span class="hero-leave-time" data-hero-leave-time></span>
+            </div>
+            <div class="hero-status" data-hero-status>
+              <span class="hero-status-pill" data-hero-status-pill></span>
+              <span class="hero-status-caption" data-hero-status-caption></span>
+            </div>
+          </div>
+          <ol class="hero-legs" data-hero-legs></ol>
+        </section>
+      </section>
+    </div>
 
-  <section id="alternatives-section" class="alternatives" aria-labelledby="alternatives-heading" hidden>
-    <h2 id="alternatives-heading" class="section-label">Alternatives</h2>
-    <ol id="alternatives" class="results results-alt"></ol>
-  </section>
+    {# Server-rendered from model_stats (Prompt 1's /results context). #}
+    <aside class="model-stats-card" aria-label="Model stats"{% if not model_stats %} hidden{% endif %}>
+      {% if model_stats %}
+      <h2 class="model-stats-title">Model</h2>
+      <dl class="model-stats-list">
+        <div class="model-stats-row">
+          <dt>Model</dt>
+          <dd>{{ model_stats.model_type }}</dd>
+        </div>
+        <div class="model-stats-row">
+          <dt>Trained on</dt>
+          <dd>{% if model_stats.training_rows is not none %}{{ model_stats.training_rows | format_rows }} rows{% else %}—{% endif %}</dd>
+        </div>
+        <div class="model-stats-row">
+          <dt>Days archived</dt>
+          <dd>{% if model_stats.days_archived is not none %}{{ model_stats.days_archived }} days{% else %}—{% endif %}</dd>
+        </div>
+        <div class="model-stats-row">
+          <dt>Test MAE</dt>
+          <dd>{% if model_stats.test_mae is not none %}{{ '%.2f' | format(model_stats.test_mae) }} min{% else %}—{% endif %}</dd>
+        </div>
+        <div class="model-stats-row">
+          <dt>vs baseline</dt>
+          <dd>{% if model_stats.pct_improvement_over_naive is not none %}{{ '%.1f' | format(model_stats.pct_improvement_over_naive) }}% better{% else %}—{% endif %}</dd>
+        </div>
+        <div class="model-stats-row">
+          <dt>Through</dt>
+          <dd>{{ model_stats.data_snapshot.model_trained_through or model_stats.training_window.end or '—' }}</dd>
+        </div>
+      </dl>
+      {% endif %}
+    </aside>
+  </div>
+
+  {# Every route but the active one, in rank order. Closed by default;
+     app.js opens it for a low-confidence top pick and sets the count. #}
+  <details id="alternatives" class="alternatives-disclosure" hidden>
+    <summary class="alternatives-summary">
+      <span class="alternatives-summary-label" data-alternatives-label>Alternatives</span>
+    </summary>
+    <ol id="alternatives-section" class="results results-alt" aria-label="Alternative routes"></ol>
+  </details>
 
   <div id="results-empty" class="empty-state" aria-live="polite" hidden>
     <p id="results-empty-message" class="empty-state-message"></p>

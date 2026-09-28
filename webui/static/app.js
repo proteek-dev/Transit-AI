@@ -303,6 +303,80 @@
     return card;
   }
 
+  // ── Hero (the active route) ─────────────────────────────────
+  // Fills the #top-pick shell in results.html. Leg rows come from
+  // renderLeg(), the same builder the alternatives' cards use.
+
+  const HERO_CONF_CLASSES = ['conf-low', 'conf-medium', 'conf-high'];
+
+  // predicted_delay_minutes -> [pill text, status class], or null when the
+  // journey has no delay figure (the whole status area is then hidden).
+  function heroStatus(delay) {
+    if (delay === null || delay === undefined) return null;
+    if (delay === 0) return ['On time', 'status-ontime'];
+    if (delay > 0) return [`+${delay} min`, 'status-late'];
+    return [`${delay} min`, 'status-early']; // already carries its minus sign
+  }
+
+  function renderHero(route) {
+    const hero = document.querySelector('#top-pick');
+    // Backend sends "HH:MM" already; shown as-is.
+    hero.querySelector('[data-hero-leave-time]').textContent = route.leave_by || '';
+
+    const status = heroStatus(route.predicted_delay_minutes);
+    const statusBox = hero.querySelector('[data-hero-status]');
+    const pill = hero.querySelector('[data-hero-status-pill]');
+    const caption = hero.querySelector('[data-hero-status-caption]');
+    statusBox.hidden = !status;
+    if (status) {
+      pill.textContent = status[0];
+      pill.className = `hero-status-pill ${status[1]}`;
+      // live_delay is always None server-side, so this is the model alone
+      // (Pass 10 swaps in RT-blended and drops the caption).
+      caption.textContent = 'Model estimate';
+    } else {
+      pill.textContent = '';
+      pill.className = 'hero-status-pill';
+      caption.textContent = '';
+    }
+
+    hero.classList.remove(...HERO_CONF_CLASSES);
+    const confClass = `conf-${route.confidence}`;
+    if (HERO_CONF_CLASSES.includes(confClass)) hero.classList.add(confClass);
+
+    hero.querySelector('[data-hero-legs]').replaceChildren(...route.legs.map(renderLeg));
+  }
+
+  // ── Contextual pill (results bottom row) ────────────────────
+  // How urgent the active route is, from its leave_by. Low confidence keeps
+  // the label but mutes the tone.
+
+  // [max minutes until leave_by (inclusive), label, tone]
+  const CONTEXT_PILL_RULES = [
+    [-2, 'MISSED IT', 'muted'], // the 2-minute grace after leave_by is over
+    [0, 'LEAVE NOW', 'danger'],
+    [3, 'HEAD OUT', 'warn'],
+    [10, 'GRAB YOUR KEYS', 'accent'],
+    [25, 'FINISH YOUR COFFEE', 'ok'],
+    [Infinity, 'PLENTY OF TIME', 'muted'],
+  ];
+  const CONTEXT_PILL_TONES = CONTEXT_PILL_RULES.map(([, , tone]) => `pill-context-${tone}`);
+  const CONTEXT_PILL_TICK_MS = 30000; // 30s so a minute-boundary flip shows promptly
+  const LOW_CONFIDENCE_TITLE = 'Low-confidence prediction — check before you go';
+
+  // Whole minutes from `now` until leave_by ("HH:MM" Brisbane wall-clock,
+  // read as the viewer's local time, like every other time here). One more
+  // than 12h in the past is tomorrow's — "00:15" seen at 23:50 is 25 min
+  // away. null when leave_by is missing or malformed.
+  function minutesUntil(leaveBy, now) {
+    const match = /^(\d{2}):(\d{2})$/.exec(leaveBy || '');
+    if (!match) return null;
+    const target = new Date(now);
+    target.setHours(Number(match[1]), Number(match[2]), 0, 0);
+    if (now - target > 12 * 60 * 60000) target.setDate(target.getDate() + 1);
+    return Math.floor((target - now) / 60000);
+  }
+
   // ── Page switch ─────────────────────────────────────────────
   // base.html sets <body data-page>. Exactly one page mode runs: the search
   // page never renders results, the results page never builds pickers.
@@ -953,15 +1027,66 @@
     const main = document.querySelector('main');
     const { from, to, departure } = main.dataset;
     const routeStrip = document.querySelector('#route-strip');
-    const topPickEl = document.querySelector('#top-pick');
-    const alternativesSection = document.querySelector('#alternatives-section');
-    const alternativesEl = document.querySelector('#alternatives');
+    // The <details> disclosure, and the <ol> of alternative cards inside it.
+    const alternativesDisclosure = document.querySelector('#alternatives');
+    const alternativesEl = document.querySelector('#alternatives-section');
+    const alternativesLabel = alternativesDisclosure.querySelector('[data-alternatives-label]');
     const emptyEl = document.querySelector('#results-empty');
     const emptyMessage = document.querySelector('#results-empty-message');
     const timeline = createTimeline(document.querySelector('#timeline'));
     let routes = [];
+    let activeRouteIndex = 0;
+
+    // has-results on .results-columns reveals the model stats card and its
+    // column (app.css). Off while loading and on empty/error.
+    function setResultsColumnsState(hasResults) {
+      const columns = document.querySelector('.results-columns');
+      if (!columns) return;
+      columns.classList.toggle('has-results', !!hasResults);
+    }
+
+    // Contextual pill: written into results.html's existing slot, never
+    // created here. Cleared whenever there's no active route.
+    const contextPill = document.querySelector('.context-pill-slot');
+
+    function renderContextPill() {
+      if (!contextPill) return;
+      contextPill.classList.remove('pill-context', ...CONTEXT_PILL_TONES);
+      contextPill.removeAttribute('title');
+      contextPill.textContent = '';
+      const route = routes[activeRouteIndex];
+      const delta = route ? minutesUntil(route.leave_by, new Date()) : null;
+      if (delta === null) return;
+      const [, label, tone] = CONTEXT_PILL_RULES.find(([max]) => delta <= max);
+      const low = route.confidence === 'low';
+      contextPill.textContent = `● ${label}`;
+      contextPill.classList.add('pill-context', `pill-context-${low ? 'muted' : tone}`);
+      if (low) contextPill.title = LOW_CONFIDENCE_TITLE;
+    }
+
+    // Re-evaluates the pill as the clock moves. One timer per page view,
+    // never restarted on active-route changes.
+    let contextPillTimer = 0;
+
+    function startContextPillTimer() {
+      clearInterval(contextPillTimer);
+      contextPillTimer = setInterval(renderContextPill, CONTEXT_PILL_TICK_MS);
+    }
+
+    window.addEventListener('pagehide', () => clearInterval(contextPillTimer));
+    // A back/forward-cache restore skips load(), and pagehide cleared the
+    // timer, so bring the pill up to date and restart it.
+    window.addEventListener('pageshow', (event) => {
+      if (!event.persisted) return;
+      renderContextPill();
+      startContextPillTimer();
+    });
 
     function showEmpty(message, kind) {
+      setResultsColumnsState(false);
+      routes = []; // no active route: the pill clears below
+      renderContextPill();
+      alternativesDisclosure.hidden = true;
       setStatus('');
       emptyMessage.textContent = message;
       if (kind) emptyEl.dataset.kind = kind;
@@ -969,36 +1094,55 @@
       emptyEl.hidden = false;
     }
 
-    // Active card: visual state plus the station timeline above the top
-    // pick, which redraws for whichever card is active. The top pick starts
-    // active; clicking or Enter/Space on any card moves it.
-    function allCards() {
-      return Array.from(main.querySelectorAll('.results > .card'));
+    // Alternatives: every route except the active one, in original rank
+    // order, so the previous hero rotates back in where it ranks. Never
+    // touches the disclosure's open state — only a fresh /routes does.
+    function renderAlternatives() {
+      const cards = [];
+      routes.forEach((route, i) => {
+        if (i === activeRouteIndex) return;
+        const card = renderRoute(route);
+        card.dataset.routeIndex = String(i); // card -> route, for the hero + timeline
+        cards.push(card);
+      });
+      alternativesEl.replaceChildren(...cards);
+      const count = cards.length;
+      alternativesLabel.textContent = count === 0 ? 'Alternatives'
+        : `${count} alternative${count === 1 ? '' : 's'}`;
+      alternativesDisclosure.hidden = count === 0;
     }
 
-    function setActiveCard(active) {
-      for (const card of allCards()) {
-        const on = card === active;
-        card.classList.toggle('is-active', on);
-        if (on) card.setAttribute('aria-current', 'true');
-        else card.removeAttribute('aria-current');
-      }
-      timeline.render(routes[Number(active.dataset.routeIndex)]);
+    // Active route: the hero, the contextual pill and the station timeline
+    // all show routes[activeRouteIndex]. The top pick (0) starts active;
+    // clicking or Enter/Space on an alternative card moves it. The hero
+    // isn't a card, so clicking it matches nothing here (a no-op).
+    function setActiveRoute(index) {
+      activeRouteIndex = index;
+      renderAlternatives();
+      renderHero(routes[activeRouteIndex]);
+      renderContextPill();
+      timeline.render(routes[activeRouteIndex]);
     }
 
     main.addEventListener('click', (event) => {
       const card = event.target.closest('.results > .card');
-      if (card) setActiveCard(card);
+      if (card) setActiveRoute(Number(card.dataset.routeIndex));
     });
 
     main.addEventListener('keydown', (event) => {
       if (event.key !== 'Enter' && event.key !== ' ') return;
       if (!event.target.matches('.results > .card')) return;
       event.preventDefault();
-      setActiveCard(event.target);
+      setActiveRoute(Number(event.target.dataset.routeIndex));
+      // The focused card was just rebuilt away; keep keyboard focus in the
+      // disclosure rather than dropping it to <body>.
+      alternativesDisclosure.querySelector('summary').focus();
     });
 
     async function load() {
+      setResultsColumnsState(false);
+      renderContextPill(); // no routes yet: clears the slot
+      alternativesDisclosure.hidden = true;
       setStatus('Finding routes…');
       const params = new URLSearchParams({ from_stop_id: from, to_stop_id: to });
       if (departure) params.set('departure', departure);
@@ -1021,21 +1165,19 @@
           return;
         }
         setStatus('Ranked by predicted arrival.');
-        const cards = routes.map((route, i) => {
-          const card = renderRoute(route);
-          card.dataset.routeIndex = String(i); // card -> route, for the timeline
-          return card;
-        });
-        topPickEl.replaceChildren(cards[0]);
-        alternativesEl.replaceChildren(...cards.slice(1));
+        // Columns settle first: the timeline measures its width on render.
+        setResultsColumnsState(true);
         routeStrip.hidden = false; // visible before the timeline measures its width
-        alternativesSection.hidden = routes.length < 2;
-        setActiveCard(topPickEl.firstElementChild);
+        setActiveRoute(0); // routes[0] is the hero; the rest render as alternatives
+        // Fresh response only: closed by default, opened for a low-confidence
+        // top pick. Later active-route changes leave it as the user set it.
+        alternativesDisclosure.open = routes[0].confidence === 'low';
       } catch (err) {
         showEmpty('Couldn’t reach the server. Try again.', 'error');
       }
     }
 
+    startContextPillTimer();
     load();
   }
 })();

@@ -52,6 +52,11 @@ WINDOW_MINUTES = 60
 # /model/stats graph_status threshold, from the archived backend.
 HEALTHY_STOP_TIMES_MIN_ROWS = 1_000_000
 
+# Journey-level confidence is the weakest leg's: Low < Medium < High.
+CONFIDENCE_RANK = {'Low': 0, 'Medium': 1, 'High': 2}
+# Same rule as phase3's predict_delay(): leave by = first departure - 3 min.
+LEAVE_BY_BUFFER = timedelta(minutes=3)
+
 
 def _fetch_s3_json(key: str) -> dict:
     bucket = os.environ.get(S3_BUCKET_ENV_VAR)
@@ -144,6 +149,20 @@ app.mount('/static', StaticFiles(directory='webui/static'), name='static')
 templates = Jinja2Templates(directory='webui/templates')
 
 
+def _format_rows(n: int | None) -> str:
+    """Row count for the /results stats card: 156_000_000 -> "156.0M"."""
+    if n is None:
+        return '—'
+    if n >= 1_000_000:
+        return f'{n / 1_000_000:.1f}M'
+    if n >= 1_000:
+        return f'{n / 1_000:.1f}k'
+    return str(n)
+
+
+templates.env.filters['format_rows'] = _format_rows
+
+
 def _schedule_snapshot(state) -> str:
     gtfs = getattr(state, 'gtfs', None)
     return getattr(gtfs, 'snapshot_date', None) or UNKNOWN
@@ -197,6 +216,9 @@ def results_page(
         'schedule_snapshot': _schedule_snapshot(state),
         'model_trained': _model_trained(state),
         'features_through': _features_through(state),
+        # Same shape as /model/stats; None (not a 503) when training metadata
+        # failed to load at startup.
+        'model_stats': _model_stats(state),
         'from_stop_id': from_stop_id,
         'to_stop_id': to_stop_id,
         'departure': (departure or '').strip() or None,
@@ -238,15 +260,14 @@ def _graph_status(gtfs) -> str:
     return 'healthy' if rows >= HEALTHY_STOP_TIMES_MIN_ROWS else 'unknown'
 
 
-@app.get('/model/stats')
-def model_stats(request: Request) -> dict:
-    state = request.app.state
+def _model_stats(state) -> dict | None:
+    """The /model/stats payload, shared with the /results page context.
+    None when the training metadata failed to load at startup -- /model/stats
+    turns that into a 503, /results passes it through as model_stats=None.
+    """
     metadata = getattr(state, 'training_metadata', None)
     if metadata is None:
-        raise HTTPException(
-            status_code=503,
-            detail='Training metadata unavailable: S3 fetch failed at startup (see server log)',
-        )
+        return None
 
     # features_through keeps the archived semantics -- null when the features
     # manifest couldn't be fetched. (The page footer's _features_through()
@@ -260,24 +281,36 @@ def model_stats(request: Request) -> dict:
     gtfs = getattr(state, 'gtfs', None)
     gtfs_static_snapshot = getattr(gtfs, 'snapshot_date', None)
 
+    coverage_counts = metadata.get('coverage_counts')
     return {
-        'training_rows': sum(metadata['coverage_counts'].values()),
-        'days_archived': metadata['data_window_days'],
-        'test_mae': metadata['test_mae'],
-        'naive_mae': metadata['naive_mae'],
-        'pct_improvement_over_naive': metadata['pct_improvement_over_naive'],
+        'training_rows': sum(coverage_counts.values()) if coverage_counts else None,
+        'days_archived': metadata.get('data_window_days'),
+        'test_mae': metadata.get('test_mae'),
+        'naive_mae': metadata.get('naive_mae'),
+        'pct_improvement_over_naive': metadata.get('pct_improvement_over_naive'),
         'model_type': 'XGBoost (v0)',
         'training_window': {
-            'start': metadata['data_window_start'],
-            'end': metadata['data_window_end'],
+            'start': metadata.get('data_window_start'),
+            'end': metadata.get('data_window_end'),
         },
         'data_snapshot': {
             'features_through': features_through,
-            'model_trained_through': metadata['data_window_end'],
+            'model_trained_through': metadata.get('data_window_end'),
             'gtfs_static_snapshot': gtfs_static_snapshot,
             'graph_status': _graph_status(gtfs),
         },
     }
+
+
+@app.get('/model/stats')
+def model_stats(request: Request) -> dict:
+    stats = _model_stats(request.app.state)
+    if stats is None:
+        raise HTTPException(
+            status_code=503,
+            detail='Training metadata unavailable: S3 fetch failed at startup (see server log)',
+        )
+    return stats
 
 
 def _to_stop_search_result(row: dict) -> dict:
@@ -515,10 +548,18 @@ def _serialize_journey(
         })
     first_departure = leg_predictions[0][0]['origin_departure_time']
     total_predicted_duration_minutes = int(round((predicted_arrival - first_departure).total_seconds() / 60))
+    # _predict_journey_legs() drops any journey with a failed leg, so the last
+    # leg's prediction is always present here; the None guard is defensive.
+    last_delay = leg_predictions[-1][1].get('blended_delay_minutes')
+    weakest = min((pred['confidence'] for _, pred in leg_predictions), key=lambda c: CONFIDENCE_RANK.get(c, 0))
     return {
         'legs': legs_out,
         'total_predicted_duration_minutes': total_predicted_duration_minutes,
         'transfer_count': journey['num_transfers'],
+        # Additive journey-level fields (Session 40); the fields above are unchanged.
+        'leave_by': (first_departure - LEAVE_BY_BUFFER).strftime('%H:%M'),
+        'predicted_delay_minutes': int(round(last_delay)) if last_delay is not None else None,
+        'confidence': weakest.lower(),
     }
 
 
