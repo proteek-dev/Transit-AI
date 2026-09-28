@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
@@ -15,8 +16,16 @@ from zoneinfo import ZoneInfo
 
 import boto3
 import psutil
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+# Local dev: load the repo-root .env regardless of CWD. override=False so real
+# env vars (Cloud Run) always win; no-op when the file is absent (the image
+# never contains it -- see .dockerignore).
+load_dotenv(Path(__file__).resolve().parents[2] / '.env', override=False)
+
+logger = logging.getLogger(__name__)
 
 # Memory visibility for diagnosing Render's free-tier 512MB OOM crash --
 # purely external process-level observability (psutil reads this process's
@@ -402,15 +411,30 @@ def _serialize_journey(journey: dict, leg_predictions: list[tuple[dict, dict]], 
     }
 
 
+def _expand_stop_group(stop_id: str) -> list[str]:
+    """Mirrors phase3's station-group expansion (stop_to_cluster -> cluster_stop_ids, as in gtfs/routing.py)."""
+    data = gtfs_loader.load_gtfs_data()
+    cluster = data.stop_to_cluster.get(stop_id)
+    group = data.cluster_stop_ids.get(cluster, [stop_id]) if cluster else [stop_id]
+    if group != [stop_id]:
+        logger.debug('expanded stop_id %s -> %s', stop_id, group)
+    return group
+
+
 def _find_ranked_routes(from_stop_id: str, to_stop_id: str, departure_after: datetime) -> list[dict]:
     """find direct + transfer journeys (gtfs_data's BFS), predict every leg
     of every candidate, then rank by predicted (not scheduled) arrival --
     the exact pipeline app.py runs for its trip cards. Returns [] (not an
-    error) when BFS finds nothing at all, e.g. the known Surfers Paradise ->
-    HOTA gap.
+    error) when BFS finds nothing at all, e.g. the known HOTA -> Surfers
+    Paradise gap.
+
+    Each stop_id is expanded to its full station group first, the same
+    stop_ids list app.py's pickers hand find_trips(): the frontend sends one
+    member (search_stops()'s stop_ids[0]), which alone can be a bus bay or a
+    single-direction platform that no route from the other side reaches.
     """
-    origin_stop_ids = [from_stop_id]
-    dest_stop_ids = [to_stop_id]
+    origin_stop_ids = _expand_stop_group(from_stop_id)
+    dest_stop_ids = _expand_stop_group(to_stop_id)
 
     trips = gtfs_data.find_trips(origin_stop_ids, dest_stop_ids, departure_after, window_minutes=WINDOW_MINUTES)
     transfer_journeys = gtfs_data.find_multi_leg_trips(
@@ -472,6 +496,12 @@ async def routes(
 ) -> list[dict]:
     departure_after = _parse_departure(departure)
     await _wait_for_warmup()
+    # 404 only for stop_ids absent from the GTFS snapshot entirely --
+    # a known stop with no services in the window still returns [] below.
+    stop_to_cluster = gtfs_loader.load_gtfs_data().stop_to_cluster
+    unknown = [sid for sid in (from_stop_id, to_stop_id) if sid not in stop_to_cluster]
+    if unknown:
+        raise HTTPException(status_code=404, detail=f'Unknown stop_id: {", ".join(unknown)}')
     try:
         # to_thread here for the same reason _warmup() uses it: this is a
         # sync function doing blocking pandas/xgboost work, and running it

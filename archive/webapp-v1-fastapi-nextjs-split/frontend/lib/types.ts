@@ -57,3 +57,20 @@ export interface ModelStats {
   };
   data_snapshot?: DataSnapshot;
 }
+
+/** One GET /stops/search hit.
+ *
+ * `distance_km` is present ONLY when the backend's fuzzy-match path was hit
+ * AND both lat and lon were supplied. Exact-substring matches do NOT populate
+ * it, even when lat/lon are supplied. When `distance_km` is present in the
+ * response, results are sorted by it ascending. Consumers must treat
+ * `distance_km` as optional at every render site.
+ */
+export type StopSearchResult = {
+  stop_id: string;          // canonical primary ID, e.g. "600016"
+  stop_ids: string[];       // cluster of related IDs; may include 'place_'-prefixed parent-station IDs
+  stop_name: string;
+  stop_lat: number;         // WGS84
+  stop_lon: number;         // WGS84
+  distance_km?: number;
+};

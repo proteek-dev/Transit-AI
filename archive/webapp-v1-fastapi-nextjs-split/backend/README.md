@@ -4,7 +4,7 @@ Step 1 of the FastAPI/Next.js replacement for the Streamlit app (`phase3/app.py`
 
 ## Run locally
 
-`/model/stats` fetches `training_metadata.json` from S3 at startup (see below), so these env vars must be set before starting the server — e.g. via `export`, or `uvicorn --env-file`:
+`/model/stats` fetches `training_metadata.json` from S3 at startup (see below), so these env vars must be set before starting the server. `main.py` loads them automatically from the repo-root `.env` (any CWD); already-exported shell vars take precedence:
 
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
