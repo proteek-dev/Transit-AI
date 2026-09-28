@@ -24,3 +24,6 @@ streamlit-geolocation
 papermill
 geopandas
 shapely
+fastapi==0.128.8
+uvicorn[standard]==0.39.0
+jinja2==3.1.4

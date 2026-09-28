@@ -1,0 +1,395 @@
+/* Transit AI web UI. Calm, informational styling; colours live in custom
+   properties so dark mode only swaps values, never layout. */
+
+:root {
+  color-scheme: light dark;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+
+  /* 4px spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  --radius: 8px;
+  --touch-target: 44px;
+
+  --color-bg: #f7f7f5;
+  --color-surface: #ffffff;
+  --color-text: #1c1f23;
+  --color-text-muted: #5b6168;
+  --color-border: #d9dde1;
+  --color-border-strong: #b9bfc6;
+  --color-accent: #2f5fd0;
+  --color-accent-hover: #264fb0;
+  --color-accent-contrast: #ffffff;
+  --color-accent-soft: #e8eefb;
+  --color-danger: #a8261d;
+  --color-shadow: rgba(20, 24, 28, 0.08);
+
+  /* Confidence pills: muted tints, text >= 4.5:1 on its own background. */
+  --pill-high-bg: #e6f3e9;
+  --pill-high-border: #a8d3b2;
+  --pill-high-text: #1d5a2c;
+  --pill-medium-bg: #fcf1dc;
+  --pill-medium-border: #e8c47f;
+  --pill-medium-text: #734504;
+  --pill-low-bg: #eef0f2;
+  --pill-low-border: #cdd2d7;
+  --pill-low-text: #474e56;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #121416;
+    --color-surface: #1b1e21;
+    --color-text: #e8eaed;
+    --color-text-muted: #a3a9b0;
+    --color-border: #33383d;
+    --color-border-strong: #4a5157;
+    --color-accent: #86a8ff;
+    --color-accent-hover: #a3bdff;
+    --color-accent-contrast: #0b1020;
+    --color-accent-soft: #1f2a44;
+    --color-danger: #ff9a90;
+    --color-shadow: rgba(0, 0, 0, 0.4);
+
+    --pill-high-bg: #15301c;
+    --pill-high-border: #2e6a3e;
+    --pill-high-text: #a3dfb1;
+    --pill-medium-bg: #3a2a0e;
+    --pill-medium-border: #7a5a1e;
+    --pill-medium-text: #f1c97e;
+    --pill-low-bg: #25292e;
+    --pill-low-border: #40464d;
+    --pill-low-text: #c5cbd1;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0 auto;
+  max-width: 640px;
+  padding: var(--space-10) var(--space-6);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.75rem;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+/* ── Header ─────────────────────────────────────────────── */
+
+.site-header {
+  margin-bottom: var(--space-8);
+}
+
+.tagline {
+  margin: var(--space-2) 0 0;
+  color: var(--color-text-muted);
+}
+
+/* ── Form ───────────────────────────────────────────────── */
+
+.route-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-6);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+.field label {
+  display: block;
+  margin-bottom: var(--space-2);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.combo {
+  position: relative;
+}
+
+.combo input {
+  width: 100%;
+  min-height: var(--touch-target);
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius);
+}
+
+.combo input:focus {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+  border-color: var(--color-accent);
+}
+
+/* ── Dropdown ───────────────────────────────────────────── */
+
+.dropdown {
+  position: absolute;
+  top: calc(100% + var(--space-1));
+  left: 0;
+  right: 0;
+  z-index: 10;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: 0 var(--space-1) var(--space-4) var(--color-shadow);
+}
+
+.dropdown[hidden] {
+  display: none;
+}
+
+.dropdown-note {
+  margin: 0;
+  padding: var(--space-2) var(--space-3) var(--space-1);
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+}
+
+.dropdown-note[hidden] {
+  display: none;
+}
+
+.options {
+  list-style: none;
+  margin: 0;
+  padding: var(--space-1) 0;
+}
+
+.options:empty {
+  display: none;
+}
+
+.option {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: var(--touch-target);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+}
+
+/* Highlight follows aria-selected, which both arrow keys and mouse hover set,
+   so there is no hover-only affordance. */
+.option[aria-selected="true"] {
+  background: var(--color-accent-soft);
+}
+
+.option-name {
+  font-weight: 500;
+}
+
+.option-id {
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+}
+
+/* ── Submit ─────────────────────────────────────────────── */
+
+.submit {
+  min-height: var(--touch-target);
+  padding: var(--space-2) var(--space-5);
+  font: inherit;
+  font-weight: 600;
+  color: var(--color-accent-contrast);
+  background: var(--color-accent);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.submit:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.submit:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+@media (hover: hover) {
+  .submit:hover:not(:disabled) {
+    background: var(--color-accent-hover);
+    border-color: var(--color-accent-hover);
+  }
+}
+
+/* ── Results ────────────────────────────────────────────── */
+
+.results-section {
+  margin-top: var(--space-8);
+}
+
+.status {
+  margin: 0 0 var(--space-4);
+  color: var(--color-text-muted);
+}
+
+.status:empty {
+  display: none;
+}
+
+.status[data-kind="error"] {
+  color: var(--color-danger);
+}
+
+.results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.card {
+  padding: var(--space-5);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+.card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+
+.card-title {
+  font-size: 1.125rem;
+  font-weight: 600;
+}
+
+.card-meta {
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+}
+
+.legs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.leg {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+}
+
+.leg:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.leg-route {
+  font-weight: 600;
+}
+
+.leg-times {
+  width: 100%;
+  order: 3;
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+}
+
+.pill {
+  display: inline-block;
+  padding: 2px var(--space-3);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid;
+  border-radius: 999px;
+}
+
+.pill-high {
+  color: var(--pill-high-text);
+  background: var(--pill-high-bg);
+  border-color: var(--pill-high-border);
+}
+
+.pill-medium {
+  color: var(--pill-medium-text);
+  background: var(--pill-medium-bg);
+  border-color: var(--pill-medium-border);
+}
+
+.pill-low {
+  color: var(--pill-low-text);
+  background: var(--pill-low-bg);
+  border-color: var(--pill-low-border);
+}
+
+/* ── Freshness footer ───────────────────────────────────── */
+
+body > footer {
+  margin-top: var(--space-12);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--color-border);
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+}
+
+body > footer p {
+  margin: 0 0 var(--space-1);
+}
+
+/* ── Small screens ──────────────────────────────────────── */
+
+@media (max-width: 480px) {
+  body {
+    padding: var(--space-6) var(--space-4);
+  }
+
+  .site-header {
+    margin-bottom: var(--space-6);
+  }
+
+  .route-form {
+    padding: var(--space-4);
+  }
+
+  .card {
+    padding: var(--space-4);
+  }
+}

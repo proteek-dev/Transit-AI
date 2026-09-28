@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Transit AI</title>
+    <link rel="stylesheet" href="/static/app.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <h1>Transit AI</h1>
+      <p class="tagline">Predicted arrivals for South East Queensland bus, train and tram.</p>
+    </header>
+
+    <main>
+      <form id="route-form" class="route-form" novalidate>
+        <div class="field">
+          <label id="from-label" for="from-input">From</label>
+          <div class="combo">
+            <input id="from-input" type="text" autocomplete="off" spellcheck="false"
+                   placeholder="Search for a stop"
+                   role="combobox" aria-autocomplete="list" aria-expanded="false"
+                   aria-controls="from-listbox">
+            <div id="from-dropdown" class="dropdown" hidden>
+              <p id="from-note" class="dropdown-note" hidden></p>
+              <ul id="from-listbox" class="options" role="listbox" aria-labelledby="from-label"></ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label id="to-label" for="to-input">To</label>
+          <div class="combo">
+            <input id="to-input" type="text" autocomplete="off" spellcheck="false"
+                   placeholder="Search for a stop"
+                   role="combobox" aria-autocomplete="list" aria-expanded="false"
+                   aria-controls="to-listbox">
+            <div id="to-dropdown" class="dropdown" hidden>
+              <p id="to-note" class="dropdown-note" hidden></p>
+              <ul id="to-listbox" class="options" role="listbox" aria-labelledby="to-label"></ul>
+            </div>
+          </div>
+        </div>
+
+        <button id="submit" class="submit" type="submit">Find routes</button>
+      </form>
+
+      <section class="results-section" aria-label="Routes">
+        <p id="status" class="status" role="status" aria-live="polite"></p>
+        <ol id="results" class="results"></ol>
+      </section>
+    </main>
+
+    <footer>
+      <p>Schedule snapshot: {{ schedule_snapshot }}</p>
+      <p>Model trained: {{ model_trained }}</p>
+      <p>Features through: {{ features_through }}</p>
+    </footer>
+  </body>
+</html>
