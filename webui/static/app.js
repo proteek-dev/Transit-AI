@@ -6,7 +6,8 @@
 
   const DEBOUNCE_MS = 200;
   const SEARCH_LIMIT = 8;
-  const RECENTS_KEY = 'webui.recentStops.v1';
+  const RECENTS_KEY = 'webui.recentStops.v2';
+  const RECENTS_KEY_V1 = 'webui.recentStops.v1'; // read once by migrateRecentsV1(), then removed
   const MAX_RECENTS = 5;
   const NEAR_MATCH_NOTE = 'No exact match — showing near matches';
 
@@ -17,26 +18,69 @@
   // Every storage call is guarded: Safari private mode and blocked storage
   // throw, and a failure there should only mean "no recents".
 
+  // Accepts both shapes: v1 {stop_id, stop_name} and v2, which adds
+  // stop_lat + stop_lon. Coords are checked separately (hasCoords).
   function isRecent(item) {
     return item !== null && typeof item === 'object'
       && typeof item.stop_id === 'string' && typeof item.stop_name === 'string';
   }
 
+  function hasCoords(item) {
+    return Number.isFinite(item.stop_lat) && Number.isFinite(item.stop_lon);
+  }
+
+  // Unknown fields are kept (a later version may add e.g. mode). Coords
+  // that aren't both finite numbers demote the entry to v1: the coords are
+  // dropped, the entry itself is kept.
+  function normalizeRecent(item) {
+    if (hasCoords(item)) return { ...item };
+    const { stop_lat, stop_lon, ...rest } = item;
+    return rest;
+  }
+
+  // One-time v1 -> v2 copy. Runs only while the v2 key is absent and
+  // removes the v1 key once v2 is written, so it runs at most once.
+  function migrateRecentsV1() {
+    try {
+      const storage = window.localStorage;
+      if (storage.getItem(RECENTS_KEY) !== null) return;
+      const legacy = JSON.parse(storage.getItem(RECENTS_KEY_V1) || '[]');
+      if (!Array.isArray(legacy)) return;
+      const entries = legacy.filter(isRecent)
+        .map(({ stop_lat, stop_lon, ...rest }) => rest) // v1 entries carry no coords
+        .slice(0, MAX_RECENTS);
+      if (entries.length === 0) return;
+      storage.setItem(RECENTS_KEY, JSON.stringify(entries));
+      storage.removeItem(RECENTS_KEY_V1);
+    } catch (err) {
+      // Unreadable v1 or blocked storage: skip; the next read retries.
+    }
+  }
+
   function readRecents() {
+    migrateRecentsV1();
     try {
       const parsed = JSON.parse(window.localStorage.getItem(RECENTS_KEY) || '[]');
       if (!Array.isArray(parsed)) return [];
-      return parsed.filter(isRecent)
-        .map((s) => ({ stop_id: s.stop_id, stop_name: s.stop_name }))
-        .slice(0, MAX_RECENTS);
+      return parsed.filter(isRecent).map(normalizeRecent).slice(0, MAX_RECENTS);
     } catch (err) {
       return [];
     }
   }
 
+  // Always writes v2: coords whenever the picked stop has them. Re-picking a
+  // stored stop keeps that entry's other fields. An entry without stop_id +
+  // stop_name is never written.
   function pushRecent(stop) {
-    const entry = { stop_id: stop.stop_id, stop_name: stop.stop_name };
-    const next = [entry, ...readRecents().filter((s) => s.stop_id !== entry.stop_id)].slice(0, MAX_RECENTS);
+    if (!isRecent(stop)) return;
+    const current = readRecents();
+    const previous = current.find((s) => s.stop_id === stop.stop_id);
+    const entry = { ...previous, stop_id: stop.stop_id, stop_name: stop.stop_name };
+    if (hasCoords(stop)) {
+      entry.stop_lat = stop.stop_lat;
+      entry.stop_lon = stop.stop_lon;
+    }
+    const next = [entry, ...current.filter((s) => s.stop_id !== entry.stop_id)].slice(0, MAX_RECENTS);
     try {
       window.localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
     } catch (err) {
@@ -153,8 +197,9 @@
     function select(stop) {
       input.value = stop.stop_name;
       picker.selected = { stop_id: stop.stop_id, stop_name: stop.stop_name };
-      // Keep coordinates when the stop record has them (/stops/search and
-      // /stops/nearby rows do; recents don't). Recents still store id + name only.
+      // Keep coordinates when the stop record has them (/stops/search,
+      // /stops/nearby and /stops/bbox rows do; v2 recents do, v1 ones don't).
+      // A From with coords is what recentres the map (onFromChange).
       if (Number.isFinite(stop.stop_lat) && Number.isFinite(stop.stop_lon)) {
         picker.selected.lat = stop.stop_lat;
         picker.selected.lon = stop.stop_lon;
@@ -261,6 +306,22 @@
     input.addEventListener('blur', close);
 
     picker.select = select; // same path a dropdown-row click takes (used by nearby map pins)
+
+    // Swap support. setState() writes a selection + raw input text without
+    // select()'s side effects (no recents push), cancels any pending search
+    // and closes the list. It returns whether the selected stop changed; the
+    // caller fires notifyChange() once both pickers are written.
+    picker.text = () => input.value;
+    picker.setState = (selected, text) => {
+      clearTimeout(timer);
+      requestSeq++;
+      close();
+      const changed = (picker.selected ? picker.selected.stop_id : null) !== (selected ? selected.stop_id : null);
+      picker.selected = selected;
+      input.value = text;
+      return changed;
+    };
+    picker.notifyChange = notifyChange;
     return picker;
   }
 
@@ -388,76 +449,182 @@
   // ══ Search page ("/") ═══════════════════════════════════════
 
   function initSearchPage() {
-    let nearbyStops = [];
-    // 'from' | 'to' — which picker a nearby-pin tap fills. In memory only.
+    // 'from' | 'to' — which picker a map-pin tap fills. In memory only.
     let activePinTarget = 'from';
     let pinSelecting = false; // true while a pin tap runs a picker's select()
 
     // ── Map (Leaflet, loaded from unpkg by index.html) ────────
-    // One map instance, created lazily the first time the #map slot is
-    // shown (Leaflet needs a visible container to measure). The search page
-    // only has the nearby overview; if Leaflet failed to load, the slot
-    // stays hidden and the pickers work as before.
+    // One full-page map, always shown. currentMapMode is one of:
+    //   'empty'  — no pins: the initial SEQ overview, From cleared, or zoom < 11
+    //   'nearby' — /stops/nearby around the From stop or the user's location
+    //   'bbox'   — /stops/bbox for the viewport, refetched as the user pans
+    // A user pan/zoom leaves 'nearby' for 'bbox'/'empty'; our own recentres
+    // and fits, and Leaflet's resize handling, never do. If Leaflet failed
+    // to load, the map stays an empty panel and the pickers work as before.
 
     const mapEl = document.querySelector('#map');
     const mapHeaderEl = document.querySelector('#map-header');
-    const DEFAULT_CENTER = [-27.4698, 153.0251]; // Brisbane CBD, used only if there are no coordinates
+    const mapSpinner = document.querySelector('#map-spinner');
+    const mapToast = document.querySelector('#map-toast');
+    const SEQ_CENTER = [-27.75, 153.2]; // Brisbane <-> Gold Coast corridor
+    const SEQ_ZOOM = 9;
+    const BBOX_MIN_ZOOM = 11;
+    const FROM_ZOOM = 15;
+    const BBOX_DEBOUNCE_MS = 300;
+    const BBOX_LIMIT = 50;
+    const BBOX_MAX_SIDE_DEG = 0.99; // /stops/bbox rejects sides over 1 degree
+    const NO_STOPS_IN_VIEW = 'No stops in view — pan or zoom out';
     const FIT_PADDING = [24, 24];
     const HIT_RADIUS = 22; // invisible marker hit area: 44px across, the touch-target size
 
     let map = null;
     let pinLayer = null;
-    let renderedView = 'hidden';
+    let currentMapMode = 'empty';
+    let nearbyAnchor = null; // {lat, lon} the nearby pins are around; null outside 'nearby'
+    let programmaticMove = false; // true while our own setView/fitBounds runs
+    let resizeMovePending = false; // Leaflet's resize handling fires a moveend of its own
+    let bboxTimer = null;
+    // The one in-flight pin fetch (bbox or nearby — a newer one of either
+    // kind aborts it), and why the last aborted fetch was aborted.
+    let lastBboxFetchController = null;
+    let lastBboxFetchAbortReason = null; // 'superseded' | 'mode-change'
 
     function mapAvailable() {
       return typeof window.L !== 'undefined';
     }
 
     function ensureMap() {
-      if (map) return;
+      if (map || !mapAvailable()) return;
       map = L.map(mapEl, {
-        // A page-embedded map shouldn't hijack scrolling: no wheel zoom, and
-        // no one-finger drag on phones (zoom buttons and taps still work).
+        // Full-page map: one-finger drag pans on phones too. Wheel zoom stays
+        // off. Zoom buttons go bottom-right, clear of the picker overlay.
         scrollWheelZoom: false,
-        dragging: !L.Browser.mobile,
+        dragging: true,
+        zoomControl: false,
       });
       // Leaflet's own constant attribution markup, not user data.
       L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom: 19,
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
       }).addTo(map);
+      L.control.zoom({ position: 'bottomright' }).addTo(map);
       pinLayer = L.layerGroup().addTo(map);
+      map.on('resize', () => { resizeMovePending = true; });
+      map.on('moveend', onMapMoveEnd);
+      moveMap(() => map.setView(SEQ_CENTER, SEQ_ZOOM, { animate: false }));
     }
 
-    // hidden | nearby, derived from page state only.
-    function mapView() {
-      if (!mapAvailable()) return 'hidden';
-      return fromPicker.originCoords ? 'nearby' : 'hidden';
+    // Run one of our own view changes. animate:false makes Leaflet fire
+    // moveend synchronously inside fn, so the flag is always reset.
+    function moveMap(fn) {
+      programmaticMove = true;
+      try {
+        fn();
+      } finally {
+        programmaticMove = false;
+      }
     }
 
-    // Redraw the map for the current state. The only thing that shows,
-    // hides or redraws it.
-    function renderMap() {
-      const view = mapView();
-      mapHeaderEl.hidden = view !== 'nearby'; // pin-target header: nearby overview only
-      if (view === 'hidden') {
-        mapEl.hidden = true;
-        if (pinLayer) pinLayer.clearLayers();
-        renderedView = 'hidden';
+    function computeMapMode() {
+      if (!map) return 'empty';
+      if (nearbyAnchor) return 'nearby';
+      return map.getZoom() >= BBOX_MIN_ZOOM ? 'bbox' : 'empty';
+    }
+
+    function onMapMoveEnd() {
+      let userMove = false;
+      if (!programmaticMove) {
+        // Leaflet fires a resize's moveend 200 ms late; only a moveend that
+        // isn't ours consumes the flag, so a recentre in between can't eat it.
+        userMove = !resizeMovePending;
+        resizeMovePending = false;
+      }
+      if (userMove) nearbyAnchor = null; // the user took over: browse by viewport
+      applyMapMode();
+    }
+
+    // Bring pins, fetches and the pin-target header in line with the mode.
+    function applyMapMode() {
+      currentMapMode = computeMapMode();
+      mapHeaderEl.hidden = currentMapMode === 'empty'; // pin taps only mean something with pins up
+      if (currentMapMode === 'bbox') {
+        scheduleBboxFetch();
         return;
       }
-      const wasHidden = mapEl.hidden;
-      mapEl.hidden = false;
-      ensureMap();
-      if (wasHidden) map.invalidateSize();
-      drawNearby();
-      renderedView = view;
+      clearTimeout(bboxTimer);
+      if (currentMapMode === 'empty') {
+        abortMapFetch('mode-change');
+        if (pinLayer) pinLayer.clearLayers();
+        setMapToast('');
+      }
+      // 'nearby': showNearby() owns the fetch and the drawing.
     }
 
-    // Redraw only if the view itself changed — e.g. picking a From from a
-    // nearby pin keeps the overview as-is instead of re-fitting it.
-    function syncMap() {
-      if (mapView() !== renderedView) renderMap();
+    // The 300 ms debounce: a pan's moveend only fetches once the map settles.
+    function scheduleBboxFetch() {
+      clearTimeout(bboxTimer);
+      bboxTimer = setTimeout(() => {
+        if (computeMapMode() !== 'bbox') return;
+        const bounds = map.getBounds();
+        runPinFetch(
+          (signal) => fetchStopsBbox(bounds, signal),
+          (stops) => { if (currentMapMode === 'bbox') drawPins(stops); },
+          () => {}, // a failed refresh keeps the pins already up; the next pan retries
+        );
+      }, BBOX_DEBOUNCE_MS);
+    }
+
+    function abortMapFetch(reason) {
+      if (!lastBboxFetchController) return;
+      lastBboxFetchAbortReason = reason;
+      lastBboxFetchController.abort();
+      lastBboxFetchController = null;
+    }
+
+    // One pin fetch at a time, aborting any older one. Pins are only
+    // replaced when the new rows land, so old pins stay up meanwhile.
+    async function runPinFetch(fetcher, draw, onError) {
+      abortMapFetch('superseded');
+      const controller = new AbortController();
+      lastBboxFetchController = controller;
+      setMapLoading(true);
+      try {
+        const stops = await fetcher(controller.signal);
+        if (!controller.signal.aborted) draw(stops);
+      } catch (err) {
+        if (!controller.signal.aborted) onError(err);
+      } finally {
+        if (controller === lastBboxFetchController) lastBboxFetchController = null;
+        // A superseded fetch leaves the spinner to its replacement.
+        const superseded = controller.signal.aborted && lastBboxFetchAbortReason === 'superseded';
+        if (!superseded) setMapLoading(false);
+      }
+    }
+
+    // /stops/bbox caps each side at 1 degree; a wider view (zoom 11 on a big
+    // screen) asks for the capped box around the view's centre instead.
+    async function fetchStopsBbox(bounds, signal) {
+      const center = bounds.getCenter();
+      const halfLon = Math.min(bounds.getEast() - bounds.getWest(), BBOX_MAX_SIDE_DEG) / 2;
+      const halfLat = Math.min(bounds.getNorth() - bounds.getSouth(), BBOX_MAX_SIDE_DEG) / 2;
+      const params = new URLSearchParams({
+        west: (center.lng - halfLon).toFixed(5),
+        south: (center.lat - halfLat).toFixed(5),
+        east: (center.lng + halfLon).toFixed(5),
+        north: (center.lat + halfLat).toFixed(5),
+        limit: String(BBOX_LIMIT),
+      });
+      const resp = await fetch('/stops/bbox?' + params.toString(), { signal });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      return resp.json();
+    }
+
+    function setMapLoading(busy) {
+      mapSpinner.hidden = !busy;
+    }
+
+    function setMapToast(text) {
+      mapToast.textContent = text;
     }
 
     // Mode colours live in app.css custom properties.
@@ -487,25 +654,30 @@
       return km < 0.05 ? 'under 0.1 km away' : `${km.toFixed(1)} km away`;
     }
 
-    function drawNearby() {
+    // Replace the pins with `stops` (bbox or nearby rows), plus the "you are
+    // here" marker once location is known. Returns the drawn bounds.
+    function drawPins(stops) {
       pinLayer.clearLayers();
+      setMapToast(stops.length === 0 ? NO_STOPS_IN_VIEW : '');
       const origin = fromPicker.originCoords;
       const colors = mapColors();
       const bounds = L.latLngBounds([]);
 
       // "You are here": filled dot + pulsing ring. Never interactive, so it
       // can't swallow a tap meant for a stop pin underneath it.
-      const here = [origin.lat, origin.lon];
-      L.circleMarker(here, {
-        radius: 14, weight: 2, color: colors.marker, fillColor: colors.marker, fillOpacity: 0.12,
-        interactive: false, className: 'map-here-pulse',
-      }).addTo(pinLayer);
-      L.circleMarker(here, {
-        radius: 6, weight: 2, color: colors.casing, fillColor: colors.marker, fillOpacity: 1, interactive: false,
-      }).addTo(pinLayer);
-      bounds.extend(here);
+      if (origin) {
+        const here = [origin.lat, origin.lon];
+        L.circleMarker(here, {
+          radius: 14, weight: 2, color: colors.marker, fillColor: colors.marker, fillOpacity: 0.12,
+          interactive: false, className: 'map-here-pulse',
+        }).addTo(pinLayer);
+        L.circleMarker(here, {
+          radius: 6, weight: 2, color: colors.casing, fillColor: colors.marker, fillOpacity: 1, interactive: false,
+        }).addTo(pinLayer);
+        bounds.extend(here);
+      }
 
-      for (const stop of nearbyStops) {
+      for (const stop of stops) {
         const latlng = [stop.stop_lat, stop.stop_lon];
         L.circleMarker(latlng, {
           radius: 6,
@@ -516,28 +688,64 @@
           interactive: false,
         }).addTo(pinLayer);
         const role = MODE_LABEL[stop.mode] || MODE_LABEL.unknown;
+        // Bbox rows carry no distance_km: name only.
+        const name = Number.isFinite(stop.distance_km)
+          ? `${stop.stop_name} · ${distanceLabel(stop.distance_km)}`
+          : stop.stop_name;
         L.circleMarker(latlng, { radius: HIT_RADIUS, stroke: false, fill: true, fillOpacity: 0 })
-          .bindTooltip(mapLabel(role, `${stop.stop_name} · ${distanceLabel(stop.distance_km)}`), {
-            direction: 'top', offset: [0, -8],
-          })
+          .bindTooltip(mapLabel(role, name), { direction: 'top', offset: [0, -8] })
           .on('click', () => pinSelect(stop))
           .addTo(pinLayer);
         bounds.extend(latlng);
       }
-      if (bounds.isValid()) map.fitBounds(bounds, { padding: FIT_PADDING, maxZoom: 16 });
-      else map.setView(DEFAULT_CENTER, 11);
+      return bounds;
+    }
+
+    // 'nearby' around coords. A From stop recentres on itself at FROM_ZOOM
+    // right away; a location fix (fit: true) fits the pins once they land,
+    // as the Pass 6 overview did. Resolves when the fetch settles.
+    function showNearby(coords, { fit }) {
+      if (!map) return Promise.resolve();
+      nearbyAnchor = coords;
+      if (fit) applyMapMode();
+      else moveMap(() => map.setView([coords.lat, coords.lon], FROM_ZOOM, { animate: false }));
+      return runPinFetch(
+        (signal) => fetchStopsNearby(coords, signal),
+        (stops) => {
+          if (nearbyAnchor !== coords) return; // the user panned away meanwhile
+          const bounds = drawPins(stops);
+          if (fit && bounds.isValid()) {
+            moveMap(() => map.fitBounds(bounds, { padding: FIT_PADDING, maxZoom: 16, animate: false }));
+          }
+        },
+        () => setFromHint('Couldn’t load nearby stops. Try again or search by name.'),
+      );
+    }
+
+    // Back to the SEQ overview with no pins (the moveend lands in 'empty').
+    function showEmpty() {
+      if (!map) return;
+      nearbyAnchor = null;
+      moveMap(() => map.setView(SEQ_CENTER, SEQ_ZOOM, { animate: false }));
     }
 
     // ── Pickers ───────────────────────────────────────────────
 
+    // From set with coords (typed, pin, or a v2 recent) -> nearby around it;
+    // cleared -> empty overview. A v1 recent has no coords, so the map stays
+    // as it is.
     function onFromChange() {
       if (fromPicker.selected) setFromHint('');
       retargetAfterChange('from');
-      syncMap();
+      updateSwapButton();
+      const coords = fromBias();
+      if (coords) showNearby(coords, { fit: false });
+      else if (!fromPicker.selected) showEmpty();
     }
 
     function onToChange() {
       retargetAfterChange('to');
+      updateSwapButton();
     }
 
     // To is geo-biased only by a confirmed From that carries coordinates.
@@ -551,6 +759,45 @@
     fromPicker.originCoords = null; // in-memory only; never persisted
     const form = document.querySelector('#route-form');
 
+    // ── Swap From <-> To ──────────────────────────────────────
+    // Exchanges selections and raw input text (mid-edit text moves too),
+    // writing both pickers before either onChange fires. The pin target is
+    // tied to the field, not the stop, so retargeting is skipped. originCoords
+    // is the user's location fix, not From's stop, so it stays put; the
+    // recentre comes from the new From's own coords via onFromChange.
+    // Focus stays on the button; it can't disable itself, since a swap only
+    // moves text between the fields.
+
+    const swapButton = document.querySelector('#swap-button');
+    let swapping = false; // true while a swap runs the pickers' onChange
+
+    function updateSwapButton() {
+      swapButton.disabled = fromPicker.text().trim() === '' && toPicker.text().trim() === '';
+    }
+
+    function swapPickers() {
+      const from = { selected: fromPicker.selected, text: fromPicker.text() };
+      const to = { selected: toPicker.selected, text: toPicker.text() };
+      const fromChanged = fromPicker.setState(to.selected, to.text);
+      const toChanged = toPicker.setState(from.selected, from.text);
+      swapping = true;
+      try {
+        if (fromChanged) fromPicker.notifyChange();
+        if (toChanged) toPicker.notifyChange();
+      } finally {
+        swapping = false;
+      }
+      renderPinTarget(); // the toggle shows each field's stop name
+      clearError();
+      updateSwapButton();
+    }
+
+    swapButton.addEventListener('click', swapPickers); // native button: Enter and Space both click
+    for (const input of document.querySelectorAll('#from-input, #to-input')) {
+      input.addEventListener('input', updateSwapButton);
+    }
+    updateSwapButton();
+
     // ── Pin target (which field a nearby-pin tap fills) ───────
 
     function defaultPinTarget() {
@@ -563,7 +810,7 @@
     // pinSelect(), so this skips while one is running. A manual toggle
     // choice holds until the next selection or clear reaches here.
     function retargetAfterChange(which) {
-      if (pinSelecting) return;
+      if (pinSelecting || swapping) return;
       const picker = which === 'from' ? fromPicker : toPicker;
       if (!picker.selected) setPinTarget(defaultPinTarget()); // cleared
       else if (which === 'from' && activePinTarget === 'from') setPinTarget('to'); // From's job is done
@@ -629,6 +876,7 @@
     });
 
     renderPinTarget();
+    ensureMap(); // after the pickers exist: pin taps and mode changes use them
 
     // ── Use my location (From only) ───────────────────────────
     // User-initiated only: geolocation is never touched on page load, not
@@ -659,19 +907,14 @@
       locateButton.title = label;
     }
 
-    // Exactly one /stops/nearby request per location grant.
-    async function loadNearby(coords) {
+    // One /stops/nearby request per location grant or From change.
+    async function fetchStopsNearby(coords, signal) {
       const params = new URLSearchParams({
         lat: String(coords.lat), lon: String(coords.lon), limit: String(NEARBY_LIMIT),
       });
-      try {
-        const resp = await fetch('/stops/nearby?' + params.toString());
-        if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        return await resp.json();
-      } catch (err) {
-        setFromHint('Couldn’t load nearby stops. Try again or search by name.');
-        return [];
-      }
+      const resp = await fetch('/stops/nearby?' + params.toString(), { signal });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      return resp.json();
     }
 
     async function onPosition(position) {
@@ -679,9 +922,8 @@
       fromPicker.originCoords = coords;
       setLocationGranted(true);
       setFromHint('');
-      nearbyStops = await loadNearby(coords);
+      await showNearby(coords, { fit: true }); // new pins: redraw + re-fit around the user
       setLocating(false);
-      renderMap(); // new pins: redraw + re-fit even if already in the overview
     }
 
     function onPositionError() {

@@ -11,72 +11,88 @@
 {% endblock %}
 
 {% block content %}
-<main>
-  <h1 class="sr-only">Transit AI — plan a trip</h1>
-  <p class="tagline">Predicted arrivals for South East Queensland bus, train and tram.</p>
+<!-- Map-first layout: the map fills the stage; the pickers float above it
+     in the overlay card. <main> comes first so keyboard focus reaches the
+     pickers before the map. -->
+<div class="map-stage">
+  <main>
+    <h1 class="sr-only">Transit AI — plan a trip</h1>
 
-  <form id="route-form" class="route-form" novalidate>
-    <div class="field">
-      <label id="from-label" for="from-input">From</label>
-      <div class="combo has-action">
-        <input id="from-input" type="text" autocomplete="off" spellcheck="false"
-               placeholder="Search for a stop"
-               role="combobox" aria-autocomplete="list" aria-expanded="false"
-               aria-controls="from-listbox" aria-describedby="from-hint">
-        <!-- Pin icon is appended by app.js (icons.js, DOM-built). -->
-        <button id="locate-button" class="locate" type="button"
-                aria-label="Use my location" title="Use my location">
-          <span id="locate-dot" class="locate-dot" hidden></span>
-        </button>
-        <div id="from-dropdown" class="dropdown" hidden>
-          <p id="from-note" class="dropdown-note" hidden></p>
-          <ul id="from-listbox" class="options" role="listbox" aria-labelledby="from-label"></ul>
+    <div class="picker-overlay">
+      <p class="tagline">Predicted arrivals for South East Queensland bus, train and tram.</p>
+
+      <form id="route-form" class="route-form" novalidate>
+        <div class="field">
+          <label id="from-label" for="from-input">From</label>
+          <div class="combo has-action">
+            <input id="from-input" type="text" autocomplete="off" spellcheck="false"
+                   placeholder="Search for a stop"
+                   role="combobox" aria-autocomplete="list" aria-expanded="false"
+                   aria-controls="from-listbox" aria-describedby="from-hint">
+            <!-- Pin icon is appended by app.js (icons.js, DOM-built). -->
+            <button id="locate-button" class="locate" type="button"
+                    aria-label="Use my location" title="Use my location">
+              <span id="locate-dot" class="locate-dot" hidden></span>
+            </button>
+            <div id="from-dropdown" class="dropdown" hidden>
+              <p id="from-note" class="dropdown-note" hidden></p>
+              <ul id="from-listbox" class="options" role="listbox" aria-labelledby="from-label"></ul>
+            </div>
+          </div>
+          <p id="from-hint" class="field-hint" aria-live="polite" hidden></p>
         </div>
-      </div>
-      <p id="from-hint" class="field-hint" aria-live="polite" hidden></p>
-    </div>
 
-    <div class="field">
-      <label id="to-label" for="to-input">To</label>
-      <div class="combo">
-        <input id="to-input" type="text" autocomplete="off" spellcheck="false"
-               placeholder="Search for a stop"
-               role="combobox" aria-autocomplete="list" aria-expanded="false"
-               aria-controls="to-listbox">
-        <div id="to-dropdown" class="dropdown" hidden>
-          <p id="to-note" class="dropdown-note" hidden></p>
-          <ul id="to-listbox" class="options" role="listbox" aria-labelledby="to-label"></ul>
+        <!-- Swap From <-> To. app.js keeps it disabled while both fields are empty. -->
+        <div id="swap-slot" class="swap-slot">
+          <button id="swap-button" class="swap-button" type="button"
+                  aria-label="Swap From and To" title="Swap From and To" disabled>
+            <span aria-hidden="true">↑↓</span>
+          </button>
         </div>
-      </div>
+
+        <div class="field">
+          <label id="to-label" for="to-input">To</label>
+          <div class="combo">
+            <input id="to-input" type="text" autocomplete="off" spellcheck="false"
+                   placeholder="Search for a stop"
+                   role="combobox" aria-autocomplete="list" aria-expanded="false"
+                   aria-controls="to-listbox">
+            <div id="to-dropdown" class="dropdown" hidden>
+              <p id="to-note" class="dropdown-note" hidden></p>
+              <ul id="to-listbox" class="options" role="listbox" aria-labelledby="to-label"></ul>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pin target: which field a map-pin tap fills. Shown by app.js
+             whenever the map has pins (nearby or bbox view). -->
+        <div id="map-header" class="map-header" hidden>
+          <p id="pin-target-label" class="map-header-label" aria-live="polite"></p>
+          <div id="pin-target" class="pin-target" role="toolbar" aria-label="Field a pin tap fills">
+            <button type="button" class="pin-target-option" data-target="from" aria-pressed="true">
+              <span class="pin-target-role">From</span>
+              <span class="pin-target-value"></span>
+            </button>
+            <button type="button" class="pin-target-option" data-target="to" aria-pressed="false" tabindex="-1">
+              <span class="pin-target-role">To</span>
+              <span class="pin-target-value"></span>
+            </button>
+          </div>
+        </div>
+
+        <button id="submit" class="submit" type="submit">Find routes</button>
+      </form>
+
+      <!-- Validation messages only; loading/empty/error live on /results. -->
+      <p id="status" class="status" role="status" aria-live="polite"></p>
     </div>
+  </main>
 
-    <button id="submit" class="submit" type="submit">Find routes</button>
-  </form>
-
-  <!-- Validation messages only; loading/empty/error live on /results. -->
-  <p id="status" class="status" role="status" aria-live="polite"></p>
-
-  <section class="nearby-section" aria-label="Stops near you">
-    <!-- Nearby-overview header: which field a pin tap fills. Shown by
-         renderMap() in the nearby view only. -->
-    <div id="map-header" class="map-header" hidden>
-      <p id="pin-target-label" class="map-header-label" aria-live="polite"></p>
-      <div id="pin-target" class="pin-target" role="toolbar" aria-label="Field a pin tap fills">
-        <button type="button" class="pin-target-option" data-target="from" aria-pressed="true">
-          <span class="pin-target-role">From</span>
-          <span class="pin-target-value"></span>
-        </button>
-        <button type="button" class="pin-target-option" data-target="to" aria-pressed="false" tabindex="-1">
-          <span class="pin-target-role">To</span>
-          <span class="pin-target-value"></span>
-        </button>
-      </div>
-    </div>
-    <!-- Map slot: hidden until "Use my location" finds stops nearby;
-         app.js's renderMap() is the only thing that shows, hides or redraws it. -->
-    <div id="map" class="map" role="region" aria-label="Map of stops near you" hidden></div>
-  </section>
-</main>
+  <!-- Full-page map, always shown; app.js owns every pin, fetch and view change. -->
+  <div id="map" class="map map-fullpage" role="region" aria-label="Map of stops"></div>
+  <span id="map-spinner" class="map-spinner" aria-hidden="true" hidden></span>
+  <p id="map-toast" class="map-toast" role="status" aria-live="polite"></p>
+</div>
 {% endblock %}
 
 {% block scripts %}

@@ -103,6 +103,39 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * atan2(sqrt(a), sqrt(1 - a))
 
 
+def _split_by_mode(row, stop_to_routes, route_type_by_route, stop_lat_lon):
+    """Return list of (modes_set, stop_ids_list, stop_lat, stop_lon) tuples.
+    A cluster serving a single mode → one tuple.
+    A cluster serving multiple modes → one tuple per mode.
+
+    `row` is one _stop_index row; stop_lat_lon is data.stops indexed by
+    stop_id, used to average each mode's own member coords. A cluster with
+    no routed member stops → [].
+    """
+    by_mode: dict[int, list[str]] = {}
+    for stop_id in row.stop_ids:
+        route_types = {route_type_by_route.get(r) for r in stop_to_routes.get(stop_id, set())}
+        route_types.discard(None)
+        for rt in route_types:
+            by_mode.setdefault(rt, []).append(stop_id)
+
+    if not by_mode:
+        return []
+
+    if len(by_mode) == 1:
+        # Common case: every member stop serves the same single mode —
+        # one merged pin, reusing the cluster's already-averaged coords.
+        return [(set(by_mode), row.stop_ids, row.stop_lat, row.stop_lon)]
+
+    groups = []
+    for rt, sids in by_mode.items():
+        coords = stop_lat_lon.loc[stop_lat_lon.index.intersection(sids)]
+        if coords.empty:
+            continue
+        groups.append(({rt}, sids, coords['stop_lat'].mean(), coords['stop_lon'].mean()))
+    return groups
+
+
 def nearest_stops(lat: float, lon: float, limit: int = 15) -> list[dict]:
     """Nearest *useful* stops to (lat, lon) for a map-pin origin picker.
 
@@ -126,29 +159,7 @@ def nearest_stops(lat: float, lon: float, limit: int = 15) -> list[dict]:
 
     candidates = []
     for row in data._stop_index.itertuples(index=False):
-        by_mode: dict[int, list[str]] = {}
-        for stop_id in row.stop_ids:
-            route_types = {route_type_by_route.get(r) for r in stop_to_routes.get(stop_id, set())}
-            route_types.discard(None)
-            for rt in route_types:
-                by_mode.setdefault(rt, []).append(stop_id)
-
-        if not by_mode:
-            continue
-
-        if len(by_mode) == 1:
-            # Common case: every member stop serves the same single mode —
-            # one merged pin, reusing the cluster's already-averaged coords.
-            groups = [(set(by_mode), row.stop_ids, row.stop_lat, row.stop_lon)]
-        else:
-            groups = []
-            for rt, sids in by_mode.items():
-                coords = stop_lat_lon.loc[stop_lat_lon.index.intersection(sids)]
-                if coords.empty:
-                    continue
-                groups.append(({rt}, sids, coords['stop_lat'].mean(), coords['stop_lon'].mean()))
-
-        for route_types, sids, clat, clon in groups:
+        for route_types, sids, clat, clon in _split_by_mode(row, stop_to_routes, route_type_by_route, stop_lat_lon):
             routes_here = set()
             for sid in sids:
                 routes_here |= stop_to_routes.get(sid, set())
@@ -175,4 +186,55 @@ def nearest_stops(lat: float, lon: float, limit: int = 15) -> list[dict]:
     candidates.sort(key=lambda c: c['_score'])
     for c in candidates:
         del c['_score']
+    return candidates[:limit]
+
+
+# ~500 m at SEQ latitudes: wider than any one station's per-mode spread, so
+# a cluster straddling the bbox edge isn't dropped before it's split by mode.
+BBOX_PREFILTER_MARGIN_DEG = 0.005
+
+
+def stops_in_bbox(west: float, south: float, east: float, north: float, limit: int = 30) -> list[dict]:
+    """Return stops whose lat/lon fall inside the bbox, ranked by trip_count desc, stop_name asc.
+    No distance calculation. Per-mode split (via _split_by_mode).
+
+    Rows have nearest_stops()'s shape minus distance_km. The cluster's
+    averaged coords pre-filter the index against the bbox widened by
+    BBOX_PREFILTER_MARGIN_DEG, so a multi-mode station whose average sits
+    just outside the box still reaches the split; each per-mode row is then
+    kept only if its own coords are inside the true bbox.
+    """
+    data = load_gtfs_data()
+    stop_to_routes = data.stop_to_routes
+    route_trip_counts = data.route_trip_counts
+    route_type_by_route = data.routes.set_index('route_id')['route_type'].to_dict()
+    stop_lat_lon = data.stops.set_index('stop_id')[['stop_lat', 'stop_lon']]
+
+    index = data._stop_index
+    m = BBOX_PREFILTER_MARGIN_DEG
+    in_box = index[
+        index['stop_lat'].between(south - m, north + m) & index['stop_lon'].between(west - m, east + m)
+    ]
+
+    candidates = []
+    for row in in_box.itertuples(index=False):
+        for route_types, sids, clat, clon in _split_by_mode(row, stop_to_routes, route_type_by_route, stop_lat_lon):
+            if not (south <= clat <= north and west <= clon <= east):
+                continue
+            routes_here = set()
+            for sid in sids:
+                routes_here |= stop_to_routes.get(sid, set())
+            trip_count = sum(route_trip_counts.get(r, 0) for r in routes_here)
+
+            candidates.append({
+                'stop_id': sids[0],
+                'stop_ids': sorted(set(sids)),
+                'stop_name': row.stop_name,
+                'stop_lat': clat,
+                'stop_lon': clon,
+                'route_types': sorted(route_types),
+                'trip_count': trip_count,
+            })
+
+    candidates.sort(key=lambda c: (-c['trip_count'], c['stop_name']))
     return candidates[:limit]

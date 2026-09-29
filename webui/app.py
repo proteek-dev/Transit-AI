@@ -351,16 +351,23 @@ def stops_search(
     return [_to_stop_search_result(r) for r in rows]
 
 
-def _to_nearby_stop(row: dict) -> dict:
-    """One nearest_stops() dict -> StopSearchResult + distance_km + mode.
-    nearest_stops() splits multi-mode stations into one row per mode, so
-    route_types always has exactly one entry; mode is derived from it with
-    the same mapping /routes legs use, so the map can colour the pin.
+def _to_stop_row(row: dict, *, include_distance: bool) -> dict:
+    """Serialize a phase3 stop dict to the API shape.
+    include_distance=True  → adds distance_km (from /stops/nearby)
+    include_distance=False → omits distance_km entirely (from /stops/bbox)
+
+    nearest_stops() and stops_in_bbox() both split multi-mode stations into
+    one row per mode, so route_types always has exactly one entry; mode is
+    derived from it with the same mapping /routes legs use, so the map can
+    colour the pin.
     """
     from route_types import MODE_BY_ROUTE_TYPE
 
     out = _to_stop_search_result(row)
-    out['distance_km'] = float(row['distance_km'])
+    if include_distance:
+        out['distance_km'] = float(row['distance_km'])
+    else:
+        out.pop('distance_km', None)
     route_types = row.get('route_types') or []
     out['mode'] = MODE_BY_ROUTE_TYPE.get(int(route_types[0]), 'unknown') if route_types else 'unknown'
     return out
@@ -382,7 +389,44 @@ def stops_nearby(
         rows = nearest_stops(lat, lon, limit=limit)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f'Nearby stops unavailable: {e}')
-    return [_to_nearby_stop(r) for r in rows]
+    return [_to_stop_row(r, include_distance=True) for r in rows]
+
+
+# Max bbox side, in degrees (~110 km at SEQ latitudes): covers the Gold
+# Coast <-> Brisbane corridor while keeping one request's pin count sane.
+BBOX_MAX_SIDE_DEGREES = 1.0
+
+
+@app.get('/stops/bbox')
+def stops_bbox(
+    west: Optional[float] = Query(None, ge=-180, le=180),
+    south: Optional[float] = Query(None, ge=-90, le=90),
+    east: Optional[float] = Query(None, ge=-180, le=180),
+    north: Optional[float] = Query(None, ge=-90, le=90),
+    limit: int = Query(30, ge=1, le=100),
+) -> list:
+    """Stops inside a map viewport -- wraps phase3/gtfs/search.py's
+    stops_in_bbox(), ranked by trip_count (busiest first), one row per mode.
+    Rows are StopSearchResult + mode + trip_count, with no distance_km.
+    """
+    if west is None or south is None or east is None or north is None:
+        raise HTTPException(status_code=422, detail='west, south, east, north are all required')
+    if west >= east:
+        raise HTTPException(status_code=422, detail='west must be less than east')
+    if south >= north:
+        raise HTTPException(status_code=422, detail='south must be less than north')
+    if east - west > BBOX_MAX_SIDE_DEGREES or north - south > BBOX_MAX_SIDE_DEGREES:
+        raise HTTPException(status_code=422, detail='bbox too large — max 1 degree per side')
+    from gtfs.search import stops_in_bbox
+
+    try:
+        rows = stops_in_bbox(west, south, east, north, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f'Bbox stops unavailable: {e}')
+    return [
+        {**_to_stop_row(r, include_distance=False), 'trip_count': int(r['trip_count'])}
+        for r in rows
+    ]
 
 
 def _parse_departure(departure: str | None) -> datetime:
