@@ -1,0 +1,25 @@
+# Web framework -- pinned (Session 38)
+fastapi==0.128.8
+uvicorn[standard]==0.39.0
+jinja2==3.1.4
+
+# AWS + config
+boto3
+python-dotenv
+
+# System monitoring
+psutil
+
+# Data + ML: imported by phase3/ modules that webui/app.py pulls in via
+# sys.path at startup. Pin pyarrow for parity with the on-box precompute
+# venv (/opt/transit-ai/.venv, container's Python 3.12.14 exact match --
+# see learnings.md). Pin s3fs at the archive's version.
+pandas
+pyarrow==25.0.1
+s3fs==2025.10.0
+xgboost
+scikit-learn
+rapidfuzz
+joblib
+requests
+gtfs-realtime-bindings

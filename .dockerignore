@@ -1,5 +1,11 @@
-# Build context for webapp/backend/Dockerfile (Cloud Run backend image).
-# Built from the repo root: docker build -f webapp/backend/Dockerfile -t <image> .
+# .dockerignore for the root Dockerfile (transit-ai-webui image).
+#
+# Build context is the repo root. Explicitly excluded here:
+#   - archive/       -- retired webapp/backend and frontend, not in the image
+#   - requirements.txt -- root reqs are for local dev (streamlit, jupyter, etc.);
+#                        image installs from webui/requirements.txt instead
+#   - phase3/model/  -- fetched from S3 at runtime by webui/app.py, never baked in
+#   - **/.env, **/__pycache__/, .git, .venv, node_modules -- standard hygiene
 
 .git/
 .github/
@@ -12,13 +18,12 @@
 **/__pycache__/
 **/*.pyc
 **/.DS_Store
-.env
+**/.env
 .env.*
 !.env.example
 node_modules/
-
-# Frontend isn't needed to build the backend image
-webapp/frontend/
+.venv/
+archive/
 
 # Repo-root dev/training/notebook tooling and generated output -- not
 # runtime deps of the deployed backend
@@ -30,12 +35,11 @@ logs/
 config/
 requirements.txt
 
-# phase3/ subtree NOT reached by webapp/backend/main.py's import chain
-# (webapp/backend/Dockerfile copies only: phase3/config.py, route_types.py,
-# gtfs_data.py, live_gtfs.py, prediction.py, phase3/gtfs/, phase3/ml/ --
-# keep those OUT of this ignore list). Excluded here: the Streamlit app
-# itself, UI helpers, tests, and phase3/model/ (.gitignore'd model
-# artifacts -- fetched from S3 at runtime, never baked into the image).
+# phase3/ has files webui/app.py's import chain never reaches
+# (Streamlit app.py, map_picker.py, tests/, notebooks). The root
+# Dockerfile explicitly COPYs only the phase3/ files webui/app.py's
+# import chain does reach, so this .dockerignore doesn't need to
+# exclude the untouched files -- they're just never COPYed in.
 phase3/app.py
 phase3/map_picker.py
 phase3/ui/
