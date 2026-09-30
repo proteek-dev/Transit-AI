@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -203,10 +204,16 @@ def results_page(
     from_stop_id: Optional[str] = Query(None, alias='from'),
     to_stop_id: Optional[str] = Query(None, alias='to'),
     departure: Optional[str] = Query(None, alias='departure'),
+    # The user's location fix from "Use my location", for the hero's walk
+    # annotation. Strings, not floats: a bad value drops the pair rather
+    # than 422ing the page.
+    origin_lat: Optional[str] = Query(None),
+    origin_lon: Optional[str] = Query(None),
 ):
     """Results page shell. The page fetches /routes itself from the echoed
     params, so a pasted /results URL works with no search-page state.
     """
+    origin = _parse_origin(origin_lat, origin_lon)
     from_stop_id = (from_stop_id or '').strip()
     to_stop_id = (to_stop_id or '').strip()
     if not from_stop_id or not to_stop_id:
@@ -222,7 +229,28 @@ def results_page(
         'from_stop_id': from_stop_id,
         'to_stop_id': to_stop_id,
         'departure': (departure or '').strip() or None,
+        'origin_lat': origin[0] if origin else None,
+        'origin_lon': origin[1] if origin else None,
     })
+
+
+_DECIMAL_RE = re.compile(r'-?\d+(?:\.\d+)?')
+
+
+def _parse_origin(lat_raw: str | None, lon_raw: str | None) -> tuple[float, float] | None:
+    """(lat, lon) when both are plain decimals in range, else None -- one
+    bad or missing value drops both. The regex keeps float()'s extras
+    ("nan", "inf", "1_0", "1e3") out.
+    """
+    if lat_raw is None or lon_raw is None:
+        return None
+    lat_raw, lon_raw = lat_raw.strip(), lon_raw.strip()
+    if not (_DECIMAL_RE.fullmatch(lat_raw) and _DECIMAL_RE.fullmatch(lon_raw)):
+        return None
+    lat, lon = float(lat_raw), float(lon_raw)
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return lat, lon
 
 
 # ── JSON API (ported from archive/webapp-v1-fastapi-nextjs-split/backend/main.py) ──

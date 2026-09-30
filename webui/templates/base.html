@@ -16,9 +16,9 @@
           <span class="brand-title">SEQ TRANSIT AI</span>
           {% block header_nav %}{% endblock %}
         </div>
-        {# header_url: the existing Streamlit public URL -- swap this once
-           webui gets its own public URL. #}
-        <span class="brand-url">{{ header_url | default('transit-ai-qld.streamlit.app') }}</span>
+        {# header_url: the webui's CloudFront URL; pass header_url to
+           override once a custom domain lands. #}
+        <span class="brand-url">{{ header_url | default('d17e9wvem3lbaq.cloudfront.net') }}</span>
       </header>
 
       {% block content %}{% endblock %}

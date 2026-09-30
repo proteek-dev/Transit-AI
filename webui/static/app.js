@@ -332,15 +332,25 @@
     return `${count} transfer${count === 1 ? '' : 's'}`;
   }
 
-  function renderLeg(leg) {
+  // { chip: true } (hero only) swaps the icon + "Bus 704" text for a
+  // mode-tinted chip: icon + short name (mode label when there's none).
+  // The mode word moves to aria-label, so it still reads "Bus 704".
+  function renderLeg(leg, { chip = false } = {}) {
     const li = el('li', 'leg');
-    const main = el('div', 'leg-main');
+    const modeLabel = MODE_LABEL[leg.mode] || MODE_LABEL.unknown;
+    const main = el('div', chip ? `leg-chip mode-${leg.mode}` : 'leg-main');
     const icon = window.TransitIcons ? window.TransitIcons.modeIcon(leg.mode, `leg-icon mode-${leg.mode}`) : null;
     if (icon) main.append(icon);
-    main.append(
-      el('span', 'leg-mode', (MODE_LABEL[leg.mode] || MODE_LABEL.unknown) + ' '),
-      el('span', 'leg-route', leg.route_short_name),
-    );
+    if (chip) {
+      main.setAttribute('role', 'img');
+      main.setAttribute('aria-label', `${modeLabel} ${leg.route_short_name || ''}`.trim());
+      main.append(el('span', 'leg-chip-label', leg.route_short_name || modeLabel));
+    } else {
+      main.append(
+        el('span', 'leg-mode', modeLabel + ' '),
+        el('span', 'leg-route', leg.route_short_name),
+      );
+    }
     const pill = el('span', `pill ${PILL_CLASS[leg.confidence] || 'pill-low'}`, `${leg.confidence} confidence`);
     const times = el(
       'div', 'leg-times',
@@ -359,7 +369,7 @@
       el('span', 'card-meta', `${route.total_predicted_duration_minutes} min · ${transferLabel(route.transfer_count)}`),
     );
     const legs = el('ol', 'legs');
-    legs.append(...route.legs.map(renderLeg));
+    legs.append(...route.legs.map((leg) => renderLeg(leg)));
     card.append(head, legs);
     return card;
   }
@@ -405,7 +415,93 @@
     const confClass = `conf-${route.confidence}`;
     if (HERO_CONF_CLASSES.includes(confClass)) hero.classList.add(confClass);
 
-    hero.querySelector('[data-hero-legs]').replaceChildren(...route.legs.map(renderLeg));
+    hero.querySelector('[data-hero-journey]').textContent = [
+      `${route.total_predicted_duration_minutes} min`,
+      transferLabel(route.transfer_count),
+      route.legs.map((leg) => MODE_LABEL[leg.mode] || MODE_LABEL.unknown).join(' → '),
+    ].join(' · ');
+
+    // One line per transfer, in the summary block. Legs can end and start
+    // at different stops of one station (the router transfers within a
+    // stop group), so both names show when they differ.
+    const transfers = route.legs.slice(1).map((leg, i) => {
+      const from = route.legs[i].to_stop.stop_name;
+      const to = leg.from_stop.stop_name;
+      return from === to ? `Transfer at ${from}` : `Transfer: ${from} → ${to}`;
+    });
+    const transfersEl = hero.querySelector('[data-hero-transfers]');
+    if (transfers.length > 1) transfersEl.replaceChildren(...transfers.map((line) => el('span', null, line)));
+    else transfersEl.textContent = transfers[0] || '';
+    transfersEl.hidden = transfers.length === 0;
+
+    renderWalkAnnotation(route);
+    hero.querySelector('[data-hero-legs]').replaceChildren(...route.legs.map((leg) => renderLeg(leg, { chip: true })));
+  }
+
+  // ── Walk annotation (hero only) ─────────────────────────────
+  // "~0.4 km · ~5 min walk to X": straight-line distance from the user's
+  // location fix (<main data-origin-lat/lon>, set only when /results got a
+  // valid pair) to the first leg's from_stop. Absent silently when either
+  // end has no coords. Separate from leave_by, which stays departure - 3 min.
+
+  const WALK_KMH = 5;
+
+  // 24x24, same stroke style as icons.js.
+  const WALK_SHAPES = [
+    ['circle', { cx: 13, cy: 4, r: 2 }],
+    ['path', { d: 'M7 11l3-3h3l3 3' }],
+    ['path', { d: 'M12 8l-1.5 6' }],
+    ['path', { d: 'M10.5 14L8 21' }],
+    ['path', { d: 'M10.5 14l3 2.5L15 21' }],
+  ];
+
+  function walkIcon() {
+    const svg = svgEl('svg', {
+      viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 2,
+      'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true',
+      focusable: 'false', class: 'hero-walk-icon',
+    });
+    for (const [tag, attrs] of WALK_SHAPES) svg.append(svgEl(tag, attrs));
+    return svg;
+  }
+
+  function haversineKm(a, b) {
+    const rad = (deg) => (deg * Math.PI) / 180;
+    const dLat = rad(b.lat - a.lat);
+    const dLon = rad(b.lon - a.lon);
+    const h = Math.sin(dLat / 2) ** 2
+      + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLon / 2) ** 2;
+    return 2 * 6371 * Math.asin(Math.sqrt(h));
+  }
+
+  function walkOrigin() {
+    const { originLat, originLon } = document.querySelector('main').dataset;
+    if (originLat === undefined || originLon === undefined) return null;
+    const lat = Number(originLat);
+    const lon = Number(originLon);
+    return Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null;
+  }
+
+  function renderWalkAnnotation(route) {
+    const WALK_MAX_KM = 2.0; // farther than this isn't a walk to the stop; stay hidden
+    const slot = document.querySelector('#top-pick [data-hero-walk]');
+    const origin = walkOrigin();
+    const stop = route.legs[0] && route.legs[0].from_stop;
+    const rawKm = origin && stop && Number.isFinite(stop.lat) && Number.isFinite(stop.lon)
+      ? haversineKm(origin, stop) : null;
+    if (rawKm === null || rawKm > WALK_MAX_KM) {
+      slot.hidden = true;
+      slot.replaceChildren();
+      return;
+    }
+    // Minutes come from the shown (rounded) distance so the two agree.
+    const km = Math.max(0.1, Math.round(rawKm * 10) / 10);
+    const minutes = Math.max(1, Math.round((km / WALK_KMH) * 60));
+    slot.replaceChildren(
+      walkIcon(),
+      el('span', 'hero-walk-text', `~${km.toFixed(1)} km · ~${minutes} min walk to ${stop.stop_name}`),
+    );
+    slot.hidden = false;
   }
 
   // ── Contextual pill (results bottom row) ────────────────────
@@ -735,6 +831,9 @@
     // cleared -> empty overview. A v1 recent has no coords, so the map stays
     // as it is.
     function onFromChange() {
+      // A manual From change (typed pick, recents, clearing the text, swap)
+      // voids the location fix; a nearby-pin tap keeps it (still the GPS point).
+      if (!pinSelecting) fromPicker.originCoords = null;
       if (fromPicker.selected) setFromHint('');
       retargetAfterChange('from');
       updateSwapButton();
@@ -762,9 +861,9 @@
     // ── Swap From <-> To ──────────────────────────────────────
     // Exchanges selections and raw input text (mid-edit text moves too),
     // writing both pickers before either onChange fires. The pin target is
-    // tied to the field, not the stop, so retargeting is skipped. originCoords
-    // is the user's location fix, not From's stop, so it stays put; the
-    // recentre comes from the new From's own coords via onFromChange.
+    // tied to the field, not the stop, so retargeting is skipped. A changed
+    // From clears originCoords (onFromChange); the recentre comes from the
+    // new From's own coords.
     // Focus stays on the button; it can't disable itself, since a swap only
     // moves text between the fields.
 
@@ -963,8 +1062,13 @@
         setStatus('From and To can’t be the same stop.', 'error');
         return;
       }
-      window.location.href = '/results?from=' + encodeURIComponent(fromPicker.selected.stop_id)
+      let url = '/results?from=' + encodeURIComponent(fromPicker.selected.stop_id)
         + '&to=' + encodeURIComponent(toPicker.selected.stop_id);
+      // The location fix rides along for the hero's walk annotation. Rounded
+      // here only (3 dp, ~111m); originCoords itself keeps full precision.
+      const origin = fromPicker.originCoords;
+      if (origin) url += '&origin_lat=' + origin.lat.toFixed(3) + '&origin_lon=' + origin.lon.toFixed(3);
+      window.location.href = url;
     });
   }
 
@@ -1279,12 +1383,11 @@
     let routes = [];
     let activeRouteIndex = 0;
 
-    // has-results on .results-columns reveals the model stats card and its
-    // column (app.css). Off while loading and on empty/error.
-    function setResultsColumnsState(hasResults) {
-      const columns = document.querySelector('.results-columns');
-      if (!columns) return;
-      columns.classList.toggle('has-results', !!hasResults);
+    // The Model details disclosure shows only alongside a rendered route:
+    // hidden while loading and on empty/error. Absent (no model_stats) is fine.
+    function setModelDetailsVisible(visible) {
+      const details = document.querySelector('.model-details');
+      if (details) details.hidden = !visible;
     }
 
     // Contextual pill: written into results.html's existing slot, never
@@ -1325,7 +1428,7 @@
     });
 
     function showEmpty(message, kind) {
-      setResultsColumnsState(false);
+      setModelDetailsVisible(false);
       routes = []; // no active route: the pill clears below
       renderContextPill();
       alternativesDisclosure.hidden = true;
@@ -1382,7 +1485,7 @@
     });
 
     async function load() {
-      setResultsColumnsState(false);
+      setModelDetailsVisible(false);
       renderContextPill(); // no routes yet: clears the slot
       alternativesDisclosure.hidden = true;
       setStatus('Finding routes…');
@@ -1408,7 +1511,7 @@
         }
         setStatus('Ranked by predicted arrival.');
         // Columns settle first: the timeline measures its width on render.
-        setResultsColumnsState(true);
+        setModelDetailsVisible(true);
         routeStrip.hidden = false; // visible before the timeline measures its width
         setActiveRoute(0); // routes[0] is the hero; the rest render as alternatives
         // Fresh response only: closed by default, opened for a low-confidence

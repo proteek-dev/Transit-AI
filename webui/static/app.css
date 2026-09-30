@@ -1327,6 +1327,52 @@ body[data-page="search"] .footer {
   color: var(--text-tertiary);
 }
 
+/* Journey summary line (B6): duration · transfers · mode chain. */
+.hero-journey {
+  margin: calc(-1 * var(--space-2)) 0 var(--space-3);
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Transfer lines (B6.1): one per transfer, full text, wraps. */
+.hero-transfers {
+  margin: calc(-1 * var(--space-2)) 0 var(--space-3);
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.hero-transfers[hidden] {
+  display: none;
+}
+
+.hero-transfers > span {
+  display: block;
+}
+
+/* Walk from the user's location to the first leg's stop (B4). Sits between
+   .hero-header and .hero-legs; muted, since it's context, not the plan. */
+.hero-walk-annotation {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: calc(-1 * var(--space-2)) 0 var(--space-4);
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.hero-walk-annotation[hidden] {
+  display: none;
+}
+
+.hero-walk-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+
 .hero-legs {
   list-style: none;
   margin: 0;
@@ -1336,58 +1382,49 @@ body[data-page="search"] .footer {
   gap: var(--space-3);
 }
 
-/* ── Results columns: hero + model stats card (Session 40) ─ */
-
-.results-columns {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 200px;
-  gap: var(--space-5);
-  align-items: start;
-}
-
-/* No model_stats: the hero takes the full width. */
-.results-columns.is-single {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-.results-main {
+/* Hero leg chip (B6): replaces .leg-main on the hero only. The tint comes
+   from the leg's --mode-* token; the text stays --text-primary. */
+.leg-chip {
+  --chip-mode: var(--mode-unknown);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
   min-width: 0;
+  padding: 2px var(--space-3) 2px var(--space-2);
+  font-weight: 600;
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--chip-mode) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--chip-mode) 40%, transparent);
+  border-radius: 999px;
+}
+
+.leg-chip.mode-bus { --chip-mode: var(--mode-bus); }
+.leg-chip.mode-tram { --chip-mode: var(--mode-tram); }
+.leg-chip.mode-rail { --chip-mode: var(--mode-rail); }
+
+.leg-chip-label {
+  overflow-wrap: anywhere;
+}
+
+/* ── Model details disclosure (B6.1) ────────────────────── */
+/* The stats card, collapsed below the hero. Summary styling is shared
+   with the alternatives disclosure (below) so both read as one pattern. */
+
+.model-details {
+  display: block;
+}
+
+.model-details[hidden] {
+  display: none;
 }
 
 .model-stats-card {
-  align-self: start;
+  max-width: 24rem;
+  margin-bottom: var(--space-3);
   padding: var(--space-5);
   background: var(--surface);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius);
-}
-
-.model-stats-card[hidden] {
-  display: none;
-}
-
-/* Stats card and its column appear only alongside a rendered route:
-   app.js sets has-results on a non-empty /routes response and clears it
-   while loading and on empty/error. :not([hidden]) keeps a server-hidden
-   card (model_stats None) hidden even then. */
-.model-stats-card {
-  display: none;
-}
-
-.results-columns.has-results .model-stats-card:not([hidden]) {
-  display: block;
-}
-
-.results-columns:not(.has-results) {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-/* Two columns only above 720px; below it the stats card stacks under
-   the hero (DOM order), full width. */
-@media (max-width: 720px) {
-  .results-columns {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
 .model-stats-title {
@@ -1438,7 +1475,8 @@ body[data-page="search"] .footer {
   display: none;
 }
 
-.alternatives-summary {
+.alternatives-summary,
+.model-details-summary {
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -1452,28 +1490,33 @@ body[data-page="search"] .footer {
   color: var(--text-secondary);
 }
 
-.alternatives-summary::-webkit-details-marker {
+.alternatives-summary::-webkit-details-marker,
+.model-details-summary::-webkit-details-marker {
   display: none;
 }
 
-.alternatives-summary::before {
+.alternatives-summary::before,
+.model-details-summary::before {
   content: "▸";
   display: inline-block;
   transition: transform 150ms ease;
 }
 
-.alternatives-disclosure[open] .alternatives-summary::before {
+.alternatives-disclosure[open] .alternatives-summary::before,
+.model-details[open] .model-details-summary::before {
   transform: rotate(90deg);
 }
 
-.alternatives-summary:focus-visible {
+.alternatives-summary:focus-visible,
+.model-details-summary:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
   border-radius: 2px;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .alternatives-summary::before {
+  .alternatives-summary::before,
+  .model-details-summary::before {
     transition: none;
   }
 }
@@ -1562,7 +1605,8 @@ body[data-page="search"] .footer {
     padding: var(--space-4);
   }
 
-  .alternatives-summary {
+  .alternatives-summary,
+  .model-details-summary {
     padding: var(--space-2) 0;
   }
 
