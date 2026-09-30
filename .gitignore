@@ -26,3 +26,5 @@ phase3/.streamlit/secrets.toml
 # Diagnostic cache artifacts (e.g. ABS LGA GeoJSON fetched by
 # diagnostics/corridor_scope_census.py) — regenerable, not committed.
 diagnostics/cache/
+.devcontainer/
+.streamlit/
