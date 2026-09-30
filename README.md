@@ -38,44 +38,68 @@ data is available; falls back to model-only when it isn't. Out-of-vocabulary
 stops force Low confidence rather than silently degrading.
 
 ## Architecture
-                 TransLink GTFS + GTFS-RT
-                          │
-                          ▼
- ┌─────────────────────────────────────────────┐
- │   Archiver — EC2 t4g.small + systemd        │
- │   Polls combined + tram-dedicated feeds     │
- │   every 5 min, writes raw JSON to S3        │
- └─────────────────────────────────────────────┘
-                          │
-                          ▼
-                S3 (ap-southeast-2)
-                          │
-                          ▼
- ┌─────────────────────────────────────────────┐
- │   Feature pipeline (notebook 05)            │
- │   Per-source-date snapshot matching,        │
- │   chunked read, categorical-dtype parquet   │
- └─────────────────────────────────────────────┘
-                          │
-                          ▼
- ┌─────────────────────────────────────────────┐
- │   XGBoost training (notebook 07)            │
- │   Temporal split, leakage filter,           │
- │   RSS-tracked chunked training              │
- └─────────────────────────────────────────────┘
-                          │
-                          ▼
- ┌─────────────────────────────────────────────┐
- │   FastAPI backend (webui/)                  │
- │   Jinja2 SSR + vanilla JS + Leaflet         │
- │   EC2 t4g.medium, Docker, always-on         │
- └─────────────────────────────────────────────┘
-                          │
-                          ▼
-            CloudFront (HTTPS, edge cache /static/*)
-                          │
-                          ▼
-                   End users
+
+```text
+┌───────────────────────────────────────────────┐
+│            TransLink GTFS + GTFS-RT           │
+├───────────────────────────────────────────────┤
+│  Static timetable · combined RT feed          │
+│  Dedicated tram RT endpoints                  │
+└───────────────────────────────────────────────┘
+                        │   poll every 5 min
+                        ▼
+┌───────────────────────────────────────────────┐
+│      Archiver  ·  EC2 t4g.small + systemd     │
+├───────────────────────────────────────────────┤
+│  Polls combined + tram-dedicated feeds        │
+│  Writes raw JSON snapshots to S3              │
+└───────────────────────────────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│          Amazon S3  ·  ap-southeast-2         │
+├───────────────────────────────────────────────┤
+│  Immutable raw archive                        │
+│  Versioned features + model artefacts         │
+└───────────────────────────────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│        Feature pipeline  ·  notebook 05       │
+├───────────────────────────────────────────────┤
+│  Per-source-date snapshot matching            │
+│  Chunked read, categorical-dtype parquet      │
+└───────────────────────────────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│        XGBoost training  ·  notebook 07       │
+├───────────────────────────────────────────────┤
+│  Temporal split, leakage filter               │
+│  RSS-tracked chunked training                 │
+└───────────────────────────────────────────────┘
+                        │   model + metadata
+                        ▼
+╔═══════════════════════════════════════════════╗
+║           FastAPI backend  ·  webui/          ║
+╟───────────────────────────────────────────────╢
+║  Jinja2 SSR + vanilla JS + Leaflet            ║
+║  Live GTFS-RT blend at request time           ║
+║  EC2 t4g.medium, Docker, always-on            ║
+╚═══════════════════════════════════════════════╝
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│                   CloudFront                  │
+├───────────────────────────────────────────────┤
+│  HTTPS · edge cache for /static/*             │
+└───────────────────────────────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│                   End users                   │
+└───────────────────────────────────────────────┘
+```
 
 ## Tech stack
 
