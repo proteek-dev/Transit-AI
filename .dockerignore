@@ -1,0 +1,49 @@
+# .dockerignore for the root Dockerfile (transit-ai-webui image).
+#
+# Build context is the repo root. Explicitly excluded here:
+#   - archive/       -- retired webapp/backend and frontend, not in the image
+#   - requirements.txt -- root reqs are for local dev (streamlit, jupyter, etc.);
+#                        image installs from webui/requirements.txt instead
+#   - phase3/model/  -- fetched from S3 at runtime by webui/app.py, never baked in
+#   - **/.env, **/__pycache__/, .git, .venv, node_modules -- standard hygiene
+
+.git/
+.github/
+.devcontainer/
+.claude/
+.streamlit/
+.ruff_cache/
+.vscode/
+.idea/
+**/__pycache__/
+**/*.pyc
+**/.DS_Store
+**/.env
+.env.*
+!.env.example
+node_modules/
+.venv/
+archive/
+
+# Repo-root dev/training/notebook tooling and generated output -- not
+# runtime deps of the deployed backend
+notebooks/
+pipeline/
+scripts/
+diagnostics/
+logs/
+config/
+requirements.txt
+
+# phase3/ has files webui/app.py's import chain never reaches
+# (Streamlit app.py, map_picker.py, tests/, notebooks). The root
+# Dockerfile explicitly COPYs only the phase3/ files webui/app.py's
+# import chain does reach, so this .dockerignore doesn't need to
+# exclude the untouched files -- they're just never COPYed in.
+phase3/app.py
+phase3/map_picker.py
+phase3/ui/
+phase3/tests/
+phase3/model/
+phase3/.streamlit/
+phase3/.ruff_cache/

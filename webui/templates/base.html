@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Transit AI{% endblock %}</title>
+    {# Page-specific <head> additions. The search page loads Leaflet's CSS
+       here; results has no map, so it loads no Leaflet at all. #}
+    {% block head %}{% endblock %}
+    <link rel="stylesheet" href="/static/app.css">
+  </head>
+  <body data-page="{% block page %}{% endblock %}">
+    <div class="container">
+      <header class="brand-header">
+        <div class="brand-left">
+          <span class="brand-title">SEQ TRANSIT AI</span>
+          {% block header_nav %}{% endblock %}
+        </div>
+        {# header_url: the webui's CloudFront URL; pass header_url to
+           override once a custom domain lands. #}
+        <span class="brand-url">{{ header_url | default('d17e9wvem3lbaq.cloudfront.net') }}</span>
+      </header>
+
+      {% block content %}{% endblock %}
+
+      <footer class="footer">
+        <p>Schedule snapshot: {{ schedule_snapshot }}</p>
+        <p>Model trained: {{ model_trained }}</p>
+        <p>Features through: {{ features_through }}</p>
+      </footer>
+    </div>
+
+    <script src="/static/icons.js" defer></script>
+    {# Page-specific scripts load before app.js (defer keeps document order). #}
+    {% block scripts %}{% endblock %}
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

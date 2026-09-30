@@ -1,0 +1,111 @@
+{% extends 'base.html' %}
+
+{% block title %}Routes · Transit AI{% endblock %}
+
+{% block page %}results{% endblock %}
+
+{% block header_nav %}
+<a class="back-link" href="/">← Back to search</a>
+{% endblock %}
+
+{% block content %}
+<main data-from="{{ from_stop_id }}" data-to="{{ to_stop_id }}" data-departure="{{ departure or '' }}"{% if origin_lat is not none %} data-origin-lat="{{ origin_lat }}" data-origin-lon="{{ origin_lon }}"{% endif %}>
+  <h1 class="sr-only">Routes</h1>
+  <p id="status" class="status" role="status" aria-live="polite"></p>
+
+  <section id="route-strip" class="route-strip" aria-labelledby="route-heading" hidden>
+    <h2 id="route-heading" class="section-label">Route</h2>
+    <!-- Station timeline for the active card: app.js fills it once /routes
+         returns and redraws it on every active-card change. -->
+    <figure id="timeline" class="timeline" hidden>
+      <div class="timeline-scroll"></div>
+      <div class="popover timeline-popover" hidden>
+        <span class="popover-role"></span>
+        <span class="popover-name"></span>
+        <span class="popover-time"></span>
+      </div>
+      <p class="sr-only timeline-live" aria-live="polite"></p>
+    </figure>
+    <!-- Hero: the active route (the top pick until an alternative is
+         chosen). app.js's renderHero() fills every slot; no text here. -->
+    <section id="top-pick" class="hero" aria-live="polite">
+      <div class="hero-header">
+        <div class="hero-leave-by">
+          <span class="hero-leave-label">Leave by</span>
+          <span class="hero-leave-time" data-hero-leave-time></span>
+        </div>
+        <div class="hero-status" data-hero-status>
+          <span class="hero-status-pill" data-hero-status-pill></span>
+          <span class="hero-status-caption" data-hero-status-caption></span>
+        </div>
+      </div>
+      {# "58 min · 1 transfer · Bus → Tram", filled by renderHero(). #}
+      <p class="hero-journey" data-hero-journey></p>
+      {# One line per transfer; hidden on direct routes. #}
+      <p class="hero-transfers" data-hero-transfers hidden></p>
+      {# Walk from the user's location fix to the first leg's stop; app.js
+         fills it only when /results carried origin_lat/origin_lon. #}
+      <p class="hero-walk-annotation" data-hero-walk hidden></p>
+      <ol class="hero-legs" data-hero-legs></ol>
+    </section>
+  </section>
+
+  {# Model stats (Prompt 1's /results context), collapsed. Absent when
+     model_stats is None; app.js unhides it once /routes has a route. #}
+  {% if model_stats %}
+  <details class="model-details" hidden>
+    <summary class="model-details-summary">Model details</summary>
+    <aside class="model-stats-card" aria-label="Model stats">
+      <h2 class="model-stats-title">Model</h2>
+      <dl class="model-stats-list">
+        <div class="model-stats-row">
+          <dt>Model</dt>
+          <dd>{{ model_stats.model_type }}</dd>
+        </div>
+        <div class="model-stats-row">
+          <dt>Trained on</dt>
+          <dd>{% if model_stats.training_rows is not none %}{{ model_stats.training_rows | format_rows }} rows{% else %}—{% endif %}</dd>
+        </div>
+        <div class="model-stats-row">
+          <dt>Days archived</dt>
+          <dd>{% if model_stats.days_archived is not none %}{{ model_stats.days_archived }} days{% else %}—{% endif %}</dd>
+        </div>
+        <div class="model-stats-row">
+          <dt>Test MAE</dt>
+          <dd>{% if model_stats.test_mae is not none %}{{ '%.2f' | format(model_stats.test_mae) }} min{% else %}—{% endif %}</dd>
+        </div>
+        <div class="model-stats-row">
+          <dt>vs baseline</dt>
+          <dd>{% if model_stats.pct_improvement_over_naive is not none %}{{ '%.1f' | format(model_stats.pct_improvement_over_naive) }}% better{% else %}—{% endif %}</dd>
+        </div>
+        <div class="model-stats-row">
+          <dt>Through</dt>
+          <dd>{{ model_stats.data_snapshot.model_trained_through or model_stats.training_window.end or '—' }}</dd>
+        </div>
+      </dl>
+    </aside>
+  </details>
+  {% endif %}
+
+  {# Every route but the active one, in rank order. Closed by default;
+     app.js opens it for a low-confidence top pick and sets the count. #}
+  <details id="alternatives" class="alternatives-disclosure" hidden>
+    <summary class="alternatives-summary">
+      <span class="alternatives-summary-label" data-alternatives-label>Alternatives</span>
+    </summary>
+    <ol id="alternatives-section" class="results results-alt" aria-label="Alternative routes"></ol>
+  </details>
+
+  <div id="results-empty" class="empty-state" aria-live="polite" hidden>
+    <p id="results-empty-message" class="empty-state-message"></p>
+    <a class="back-link" href="/">← Back to search</a>
+  </div>
+
+  <div class="results-bottom-row">
+    {# Reserved for the contextual pill ("LEAVE NOW" etc.) -- the next pass fills it. #}
+    <span class="context-pill-slot"></span>
+    {% set repo = repo_url | default('https://github.com/proteek-dev/Transit-AI') %}
+    <a class="repo-link" href="{{ repo }}">{{ repo | replace('https://', '') }}</a>
+  </div>
+</main>
+{% endblock %}

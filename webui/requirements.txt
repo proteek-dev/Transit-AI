@@ -1,0 +1,29 @@
+# Web framework -- pinned (Session 38)
+fastapi==0.128.8
+uvicorn[standard]==0.39.0
+jinja2==3.1.4
+
+# AWS + config. boto3 pinned to what the production container has been
+# serving with (verified via SSM Session 41): unpinned boto3 sends pip's
+# resolver into a 15+ minute backtrack against s3fs==2025.10.0's narrow
+# botocore range on rebuild. Pinning skips the walk. python-dotenv
+# pinned for the same reason at lower cost.
+boto3==1.41.5
+python-dotenv==1.2.3
+
+# System monitoring
+psutil
+
+# Data + ML: imported by phase3/ modules that webui/app.py pulls in via
+# sys.path at startup. Pin pyarrow for parity with the on-box precompute
+# venv (/opt/transit-ai/.venv, container's Python 3.12.14 exact match --
+# see learnings.md). Pin s3fs at the archive's version.
+pandas
+pyarrow==25.0.1
+s3fs==2025.10.0
+xgboost
+scikit-learn
+rapidfuzz
+joblib
+requests
+gtfs-realtime-bindings

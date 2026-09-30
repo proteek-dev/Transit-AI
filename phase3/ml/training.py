@@ -69,6 +69,15 @@ def _reset_mem_checkpoints() -> None:
     _mem_checkpoints.clear()
 
 
+def _train_sample_frac() -> float:
+    """TRAIN_SAMPLE_FRAC, falling back to the legacy DEBUG_SAMPLE_FRAC name so
+    old invocations still work. 1.0 = no sampling."""
+    frac = float(os.environ.get('TRAIN_SAMPLE_FRAC', os.environ.get('DEBUG_SAMPLE_FRAC', '1.0')))
+    if not 0 < frac <= 1:
+        raise ValueError(f'TRAIN_SAMPLE_FRAC must be in (0, 1], got {frac}')
+    return frac
+
+
 def _mae(y_true, y_pred) -> float:
     """Mean absolute error (notebook 07 Cells 8/8b). `y_pred` may be a
     per-row array (model predictions) or a single scalar broadcast across
@@ -95,11 +104,12 @@ def _load_training_frames():
     run_date = manifest['latest_run']
     print(f'Loading training snapshot: run_date={run_date}')
 
-    # --- Debug-only: sample down each partition as it's read, so the entire
-    # downstream path (dtype optimization, DMatrix construction, fit, save)
-    # runs against a small dataset in seconds instead of the full ~94M-row
-    # snapshot. Unset (or 1.0) means full data -- the default, normal path.
-    debug_sample_frac = float(os.environ.get('DEBUG_SAMPLE_FRAC', 1.0))
+    # --- Memory-reduction lever: sample down each partition as it's read,
+    # before dtype optimization / leak filter / concat, so every downstream
+    # full-frame op (concat, categorical cast, X_train/X_test .copy(), DMatrix,
+    # fit) runs on the reduced row count. Not debug-only -- a sampled run
+    # saves a real model. Unset (or 1.0) means full data, the default path.
+    train_sample_frac = _train_sample_frac()
 
     def _optimize_dtypes(chunk: pd.DataFrame) -> pd.DataFrame:
         """Same float64->float32 downcast + category casts as before, just
@@ -221,8 +231,8 @@ def _load_training_frames():
         chunk = pd.read_parquet(f's3://{partition_prefix}/source_date={d}/')
         chunk['source_date'] = d
         n_chunk_loaded = len(chunk)
-        if debug_sample_frac < 1.0:
-            chunk = chunk.sample(frac=debug_sample_frac, random_state=42)
+        if train_sample_frac < 1.0:
+            chunk = chunk.sample(frac=train_sample_frac, random_state=42)
         rows_loaded += n_chunk_loaded
         rows_after_sample_total += len(chunk)
 
@@ -257,8 +267,8 @@ def _load_training_frames():
         chunk = pd.read_parquet(f's3://{partition_prefix}/source_date={d}/')
         chunk['source_date'] = d
         n_chunk_loaded = len(chunk)
-        if debug_sample_frac < 1.0:
-            chunk = chunk.sample(frac=debug_sample_frac, random_state=42)
+        if train_sample_frac < 1.0:
+            chunk = chunk.sample(frac=train_sample_frac, random_state=42)
         rows_loaded += n_chunk_loaded
         rows_after_sample_total += len(chunk)
 
@@ -279,8 +289,8 @@ def _load_training_frames():
     print(f'Loaded {rows_loaded:,} rows total ({len(pre_cutoff_dates):,} pre-cutoff date(s) + '
           f'{len(post_cutoff_dates):,} post-cutoff date(s))')
     print(f'[ROW ACCOUNTING] 1. Loaded from ferry-filtered S3 snapshot: {rows_loaded:,} rows')
-    if debug_sample_frac < 1.0:
-        print(f'[ROW ACCOUNTING] 1b. Debug sample active (frac={debug_sample_frac}) -- applied per partition above')
+    if train_sample_frac < 1.0:
+        print(f'[ROW ACCOUNTING] 1b. Train sample active (frac={train_sample_frac}) -- applied per partition above')
     rows_before_leakage_filter = rows_loaded
 
     # Single concat of every per-date chunk (pre-cutoff + post-cutoff)
@@ -390,8 +400,8 @@ def _load_training_frames():
     print('Row accounting: loaded -> final train/test split')
     print('=' * 70)
     print(f'  1. Rows loaded from ferry-filtered snapshot : {rows_loaded:,}')
-    if debug_sample_frac < 1.0:
-        print(f'  1b. After debug sample (frac={debug_sample_frac})     : '
+    if train_sample_frac < 1.0:
+        print(f'  1b. After train sample (frac={train_sample_frac})     : '
               f'{rows_after_sample_total:,} ({rows_loaded - rows_after_sample_total:,} dropped by sampling)')
     print(f'  2. After leakage filter                     : {rows_after_leakage_filter:,} '
           f'({rows_after_sample_total - rows_after_leakage_filter:,} dropped)')
@@ -409,7 +419,8 @@ def _load_training_frames():
     # fit time, so inference-time categorical columns can be reconstructed
     # identically (XGBoost's categorical splits are keyed on these codes).
     categories = {c: X_train[c].cat.categories.tolist() for c in CATEGORICAL_COLS}
-    return X_train, y_train, X_test, y_test, categories, data_window_start, data_window_end, data_window_days
+    return (X_train, y_train, X_test, y_test, categories, data_window_start, data_window_end,
+            data_window_days, rows_loaded, rows_after_sample_total)
 
 
 def _find_best_matching_static_snapshot(train_route_ids: set):
@@ -450,6 +461,8 @@ def _build_training_metadata(
     data_window_start: str,
     data_window_end: str,
     data_window_days: int,
+    rows_loaded: int,
+    rows_after_sample_total: int,
     mem_checkpoints: list[tuple[str, float]],
 ) -> dict:
     """Coverage counts per (route_short_name, mode), used by predict_delay()
@@ -503,6 +516,8 @@ def _build_training_metadata(
         'data_window_start': data_window_start,
         'data_window_end': data_window_end,
         'data_window_days': data_window_days,
+        'rows_loaded': rows_loaded,
+        'rows_after_sample_total': rows_after_sample_total,
         'peak_rss_mb': peak_rss_mb,
         'rss_at_categorical_cast_mb': _checkpoint_rss('after feature dtype cast (pre-split)'),
         'rss_at_x_train_build_mb': _checkpoint_rss('after building X_train'),
@@ -514,9 +529,8 @@ def _build_training_metadata(
 def _train_and_save_model() -> None:
     _reset_mem_checkpoints()
     print('No saved model found — training v0 XGBoost model from the S3 feature snapshot...')
-    X_train, y_train, X_test, y_test, categories, data_window_start, data_window_end, data_window_days = (
-        _load_training_frames()
-    )
+    (X_train, y_train, X_test, y_test, categories, data_window_start, data_window_end,
+     data_window_days, rows_loaded, rows_after_sample_total) = _load_training_frames()
 
     model = xgb.XGBRegressor(
         enable_categorical=True,
@@ -564,6 +578,7 @@ def _train_and_save_model() -> None:
     training_metadata = _build_training_metadata(
         X_train, train_mae, test_mae, naive_mae, pct_improvement_over_naive,
         data_window_start, data_window_end, data_window_days,
+        rows_loaded, rows_after_sample_total,
         list(_mem_checkpoints),
     )
 
@@ -576,4 +591,13 @@ def _train_and_save_model() -> None:
     print(f'Saved categorical mappings to {CATEGORIES_PATH.name}')
     print(f'Saved training coverage metadata to {TRAINING_METADATA_PATH.name}')
 
-    _upload_model_to_s3()
+    # Memory-test runs (pipeline/02_train_model_capped.sh) keep artifacts local.
+    if os.environ.get('TRAIN_SKIP_S3_UPLOAD') == '1':
+        print('TRAIN_SKIP_S3_UPLOAD=1 -- skipping S3 upload; artifacts are local only.')
+    else:
+        _upload_model_to_s3()
+
+    train_sample_frac = _train_sample_frac()
+    if train_sample_frac < 1.0:
+        print(f'WARNING: TRAIN_SAMPLE_FRAC={train_sample_frac} — vocabulary built from sample, '
+              f'rare categories may be OOV at inference.')

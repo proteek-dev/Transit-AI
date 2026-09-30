@@ -34,11 +34,38 @@ heartbeat() {
     done
 }
 
+# Kills the training process if its RSS exceeds TRAIN_RSS_CAP_GB, so a
+# runaway run self-terminates instead of swapping the machine. (ulimit -v is
+# not enforceable on macOS -- "cannot modify limit: Invalid argument".)
+rss_watchdog() {
+    local pid="$1" cap_gb="$2" rss_kb rss_gb
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 5
+        rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+        [ -n "$rss_kb" ] || return 0   # process finished between checks
+        # ps reports RSS in KiB; 1048576 KiB = 1 GiB.
+        if awk -v kb="$rss_kb" -v cap="$cap_gb" 'BEGIN { exit !(kb / 1048576 > cap) }'; then
+            rss_gb=$(awk -v kb="$rss_kb" 'BEGIN { printf "%.2f", kb / 1048576 }')
+            log "RSS CAP HIT: ${rss_gb}GB > ${cap_gb}GB, killing"
+            kill -TERM "$pid" 2>/dev/null
+            sleep 10
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+            return 0
+        fi
+    done
+}
+
 fail() { log "❌ FAILED: $1 — see $LOG. Aborting. runs/ and latest/ are untouched; an abandoned phase3/model/${STAGING_SUBDIR:-_staging_*}/ folder may remain and can be deleted."; exit 1; }
 
 log "=========================================="
 log "Train model started. Logging to: $LOG"
 log "=========================================="
+
+TRAIN_RSS_CAP_GB="${TRAIN_RSS_CAP_GB:-}"
+if [ -n "$TRAIN_RSS_CAP_GB" ]; then
+    [[ "$TRAIN_RSS_CAP_GB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || fail "TRAIN_RSS_CAP_GB must be a number of GB, got '${TRAIN_RSS_CAP_GB}'"
+    log "RSS watchdog enabled: training will be killed above ${TRAIN_RSS_CAP_GB}GB RSS (polled every 5s)"
+fi
 
 # ── Step 1/3: determine run_id from current Brisbane date/time ──────────────
 log "STEP 1/3: Determining run_id (Australia/Brisbane date/time)"
@@ -62,9 +89,15 @@ MODEL_SUBDIR_OVERRIDE="$STAGING_SUBDIR" python3 -u phase3/prediction.py >> "$LOG
 RETRAIN_PID=$!
 heartbeat "$RETRAIN_PID" "Retrain" &
 HB_PID=$!
+WD_PID=""
+if [ -n "$TRAIN_RSS_CAP_GB" ]; then
+    rss_watchdog "$RETRAIN_PID" "$TRAIN_RSS_CAP_GB" &
+    WD_PID=$!
+fi
 
 wait "$RETRAIN_PID"; RETRAIN_EXIT=$?
 kill "$HB_PID" 2>/dev/null
+[ -n "$WD_PID" ] && kill "$WD_PID" 2>/dev/null
 
 [ "$RETRAIN_EXIT" -eq 0 ] || fail "model retrain (exit code $RETRAIN_EXIT)"
 
