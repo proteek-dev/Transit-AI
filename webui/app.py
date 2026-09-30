@@ -38,7 +38,6 @@ PHASE3_DIR = REPO_ROOT / 'phase3'
 S3_BUCKET_ENV_VAR = 'AWS_S3_BUCKET'
 MODEL_SUBDIR = os.environ.get('MODEL_SUBDIR_OVERRIDE', 'latest')
 S3_METADATA_KEY = f'phase3/model/{MODEL_SUBDIR}/training_metadata.json'
-S3_FEATURE_MANIFEST_KEY = 'ml_features/v0_feature_snapshot/_latest.json'
 
 UNKNOWN = 'unknown'
 
@@ -139,7 +138,6 @@ async def lifespan(app: FastAPI):
     logger.info('[webui] load_model patched to return cached instance')
 
     app.state.training_metadata = _fetch_s3_json_or_none(S3_METADATA_KEY, 'training_metadata.json')
-    app.state.features_manifest = _fetch_s3_json_or_none(S3_FEATURE_MANIFEST_KEY, 'features _latest.json')
 
     logger.info('[webui] ready')
     yield
@@ -175,12 +173,8 @@ def _model_trained(state) -> str:
 
 
 def _features_through(state) -> str:
-    # Falls back to the model's training-window end when the features manifest
-    # couldn't be fetched (expected in prod: EC2 role lacks GetObject on it).
-    manifest = getattr(state, 'features_manifest', None)
-    if manifest is not None:
-        date_range = manifest.get('source_date_range') or []
-        return max(date_range) if date_range else UNKNOWN
+    # The model's training-window end. The features manifest isn't fetched
+    # (the EC2 role lacks GetObject on it), so this is the closest date.
     metadata = getattr(state, 'training_metadata', None) or {}
     return metadata.get('data_window_end') or UNKNOWN
 
@@ -297,13 +291,6 @@ def _model_stats(state) -> dict | None:
     if metadata is None:
         return None
 
-    # features_through keeps the archived semantics -- null when the features
-    # manifest couldn't be fetched. (The page footer's _features_through()
-    # falls back to data_window_end instead; the API deliberately doesn't.)
-    manifest = getattr(state, 'features_manifest', None) or {}
-    date_range = manifest.get('source_date_range') or []
-    features_through = max(date_range) if date_range else None
-
     # The archived backend read this from gtfs_static_optimized/latest/_manifest.json;
     # webui reports the snapshot date of the GTFS actually loaded in memory.
     gtfs = getattr(state, 'gtfs', None)
@@ -322,7 +309,10 @@ def _model_stats(state) -> dict | None:
             'end': metadata.get('data_window_end'),
         },
         'data_snapshot': {
-            'features_through': features_through,
+            # Kept for the archived API shape; always null now that the
+            # features manifest isn't fetched. (The page footer's
+            # _features_through() uses data_window_end instead.)
+            'features_through': None,
             'model_trained_through': metadata.get('data_window_end'),
             'gtfs_static_snapshot': gtfs_static_snapshot,
             'graph_status': _graph_status(gtfs),
