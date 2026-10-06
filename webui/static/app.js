@@ -601,8 +601,12 @@
 
   let _livePollTimerId = null; // the single setInterval handle; null when not running
   let _liveCurrentTripIds = []; // the rendered route's pollable trip_ids, sorted
-  // trip_id -> {leg, icon, y, cum, anchors}, rebuilt by every timeline render.
+  // trip_id -> {leg, icon, y, cum, anchors, stopProgress, nodeEls}, rebuilt by
+  // every timeline render.
   let _liveLegs = new Map();
+  // trip_id -> last applied 0..1 progress. Outside _liveLegs so a re-render
+  // (resize) can restore stop states without waiting for the next poll.
+  let _liveLastProgress = new Map();
   // Bumped per startLivePolling(); a response for an older route is dropped.
   let _liveGeneration = 0;
 
@@ -615,24 +619,62 @@
   // Shape cumulative lengths (planar degrees, like nearestPointOnShape) and
   // the leg's stops as {progress, x} anchors, progress forced non-decreasing.
   // Stops without coords are skipped; under two usable anchors, the leg's
-  // first and last stops pin the shape's two ends.
+  // first and last stops pin the shape's two ends. stopProgress is the same
+  // per-stop progress as a 0..1 fraction of the shape, keyed by timeline node.
   function liveLegLayout(shape, stops) {
     const cum = [0];
     for (let i = 1; i < shape.length; i++) {
       cum.push(cum[i - 1] + Math.hypot(shape[i][0] - shape[i - 1][0], shape[i][1] - shape[i - 1][1]));
     }
+    const total = cum[cum.length - 1];
     let anchors = [];
-    for (const { x, stop } of stops) {
+    const stopProgress = [];
+    for (const { x, stop, nodeIndex } of stops) {
       const proj = Number.isFinite(stop.lat) && Number.isFinite(stop.lon)
         ? nearestPointOnShape(stop.lat, stop.lon, shape) : null;
       if (!proj) continue;
       const progress = Math.max(shapeProgress(cum, proj), anchors.length ? anchors[anchors.length - 1].progress : 0);
       anchors.push({ progress, x });
+      if (total > 0) stopProgress.push({ nodeIndex, progress: progress / total });
     }
     if (anchors.length < 2) {
-      anchors = [{ progress: 0, x: stops[0].x }, { progress: cum[cum.length - 1], x: stops[stops.length - 1].x }];
+      anchors = [{ progress: 0, x: stops[0].x }, { progress: total, x: stops[stops.length - 1].x }];
     }
-    return { cum, anchors };
+    return { cum, anchors, stopProgress };
+  }
+
+  // A vehicle's progress along its leg as a 0..1 fraction of the shape.
+  function legFraction(live, proj) {
+    const total = live.cum[live.cum.length - 1];
+    return total > 0 ? shapeProgress(live.cum, proj) / total : 0;
+  }
+
+  const STOP_STATES = ['state-passed', 'state-next', 'state-future'];
+  const STOP_STATE_APPROACH = 0.01; // at or below: still at/before the origin (the shape[0] clamp) -- no state
+  const STOP_STATE_LAG = 0.01; // classify a little behind the fix, nearer the tweening icon
+  const STOP_STATE_PASS_MARGIN = 0.02; // a stop is passed once the bus is this far beyond it
+
+  // Passed / next / future on the leg's stop nodes from the bus's fraction
+  // along the shape. Classes only: CSS decides which node kinds show them.
+  // Stops without coords (no stopProgress entry) keep their default look.
+  function _applyStopStates(tripId, progress) {
+    const live = _liveLegs.get(tripId);
+    if (!live) return;
+    for (const el of live.nodeEls.values()) el.classList.remove(...STOP_STATES);
+    if (!(progress > STOP_STATE_APPROACH)) return;
+    const compare = progress - STOP_STATE_LAG;
+    let nextFound = false;
+    for (const { nodeIndex, progress: stopProg } of live.stopProgress) {
+      const el = live.nodeEls.get(nodeIndex);
+      if (!el) continue;
+      let state = 'state-future';
+      if (stopProg + STOP_STATE_PASS_MARGIN < compare) state = 'state-passed';
+      else if (!nextFound) {
+        state = 'state-next';
+        nextFound = true;
+      }
+      el.classList.add(state);
+    }
   }
 
   function shapeProgress(cum, proj) {
@@ -706,14 +748,19 @@
   }
 
   // Back to the Pass 9 placeholder: rest position, full opacity (hidden for
-  // a later leg). Jumps, no tween.
-  function _hideVehicleIcon(iconEl) {
+  // a later leg). Jumps, no tween. With a tripId, also drops that leg's stop
+  // states so a lost fix doesn't leave stale "passed" marks.
+  function _hideVehicleIcon(iconEl, tripId) {
     placeWithoutTween(iconEl, () => {
       iconEl.style.display = iconEl.dataset.restHidden === 'true' ? 'none' : '';
       iconEl.style.transform = `translate(${iconEl.dataset.restX}px, ${iconEl.dataset.restY}px)`;
       iconEl.style.setProperty('--vehicle-opacity', '1');
     });
     delete iconEl.dataset.live;
+    if (tripId) {
+      _liveLastProgress.delete(tripId);
+      _applyStopStates(tripId, 0);
+    }
   }
 
   async function _pollLiveVehicles() {
@@ -744,13 +791,16 @@
       const age = vehicle ? vehicle.age_seconds : Infinity;
       // No fix, off its own shape, or past the server's 120s cut (defensive).
       if (!proj || proj.distanceSq > MAX_PROJECTION_DISTSQ_DEG || age > LIVE_STALE_HIDE_SECONDS) {
-        _hideVehicleIcon(iconEl);
+        _hideVehicleIcon(iconEl, tripId);
         continue;
       }
       // Negative age (clock skew) lands in the fresh band.
       const opacity = age <= LIVE_STALE_DIM_SECONDS ? 1 : LIVE_DIM_OPACITY;
       const { svgX, svgY } = _latLonToSvgCoords(proj, live);
       _setVehiclePosition(iconEl, svgX, svgY, opacity);
+      const progress = legFraction(live, proj);
+      _liveLastProgress.set(tripId, progress);
+      _applyStopStates(tripId, progress);
     }
   }
 
@@ -768,6 +818,7 @@
   function startLivePolling(tripIds) {
     const next = [...new Set(tripIds)].sort();
     if (_livePollTimerId !== null && next.join(',') === _liveCurrentTripIds.join(',')) return;
+    if (next.join(',') !== _liveCurrentTripIds.join(',')) _liveLastProgress = new Map();
     _liveCurrentTripIds = next;
     _liveGeneration++;
     startLiveTimer();
@@ -1522,10 +1573,10 @@
     // Each pollable leg is registered in _liveLegs for _pollLiveVehicles().
     function drawVehicles() {
       const y = TL_BASELINE - r - 3 - TL_VEHICLE_SIZE / 2; // icon centre, same spot as Pass 9
-      // Per leg, its stops' timeline x in order: [{x, stop}, ...].
+      // Per leg, its stops' timeline x in order: [{x, stop, nodeIndex}, ...].
       const legStops = route.legs.map(() => []);
       nodes.forEach((node, i) => node.legRefs.forEach((legIndex, k) => {
-        legStops[legIndex].push({ x: xs[i], stop: node.stops[k] });
+        legStops[legIndex].push({ x: xs[i], stop: node.stops[k], nodeIndex: i });
       }));
       route.legs.forEach((leg, legIndex) => {
         const pollable = isLivePollable(leg);
@@ -1533,7 +1584,16 @@
         const icon = buildVehicleIcon(leg.mode, legStops[legIndex][0].x, y, legIndex > 0);
         if (!icon) return;
         svg.append(icon);
-        if (pollable) _liveLegs.set(leg.trip_id, { leg, icon, y, ...liveLegLayout(leg.shape, legStops[legIndex]) });
+        if (!pollable) return;
+        // The leg's node <g>s, for _applyStopStates; "next" pulses in the leg's mode colour.
+        const nodeEls = new Map();
+        for (const { nodeIndex } of legStops[legIndex]) {
+          const el = svg.querySelector(`#tl-node-${nodeIndex}`);
+          if (!el) continue;
+          el.style.setProperty('--next-color', modeFill(leg.mode));
+          nodeEls.set(nodeIndex, el);
+        }
+        _liveLegs.set(leg.trip_id, { leg, icon, y, nodeEls, ...liveLegLayout(leg.shape, legStops[legIndex]) });
       });
     }
 
@@ -1603,6 +1663,9 @@
       svg.append(svgEl('line', { x1: TL_PAD, y1: TL_BASELINE, x2: width - TL_PAD, y2: TL_BASELINE, class: 'timeline-line' }));
       nodes.forEach((node, i) => drawNode(node, i, spacing));
       drawVehicles();
+      // A re-render (resize) rebuilds every node: restore stop states from the
+      // last poll rather than leaving them blank for up to 30s.
+      for (const [tripId, progress] of _liveLastProgress) _applyStopStates(tripId, progress);
       drawLabels(width);
 
       // One Tab stop; arrows move the active stop (aria-activedescendant).

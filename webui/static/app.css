@@ -1230,6 +1230,39 @@ body[data-page="search"] .footer {
   }
 }
 
+/* Pass 11 stop state from the live bus's progress along its leg. app.js
+   sets the state-* class and --next-color (the leg's mode) on each node <g>;
+   only intermediate .timeline-stop dots restyle. fill-box keeps the pulse
+   scaling around the dot itself, not the SVG's origin. */
+.timeline-node.state-passed .timeline-stop {
+  fill: var(--text-tertiary);
+  opacity: 0.35;
+}
+
+.timeline-node.state-next .timeline-stop {
+  fill: var(--next-color, var(--mode-bus));
+  r: 5;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: tl-stop-pulse 1.8s ease-in-out infinite;
+}
+
+.timeline-node.state-future .timeline-stop {
+  fill: var(--text-tertiary);
+  opacity: 1;
+}
+
+@keyframes tl-stop-pulse {
+  0%, 100% { transform: scale(1); filter: drop-shadow(0 0 0 var(--next-color, var(--mode-bus))); }
+  50% { transform: scale(1.25); filter: drop-shadow(0 0 4px var(--next-color, var(--mode-bus))); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .timeline-node.state-next .timeline-stop {
+    animation: none;
+  }
+}
+
 .timeline-popover {
   transform: translate(-50%, -100%);
   white-space: nowrap;
