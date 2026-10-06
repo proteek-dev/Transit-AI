@@ -1207,6 +1207,29 @@ body[data-page="search"] .footer {
   filter: drop-shadow(0 0 3px color-mix(in srgb, currentColor 55%, transparent));
 }
 
+/* Pass 10 live vehicle: the <g> around .timeline-vehicle. app.js sets
+   transform, --vehicle-opacity and --vehicle-tween (CSS_TWEEN_MS) inline.
+   Linear, not eased: the vehicle covers a real path at roughly constant
+   speed. */
+.timeline-vehicle-live {
+  transform-box: view-box;
+  opacity: var(--vehicle-opacity, 1);
+  transition:
+    transform var(--vehicle-tween, 0ms) linear,
+    opacity var(--vehicle-tween, 0ms) linear;
+}
+
+/* First fix / back to the placeholder: jump, don't tween. */
+.timeline-vehicle-live.is-jump {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .timeline-vehicle-live {
+    transition: none;
+  }
+}
+
 .timeline-popover {
   transform: translate(-50%, -100%);
   white-space: nowrap;

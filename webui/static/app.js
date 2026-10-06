@@ -534,6 +534,266 @@
     return Math.floor((target - now) / 60000);
   }
 
+  // ── Shape projection (live vehicles) ────────────────────────
+  // Snaps a GTFS-RT vehicle position onto a leg's shape. leg.shape is
+  // [[lat, lon], ...] (webui/app.py _leg_shape) and is read in that order.
+  //
+  // Planar math: lat/lon are treated as flat x/y. Over an SEQ corridor
+  // (<200 km N-S) the nearest-point error against great-circle is far
+  // below GTFS-RT positional noise, so no haversine here. distanceSq is
+  // in squared degrees, comparable only with other planar results.
+  //
+  // Pure: no DOM, globals, timers or logging. Returns
+  // {lat, lon, segmentIndex, t, distanceSq} for the nearest point, where the
+  // winning segment is shape[segmentIndex] -> shape[segmentIndex + 1] and t
+  // is 0..1 along it. null for a non-finite lat/lon, a shape with < 2
+  // points, or one whose segments are all zero-length.
+  function nearestPointOnShape(lat, lon, shape) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    if (!Array.isArray(shape) || shape.length < 2) return null;
+
+    let best = null;
+    for (let i = 0; i < shape.length - 1; i++) {
+      const [lat1, lon1] = shape[i];
+      const [lat2, lon2] = shape[i + 1];
+      const vLat = lat2 - lat1;
+      const vLon = lon2 - lon1;
+      const vv = vLat * vLat + vLon * vLon;
+      if (!(vv > 0)) continue; // zero-length segment (or non-numeric point)
+
+      const t = Math.min(1, Math.max(0, ((lat - lat1) * vLat + (lon - lon1) * vLon) / vv));
+      const nLat = lat1 + t * vLat;
+      const nLon = lon1 + t * vLon;
+      const distanceSq = (lat - nLat) ** 2 + (lon - nLon) ** 2;
+      if (best === null || distanceSq < best.distanceSq) {
+        best = { lat: nLat, lon: nLon, segmentIndex: i, t, distanceSq };
+      }
+    }
+    return best;
+  }
+
+  // ── Live vehicles (Pass 10) ─────────────────────────────────
+  // Polls /live_vehicles for the active route's trips, snaps each vehicle
+  // onto its leg's shape and slides that leg's timeline icon there.
+  //
+  // The timeline is a schematic: stops sit at equal spacing in sequence
+  // order, not by geography. So a fix is placed by its progress along the
+  // shape (segmentIndex + t -> cumulative length), interpolated between the
+  // timeline x of the two stops it falls between (liveLegLayout).
+  //
+  // Declared above the page switch: load() calls stopLivePolling() before
+  // its first await, so this state must already be initialised.
+
+  const LIVE_POLL_INTERVAL_MS = 30000; // 30s poll, matches locked spec
+  const LIVE_STALE_DIM_SECONDS = 90; // 0-90s: full opacity
+  const LIVE_STALE_HIDE_SECONDS = 120; // 90-120s: dimmed; >120s: hidden
+  const LIVE_DIM_OPACITY = 0.5; // visual for the 90-120s band
+  // Planar squared-degree threshold (nearestPointOnShape's distanceSq). At
+  // ~28°S, 0.02° ≈ 2.2 km north-south and ≈ 1.95 km east-west, so 0.0004
+  // (0.02²) is roughly a 2 km envelope around the polyline. Anything further
+  // from its own trip's shape is treated as no live position (wrong trip
+  // match or GPS glitch) and the icon falls back to the Pass 9 placeholder.
+  const MAX_PROJECTION_DISTSQ_DEG = 0.0004;
+  const CSS_TWEEN_MS = 29500; // a little under the poll so a move finishes before the next one
+
+  // No icon rotation: shipped, then reversed after Chrome QA — front-view
+  // icons flip on N-S routes. Reasoning in pass-10.md; don't re-add it.
+
+  let _livePollTimerId = null; // the single setInterval handle; null when not running
+  let _liveCurrentTripIds = []; // the rendered route's pollable trip_ids, sorted
+  // trip_id -> {leg, icon, y, cum, anchors}, rebuilt by every timeline render.
+  let _liveLegs = new Map();
+  // Bumped per startLivePolling(); a response for an older route is dropped.
+  let _liveGeneration = 0;
+
+  // Legs without a shape or trip_id are never polled: they keep the static
+  // placeholder (first leg) or no icon (later legs).
+  function isLivePollable(leg) {
+    return Array.isArray(leg.shape) && leg.shape.length >= 2 && Boolean(leg.trip_id);
+  }
+
+  // Shape cumulative lengths (planar degrees, like nearestPointOnShape) and
+  // the leg's stops as {progress, x} anchors, progress forced non-decreasing.
+  // Stops without coords are skipped; under two usable anchors, the leg's
+  // first and last stops pin the shape's two ends.
+  function liveLegLayout(shape, stops) {
+    const cum = [0];
+    for (let i = 1; i < shape.length; i++) {
+      cum.push(cum[i - 1] + Math.hypot(shape[i][0] - shape[i - 1][0], shape[i][1] - shape[i - 1][1]));
+    }
+    let anchors = [];
+    for (const { x, stop } of stops) {
+      const proj = Number.isFinite(stop.lat) && Number.isFinite(stop.lon)
+        ? nearestPointOnShape(stop.lat, stop.lon, shape) : null;
+      if (!proj) continue;
+      const progress = Math.max(shapeProgress(cum, proj), anchors.length ? anchors[anchors.length - 1].progress : 0);
+      anchors.push({ progress, x });
+    }
+    if (anchors.length < 2) {
+      anchors = [{ progress: 0, x: stops[0].x }, { progress: cum[cum.length - 1], x: stops[stops.length - 1].x }];
+    }
+    return { cum, anchors };
+  }
+
+  function shapeProgress(cum, proj) {
+    const i = proj.segmentIndex;
+    return cum[i] + proj.t * (cum[i + 1] - cum[i]);
+  }
+
+  // Sequence-based, not geographic (see the section comment): takes the
+  // projection rather than a bare lat/lon, since segmentIndex + t is what
+  // locates the fix along the shape.
+  function _latLonToSvgCoords(proj, live) {
+    const { anchors, y } = live;
+    const p = shapeProgress(live.cum, proj);
+    if (p <= anchors[0].progress) return { svgX: anchors[0].x, svgY: y };
+    for (let k = 1; k < anchors.length; k++) {
+      const a = anchors[k - 1];
+      const b = anchors[k];
+      if (p <= b.progress) {
+        const span = b.progress - a.progress;
+        return { svgX: span > 0 ? a.x + ((p - a.progress) / span) * (b.x - a.x) : b.x, svgY: y };
+      }
+    }
+    return { svgX: anchors[anchors.length - 1].x, svgY: y };
+  }
+
+  // The mode icon inside a <g>: Pass 9's icon is a nested <svg>, and CSS
+  // transforms on a nested <svg> aren't reliably applied (Chrome), so the
+  // <g> carries the translate. The icon is centred on the <g>'s origin.
+  // null for a mode with no icon.
+  function buildVehicleIcon(mode, restX, restY, hiddenAtRest) {
+    const icon = window.TransitIcons ? window.TransitIcons.modeIcon(mode, `timeline-vehicle mode-${mode}`) : null;
+    if (!icon) return null;
+    icon.setAttribute('x', String(-TL_VEHICLE_SIZE / 2));
+    icon.setAttribute('y', String(-TL_VEHICLE_SIZE / 2));
+    icon.setAttribute('width', String(TL_VEHICLE_SIZE));
+    icon.setAttribute('height', String(TL_VEHICLE_SIZE));
+    const g = svgEl('g', { class: 'timeline-vehicle-live' });
+    g.dataset.restX = String(restX);
+    g.dataset.restY = String(restY);
+    g.dataset.restHidden = String(hiddenAtRest);
+    g.style.setProperty('--vehicle-tween', `${CSS_TWEEN_MS}ms`);
+    g.append(icon);
+    _hideVehicleIcon(g);
+    return g;
+  }
+
+  // null when the route was re-rendered and the icon is gone.
+  function _getTimelineLegElement(tripId) {
+    const live = _liveLegs.get(tripId);
+    return live && live.icon.isConnected ? live.icon : null;
+  }
+
+  // Apply without the tween: flush styles with the tween off, then restore.
+  function placeWithoutTween(iconEl, apply) {
+    iconEl.classList.add('is-jump');
+    apply();
+    iconEl.getBoundingClientRect();
+    iconEl.classList.remove('is-jump');
+  }
+
+  function _setVehiclePosition(iconEl, svgX, svgY, opacity) {
+    const apply = () => {
+      iconEl.style.display = '';
+      iconEl.style.transform = `translate(${svgX}px, ${svgY}px)`;
+      iconEl.style.setProperty('--vehicle-opacity', String(opacity));
+    };
+    // First fix since resting: jump there rather than crawl from the origin.
+    if (iconEl.dataset.live === 'true') apply();
+    else placeWithoutTween(iconEl, apply);
+    iconEl.dataset.live = 'true';
+  }
+
+  // Back to the Pass 9 placeholder: rest position, full opacity (hidden for
+  // a later leg). Jumps, no tween.
+  function _hideVehicleIcon(iconEl) {
+    placeWithoutTween(iconEl, () => {
+      iconEl.style.display = iconEl.dataset.restHidden === 'true' ? 'none' : '';
+      iconEl.style.transform = `translate(${iconEl.dataset.restX}px, ${iconEl.dataset.restY}px)`;
+      iconEl.style.setProperty('--vehicle-opacity', '1');
+    });
+    delete iconEl.dataset.live;
+  }
+
+  async function _pollLiveVehicles() {
+    if (_liveCurrentTripIds.length === 0) return;
+    const generation = _liveGeneration;
+    let body;
+    try {
+      const resp = await fetch(`/live_vehicles?trip_ids=${encodeURIComponent(_liveCurrentTripIds.join(','))}`);
+      if (!resp.ok) {
+        console.warn(`[live] /live_vehicles returned ${resp.status}; keeping last positions`);
+        return;
+      }
+      body = await resp.json();
+    } catch (err) {
+      console.warn('[live] /live_vehicles failed; keeping last positions', err);
+      return;
+    }
+    if (generation !== _liveGeneration) return; // a different route rendered meanwhile
+    const vehicles = (body && body.vehicles) || {};
+
+    for (const tripId of _liveCurrentTripIds) {
+      const live = _liveLegs.get(tripId);
+      const iconEl = _getTimelineLegElement(tripId);
+      if (!live || !iconEl) continue;
+
+      const vehicle = vehicles[tripId];
+      const proj = vehicle ? nearestPointOnShape(vehicle.lat, vehicle.lon, live.leg.shape) : null;
+      const age = vehicle ? vehicle.age_seconds : Infinity;
+      // No fix, off its own shape, or past the server's 120s cut (defensive).
+      if (!proj || proj.distanceSq > MAX_PROJECTION_DISTSQ_DEG || age > LIVE_STALE_HIDE_SECONDS) {
+        _hideVehicleIcon(iconEl);
+        continue;
+      }
+      // Negative age (clock skew) lands in the fresh band.
+      const opacity = age <= LIVE_STALE_DIM_SECONDS ? 1 : LIVE_DIM_OPACITY;
+      const { svgX, svgY } = _latLonToSvgCoords(proj, live);
+      _setVehiclePosition(iconEl, svgX, svgY, opacity);
+    }
+  }
+
+  // Poll now (first paint shouldn't wait 30s), then every 30s. Idempotent.
+  function startLiveTimer() {
+    clearInterval(_livePollTimerId);
+    _livePollTimerId = null;
+    if (_liveCurrentTripIds.length === 0) return;
+    _pollLiveVehicles();
+    _livePollTimerId = setInterval(_pollLiveVehicles, LIVE_POLL_INTERVAL_MS);
+  }
+
+  // Idempotent: the same trips with the timer already running is a no-op —
+  // no extra immediate poll, no timer restart.
+  function startLivePolling(tripIds) {
+    const next = [...new Set(tripIds)].sort();
+    if (_livePollTimerId !== null && next.join(',') === _liveCurrentTripIds.join(',')) return;
+    _liveCurrentTripIds = next;
+    _liveGeneration++;
+    startLiveTimer();
+  }
+
+  function stopLivePolling() {
+    clearInterval(_livePollTimerId);
+    _livePollTimerId = null;
+  }
+
+  // Same lifecycle as the contextual-pill timer: pagehide stops it; a
+  // back/forward-cache restore (pageshow, persisted) restarts it for the
+  // trips already on screen. Registered once, here, not per route.
+  function _handleVisibilityChange(event) {
+    if (event.type === 'pagehide') stopLivePolling();
+    else if (event.type === 'pageshow' && event.persisted) startLiveTimer();
+  }
+
+  window.addEventListener('pagehide', _handleVisibilityChange);
+  window.addEventListener('pageshow', _handleVisibilityChange);
+
+  // Same namespace pattern as icons.js's window.TransitIcons.
+  window.TransitAI = {
+    nearestPointOnShape, startLivePolling, stopLivePolling, _handleVisibilityChange, _testPass10Projection,
+  };
+
   // ── Page switch ─────────────────────────────────────────────
   // base.html sets <body data-page>. Exactly one page mode runs: the search
   // page never renders results, the results page never builds pickers.
@@ -1074,8 +1334,8 @@
 
   // ══ Station timeline (results page) ═════════════════════════
   // Inline SVG built through DOM APIs (no markup strings), like icons.js.
-  // Static in Pass 9: the vehicle icon sits on the first leg's origin; Pass
-  // 10 swaps in a real GTFS-RT position — no timers or polling here.
+  // The vehicle icon rests on the first leg's origin (Pass 9); the Pass 10
+  // live poll (above the page switch) moves it — no timers or polling here.
 
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const MODE_VAR = { bus: '--mode-bus', tram: '--mode-tram', rail: '--mode-rail' };
@@ -1128,6 +1388,7 @@
             && sameStation(prev.stops[0], stop)) {
           prev.stops.push(stop);
           prev.modeRight = leg.mode;
+          prev.legRefs.push(legIndex);
           return;
         }
         nodes.push({
@@ -1136,6 +1397,7 @@
           stops: [stop],
           modeLeft: leg.mode,
           modeRight: leg.mode,
+          legRefs: [legIndex], // legs this node is a stop of, parallel to `stops`
         });
       });
     });
@@ -1254,15 +1516,25 @@
       svg.append(g);
     }
 
-    function drawVehicle() {
-      const mode = route.legs[0].mode;
-      const icon = window.TransitIcons ? window.TransitIcons.modeIcon(mode, `timeline-vehicle mode-${mode}`) : null;
-      if (!icon) return;
-      icon.setAttribute('x', String(xs[0] - TL_VEHICLE_SIZE / 2));
-      icon.setAttribute('y', String(TL_BASELINE - r - TL_VEHICLE_SIZE - 3));
-      icon.setAttribute('width', String(TL_VEHICLE_SIZE));
-      icon.setAttribute('height', String(TL_VEHICLE_SIZE));
-      svg.append(icon);
+    // One icon per leg the live poll can place. The first leg's icon is the
+    // Pass 9 placeholder (always shown, resting on the origin); later legs'
+    // icons rest hidden on their first stop and appear only with a live fix.
+    // Each pollable leg is registered in _liveLegs for _pollLiveVehicles().
+    function drawVehicles() {
+      const y = TL_BASELINE - r - 3 - TL_VEHICLE_SIZE / 2; // icon centre, same spot as Pass 9
+      // Per leg, its stops' timeline x in order: [{x, stop}, ...].
+      const legStops = route.legs.map(() => []);
+      nodes.forEach((node, i) => node.legRefs.forEach((legIndex, k) => {
+        legStops[legIndex].push({ x: xs[i], stop: node.stops[k] });
+      }));
+      route.legs.forEach((leg, legIndex) => {
+        const pollable = isLivePollable(leg);
+        if (legIndex > 0 && !pollable) return;
+        const icon = buildVehicleIcon(leg.mode, legStops[legIndex][0].x, y, legIndex > 0);
+        if (!icon) return;
+        svg.append(icon);
+        if (pollable) _liveLegs.set(leg.trip_id, { leg, icon, y, ...liveLegLayout(leg.shape, legStops[legIndex]) });
+      });
     }
 
     // Labels: origin, destination and transfers only. Origin/destination are
@@ -1300,6 +1572,7 @@
       hidePopover();
       active = -1;
       live.textContent = '';
+      _liveLegs = new Map(); // the old icons go with the old SVG
       if (!route || !route.legs.length) {
         figure.hidden = true;
         return;
@@ -1329,7 +1602,7 @@
 
       svg.append(svgEl('line', { x1: TL_PAD, y1: TL_BASELINE, x2: width - TL_PAD, y2: TL_BASELINE, class: 'timeline-line' }));
       nodes.forEach((node, i) => drawNode(node, i, spacing));
-      drawVehicle();
+      drawVehicles();
       drawLabels(width);
 
       // One Tab stop; arrows move the active stop (aria-activedescendant).
@@ -1467,6 +1740,7 @@
       renderHero(routes[activeRouteIndex]);
       renderContextPill();
       timeline.render(routes[activeRouteIndex]);
+      startLivePolling(routes[activeRouteIndex].legs.filter(isLivePollable).map((leg) => leg.trip_id));
     }
 
     main.addEventListener('click', (event) => {
@@ -1485,6 +1759,7 @@
     });
 
     async function load() {
+      stopLivePolling(); // nothing rendered yet to poll for
       setModelDetailsVisible(false);
       renderContextPill(); // no routes yet: clears the slot
       alternativesDisclosure.hidden = true;
@@ -1525,4 +1800,54 @@
     startContextPillTimer();
     load();
   }
+
+  // ---- Pass 10 tests ----
+  // Runs automatically only with ?pass10_test=1; otherwise call
+  // TransitAI._testPass10Projection() from the console.
+
+  function _testPass10Projection() {
+    // Surfers Paradise -> Broadbeach, roughly along the G:link corridor.
+    const shape = [
+      [-28.0005, 153.4295],
+      [-28.0100, 153.4300],
+      [-28.0230, 153.4310],
+      [-28.0330, 153.4300],
+    ];
+    const last = shape.length - 1;
+    const [a, b] = [shape[1], shape[2]]; // the middle segment, index 1
+    const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    const d = 0.001;
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const perp = [-(b[1] - a[1]) / len, (b[0] - a[0]) / len]; // unit normal to a->b
+
+    const start = nearestPointOnShape(shape[0][0], shape[0][1], shape);
+    const end = nearestPointOnShape(shape[last][0], shape[last][1], shape);
+    const onMid = nearestPointOnShape(mid[0], mid[1], shape);
+    const offMid = nearestPointOnShape(mid[0] + d * perp[0], mid[1] + d * perp[1], shape);
+
+    const checks = [
+      [start && start.t === 0 && start.segmentIndex === 0 && start.distanceSq < 1e-12,
+        'vehicle on shape[0]: t=0, segmentIndex=0, distanceSq≈0'],
+      [end && end.t === 1 && end.segmentIndex === last - 1 && end.distanceSq < 1e-12,
+        'vehicle on last point: t=1, segmentIndex=length-2, distanceSq≈0'],
+      [onMid && Math.abs(onMid.t - 0.5) < 1e-9 && onMid.segmentIndex === 1 && onMid.distanceSq < 1e-12,
+        'vehicle at middle-segment midpoint: t≈0.5, segmentIndex=1, distanceSq≈0'],
+      [offMid && Math.abs(offMid.t - 0.5) < 1e-9 && offMid.segmentIndex === 1
+        && Math.abs(offMid.distanceSq - d * d) < d * d * 1e-6,
+        'vehicle offset perpendicular by d: t≈0.5, distanceSq≈d²'],
+      [nearestPointOnShape(-28.01, 153.43, []) === null
+        && nearestPointOnShape(-28.01, 153.43, [shape[0]]) === null
+        && nearestPointOnShape(NaN, 153.43, shape) === null,
+        'degenerate inputs (empty shape, 1-point shape, NaN lat) return null'],
+    ];
+
+    let passed = 0;
+    for (const [ok, message] of checks) {
+      console.assert(ok, message);
+      if (ok) passed++;
+    }
+    console.log(`Pass 10 projection tests: ${passed}/${checks.length} passed`);
+  }
+
+  if (window.location.search.includes('pass10_test=1')) _testPass10Projection();
 })();

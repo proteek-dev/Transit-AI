@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,6 +27,8 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
+from webui.live_trams import fetch_tram_vehicle_positions
 
 logger = logging.getLogger('uvicorn.error')
 
@@ -56,6 +59,10 @@ HEALTHY_STOP_TIMES_MIN_ROWS = 1_000_000
 CONFIDENCE_RANK = {'Low': 0, 'Medium': 1, 'High': 2}
 # Same rule as phase3's predict_delay(): leave by = first departure - 3 min.
 LEAVE_BY_BUFFER = timedelta(minutes=3)
+
+# /live_vehicles: request cap, and positions older than this are dropped.
+LIVE_VEHICLES_MAX_TRIP_IDS = 20
+LIVE_VEHICLE_MAX_AGE_SECONDS = 120
 
 
 def _fetch_s3_json(key: str) -> dict:
@@ -714,3 +721,55 @@ def routes(
         raise
     except Exception as e:
         raise HTTPException(status_code=503, detail=f'Routing/prediction unavailable: {e}')
+
+
+@app.get('/live_vehicles')
+def live_vehicles(trip_ids: Optional[str] = Query(None)) -> dict:
+    """Latest position for each requested trip_id, from the combined SEQ
+    VehiclePositions feed plus the tram-only feed (the combined one has no
+    trams). Trips with no position, or one older than
+    LIVE_VEHICLE_MAX_AGE_SECONDS, are left out of `vehicles`.
+    """
+    requested = list(dict.fromkeys(t.strip() for t in (trip_ids or '').split(',') if t.strip()))
+    if not requested:
+        raise HTTPException(status_code=400, detail='trip_ids query parameter is required')
+    if len(requested) > LIVE_VEHICLES_MAX_TRIP_IDS:
+        raise HTTPException(status_code=400, detail=f'max {LIVE_VEHICLES_MAX_TRIP_IDS} trip_ids per request')
+
+    now = int(time.time())
+
+    import live_gtfs
+
+    # phase3's fetcher raises on failure; degrade to tram-only rather than 500.
+    try:
+        combined = live_gtfs.fetch_vehicle_positions()
+    except Exception:
+        logger.exception('[webui] /live_vehicles: combined VehiclePositions fetch failed -- continuing without it')
+        combined = {}
+    trams = fetch_tram_vehicle_positions()
+
+    # The combined feed is authoritative; a trip_id in both is unexpected.
+    collisions = combined.keys() & trams.keys()
+    if collisions:
+        logger.warning(
+            '[webui] /live_vehicles: %d trip_id(s) in both combined and tram feeds, keeping combined: %s',
+            len(collisions), sorted(collisions)[:5],
+        )
+    merged = {**trams, **combined}
+
+    vehicles = {}
+    for trip_id in requested:
+        vehicle = merged.get(trip_id)
+        if vehicle is None:
+            continue
+        age_seconds = now - vehicle['timestamp']
+        if age_seconds > LIVE_VEHICLE_MAX_AGE_SECONDS:
+            continue
+        vehicles[trip_id] = {
+            'lat': vehicle['lat'],
+            'lon': vehicle['lon'],
+            'timestamp': vehicle['timestamp'],
+            'age_seconds': age_seconds,
+        }
+
+    return {'vehicles': vehicles, 'fetched_at': now}
