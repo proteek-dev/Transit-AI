@@ -403,7 +403,7 @@
       pill.textContent = status[0];
       pill.className = `hero-status-pill ${status[1]}`;
       // live_delay is always None server-side, so this is the model alone
-      // (Pass 10 swaps in RT-blended and drops the caption).
+      // (no realtime blending yet).
       caption.textContent = 'Model estimate';
     } else {
       pill.textContent = '';
@@ -521,12 +521,18 @@
   const CONTEXT_PILL_TICK_MS = 30000; // 30s so a minute-boundary flip shows promptly
   const LOW_CONFIDENCE_TITLE = 'Low-confidence prediction — check before you go';
 
-  // Whole minutes from `now` until leave_by ("HH:MM" Brisbane wall-clock,
-  // read as the viewer's local time, like every other time here). One more
-  // than 12h in the past is tomorrow's — "00:15" seen at 23:50 is 25 min
-  // away. null when leave_by is missing or malformed.
-  function minutesUntil(leaveBy, now) {
-    const match = /^(\d{2}):(\d{2})$/.exec(leaveBy || '');
+  // Whole minutes from `now` until the route's leave_by. leave_by_epoch (unix
+  // seconds) is an absolute instant, so it's right whatever timezone the
+  // device is on — a phone near the border on NSW daylight time is an hour
+  // ahead of Brisbane. Without it (an older payload), falls back to reading
+  // leave_by ("HH:MM" Brisbane wall-clock) as the viewer's local time; there,
+  // one more than 12h in the past is tomorrow's — "00:15" seen at 23:50 is
+  // 25 min away. null when both are missing or malformed.
+  function minutesUntil(route, now) {
+    if (Number.isFinite(route.leave_by_epoch)) {
+      return Math.floor((route.leave_by_epoch * 1000 - now.getTime()) / 60000);
+    }
+    const match = /^(\d{2}):(\d{2})$/.exec(route.leave_by || '');
     if (!match) return null;
     const target = new Date(now);
     target.setHours(Number(match[1]), Number(match[2]), 0, 0);
@@ -572,7 +578,7 @@
     return best;
   }
 
-  // ── Live vehicles (Pass 10) ─────────────────────────────────
+  // ── Live vehicles ───────────────────────────────────────────
   // Polls /live_vehicles for the active route's trips, snaps each vehicle
   // onto its leg's shape and slides that leg's timeline icon there.
   //
@@ -592,23 +598,28 @@
   // ~28°S, 0.02° ≈ 2.2 km north-south and ≈ 1.95 km east-west, so 0.0004
   // (0.02²) is roughly a 2 km envelope around the polyline. Anything further
   // from its own trip's shape is treated as no live position (wrong trip
-  // match or GPS glitch) and the icon falls back to the Pass 9 placeholder.
+  // match or GPS glitch) and the icon falls back to its resting placeholder.
   const MAX_PROJECTION_DISTSQ_DEG = 0.0004;
   const CSS_TWEEN_MS = 29500; // a little under the poll so a move finishes before the next one
 
-  // No icon rotation: shipped, then reversed after Chrome QA — front-view
-  // icons flip on N-S routes. Reasoning in pass-10.md; don't re-add it.
+  // No icon rotation: shipped, then reversed after Chrome QA. The mode icons
+  // are front views, so rotating them to the heading turns them upside down
+  // on southbound (N-S) routes. Don't re-add it.
 
   let _livePollTimerId = null; // the single setInterval handle; null when not running
   let _liveCurrentTripIds = []; // the rendered route's pollable trip_ids, sorted
   // trip_id -> {leg, icon, y, cum, anchors, stopProgress, nodeEls}, rebuilt by
   // every timeline render.
   let _liveLegs = new Map();
-  // trip_id -> last applied 0..1 progress. Outside _liveLegs so a re-render
-  // (resize) can restore stop states without waiting for the next poll.
-  let _liveLastProgress = new Map();
+  // trip_id -> last accepted fix {proj, ageAtReceipt, receivedAt}. Outside
+  // _liveLegs so a re-render (resize) can restore the icon and stop states
+  // without waiting for the next poll, and so a failed poll can age the fix
+  // out (dim, then hide) instead of leaving it looking live forever.
+  let _liveLastFix = new Map();
   // Bumped per startLivePolling(); a response for an older route is dropped.
   let _liveGeneration = 0;
+  // The generation with a /live_vehicles request outstanding, or null.
+  let _liveInFlightGeneration = null;
 
   // Legs without a shape or trip_id are never polled: they keep the static
   // placeholder (first leg) or no icon (later legs).
@@ -620,13 +631,12 @@
   // the leg's stops as {progress, x} anchors, progress forced non-decreasing.
   // Stops without coords are skipped; under two usable anchors, the leg's
   // first and last stops pin the shape's two ends. stopProgress is the same
-  // per-stop progress as a 0..1 fraction of the shape, keyed by timeline node.
+  // per-stop progress (shape units), keyed by timeline node.
   function liveLegLayout(shape, stops) {
     const cum = [0];
     for (let i = 1; i < shape.length; i++) {
       cum.push(cum[i - 1] + Math.hypot(shape[i][0] - shape[i - 1][0], shape[i][1] - shape[i - 1][1]));
     }
-    const total = cum[cum.length - 1];
     let anchors = [];
     const stopProgress = [];
     for (const { x, stop, nodeIndex } of stops) {
@@ -635,45 +645,54 @@
       if (!proj) continue;
       const progress = Math.max(shapeProgress(cum, proj), anchors.length ? anchors[anchors.length - 1].progress : 0);
       anchors.push({ progress, x });
-      if (total > 0) stopProgress.push({ nodeIndex, progress: progress / total });
+      stopProgress.push({ nodeIndex, progress });
     }
     if (anchors.length < 2) {
-      anchors = [{ progress: 0, x: stops[0].x }, { progress: total, x: stops[stops.length - 1].x }];
+      anchors = [{ progress: 0, x: stops[0].x }, { progress: cum[cum.length - 1], x: stops[stops.length - 1].x }];
     }
     return { cum, anchors, stopProgress };
   }
 
-  // A vehicle's progress along its leg as a 0..1 fraction of the shape.
-  function legFraction(live, proj) {
-    const total = live.cum[live.cum.length - 1];
-    return total > 0 ? shapeProgress(live.cum, proj) / total : 0;
+  // A stop's state from the live fix. Its node <g> gets the class
+  // `state-${state}` (styled by app.css .timeline-node.state-*).
+  const StopState = Object.freeze({ PASSED: 'passed', NEXT: 'next', FUTURE: 'future' });
+  const STOP_STATE_CLASSES = Object.values(StopState).map((state) => `state-${state}`);
+  // Stop-state margins are distances, not fractions of the leg: a fraction
+  // scales with leg length (3% of an 85 km rail leg spans stations ~1 km
+  // apart). Progress is in shape units (planar degrees), so metres convert at
+  // ~111 km/degree; at ~28°S a degree of longitude is ~12% shorter, which is
+  // close enough for margins this size.
+  const METRES_PER_DEG = 111000;
+  const STOP_STATE_APPROACH = 30 / METRES_PER_DEG; // at or below: at/before the origin (the shape[0] clamp) -- no state
+  const STOP_STATE_LAG = 20 / METRES_PER_DEG; // classify a little behind the fix, nearer the tweening icon
+  const STOP_STATE_PASS_MARGIN = 60 / METRES_PER_DEG; // a stop is passed once the bus is this far beyond it
+
+  // Pure: [{nodeIndex, state: StopState}] for a fix at `progress` (shape
+  // units), or [] while approaching. stopProgress is non-decreasing
+  // (liveLegLayout), so "next" is the first stop not yet passed: every stop
+  // before it is passed, every one after it future, and there is at most one.
+  function classifyStops(stopProgress, progress) {
+    if (!(progress > STOP_STATE_APPROACH)) return [];
+    const compare = progress - STOP_STATE_LAG;
+    const nextIndex = stopProgress.findIndex(({ progress: stopProg }) => !(stopProg + STOP_STATE_PASS_MARGIN < compare));
+    return stopProgress.map(({ nodeIndex }, i) => {
+      let state = StopState.FUTURE;
+      if (nextIndex === -1 || i < nextIndex) state = StopState.PASSED;
+      else if (i === nextIndex) state = StopState.NEXT;
+      return { nodeIndex, state };
+    });
   }
 
-  const STOP_STATES = ['state-passed', 'state-next', 'state-future'];
-  const STOP_STATE_APPROACH = 0.01; // at or below: still at/before the origin (the shape[0] clamp) -- no state
-  const STOP_STATE_LAG = 0.01; // classify a little behind the fix, nearer the tweening icon
-  const STOP_STATE_PASS_MARGIN = 0.02; // a stop is passed once the bus is this far beyond it
-
-  // Passed / next / future on the leg's stop nodes from the bus's fraction
-  // along the shape. Classes only: CSS decides which node kinds show them.
-  // Stops without coords (no stopProgress entry) keep their default look.
+  // Passed / next / future on the leg's stop nodes. Classes only: CSS decides
+  // which node kinds show them. Stops without coords (no stopProgress entry)
+  // keep their default look.
   function _applyStopStates(tripId, progress) {
     const live = _liveLegs.get(tripId);
     if (!live) return;
-    for (const el of live.nodeEls.values()) el.classList.remove(...STOP_STATES);
-    if (!(progress > STOP_STATE_APPROACH)) return;
-    const compare = progress - STOP_STATE_LAG;
-    let nextFound = false;
-    for (const { nodeIndex, progress: stopProg } of live.stopProgress) {
+    for (const el of live.nodeEls.values()) el.classList.remove(...STOP_STATE_CLASSES);
+    for (const { nodeIndex, state } of classifyStops(live.stopProgress, progress)) {
       const el = live.nodeEls.get(nodeIndex);
-      if (!el) continue;
-      let state = 'state-future';
-      if (stopProg + STOP_STATE_PASS_MARGIN < compare) state = 'state-passed';
-      else if (!nextFound) {
-        state = 'state-next';
-        nextFound = true;
-      }
-      el.classList.add(state);
+      if (el) el.classList.add(`state-${state}`);
     }
   }
 
@@ -700,7 +719,7 @@
     return { svgX: anchors[anchors.length - 1].x, svgY: y };
   }
 
-  // The mode icon inside a <g>: Pass 9's icon is a nested <svg>, and CSS
+  // The mode icon inside a <g>: the icon is a nested <svg>, and CSS
   // transforms on a nested <svg> aren't reliably applied (Chrome), so the
   // <g> carries the translate. The icon is centred on the <g>'s origin.
   // null for a mode with no icon.
@@ -717,7 +736,7 @@
     g.dataset.restHidden = String(hiddenAtRest);
     g.style.setProperty('--vehicle-tween', `${CSS_TWEEN_MS}ms`);
     g.append(icon);
-    _hideVehicleIcon(g);
+    _applyRestPosition(g);
     return g;
   }
 
@@ -747,61 +766,111 @@
     iconEl.dataset.live = 'true';
   }
 
-  // Back to the Pass 9 placeholder: rest position, full opacity (hidden for
-  // a later leg). Jumps, no tween. With a tripId, also drops that leg's stop
-  // states so a lost fix doesn't leave stale "passed" marks.
+  // The resting placeholder: the leg's first stop, full opacity, hidden for
+  // a later leg. Styles only -- callers decide whether to tween.
+  function _applyRestPosition(iconEl) {
+    iconEl.style.display = iconEl.dataset.restHidden === 'true' ? 'none' : '';
+    iconEl.style.transform = `translate(${iconEl.dataset.restX}px, ${iconEl.dataset.restY}px)`;
+    iconEl.style.setProperty('--vehicle-opacity', '1');
+  }
+
+  // Back to the resting placeholder, jumping (no tween). With a tripId, also
+  // forgets that leg's fix and stop states so a lost fix doesn't leave stale
+  // "passed" marks.
   function _hideVehicleIcon(iconEl, tripId) {
-    placeWithoutTween(iconEl, () => {
-      iconEl.style.display = iconEl.dataset.restHidden === 'true' ? 'none' : '';
-      iconEl.style.transform = `translate(${iconEl.dataset.restX}px, ${iconEl.dataset.restY}px)`;
-      iconEl.style.setProperty('--vehicle-opacity', '1');
-    });
+    placeWithoutTween(iconEl, () => _applyRestPosition(iconEl));
     delete iconEl.dataset.live;
     if (tripId) {
-      _liveLastProgress.delete(tripId);
+      _liveLastFix.delete(tripId);
       _applyStopStates(tripId, 0);
     }
+  }
+
+  // Seconds old the fix is now: the server's age when received, plus time
+  // since. Counted on the client clock only, so device clock skew can't skew it.
+  function _fixAge(fix) {
+    return fix.ageAtReceipt + (Date.now() - fix.receivedAt) / 1000;
+  }
+
+  // Draw a trip's icon and stop states from its last fix: full opacity while
+  // fresh, dimmed once older than LIVE_STALE_DIM_SECONDS, back to rest past
+  // LIVE_STALE_HIDE_SECONDS or with no fix. Called on every poll -- failed
+  // ones too, which is what ages a frozen fix out -- and after a re-render.
+  function _applyLastFix(tripId) {
+    const live = _liveLegs.get(tripId);
+    const iconEl = _getTimelineLegElement(tripId);
+    if (!live || !iconEl) return;
+    const fix = _liveLastFix.get(tripId);
+    const age = fix ? _fixAge(fix) : Infinity;
+    if (age > LIVE_STALE_HIDE_SECONDS) {
+      _hideVehicleIcon(iconEl, tripId);
+      return;
+    }
+    // Negative age (clock skew) lands in the fresh band.
+    const opacity = age <= LIVE_STALE_DIM_SECONDS ? 1 : LIVE_DIM_OPACITY;
+    const { svgX, svgY } = _latLonToSvgCoords(fix.proj, live);
+    _setVehiclePosition(iconEl, svgX, svgY, opacity);
+    _applyStopStates(tripId, shapeProgress(live.cum, fix.proj));
+  }
+
+  // A failed poll: no new data, so age every trip's last fix.
+  function _agePollFixes() {
+    for (const tripId of _liveCurrentTripIds) _applyLastFix(tripId);
   }
 
   async function _pollLiveVehicles() {
     if (_liveCurrentTripIds.length === 0) return;
     const generation = _liveGeneration;
+    // One request in flight per route: a slow server shouldn't stack polls
+    // (or let an older response land last). A new route's poll still goes.
+    if (_liveInFlightGeneration === generation) return;
+    _liveInFlightGeneration = generation;
     let body;
     try {
       const resp = await fetch(`/live_vehicles?trip_ids=${encodeURIComponent(_liveCurrentTripIds.join(','))}`);
       if (!resp.ok) {
-        console.warn(`[live] /live_vehicles returned ${resp.status}; keeping last positions`);
+        console.warn(`[live] /live_vehicles returned ${resp.status}; ageing last positions`);
+        if (generation === _liveGeneration) _agePollFixes();
         return;
       }
       body = await resp.json();
     } catch (err) {
-      console.warn('[live] /live_vehicles failed; keeping last positions', err);
+      console.warn('[live] /live_vehicles failed; ageing last positions', err);
+      if (generation === _liveGeneration) _agePollFixes();
       return;
+    } finally {
+      if (_liveInFlightGeneration === generation) _liveInFlightGeneration = null;
     }
     if (generation !== _liveGeneration) return; // a different route rendered meanwhile
     const vehicles = (body && body.vehicles) || {};
+    // While a feed is down, a missing trip may just be the outage: keep its
+    // last fix and let it age out rather than dropping it at once.
+    const degraded = Boolean(body && body.degraded);
+    const receivedAt = Date.now();
 
     for (const tripId of _liveCurrentTripIds) {
       const live = _liveLegs.get(tripId);
-      const iconEl = _getTimelineLegElement(tripId);
-      if (!live || !iconEl) continue;
-
+      if (!live) continue;
       const vehicle = vehicles[tripId];
-      const proj = vehicle ? nearestPointOnShape(vehicle.lat, vehicle.lon, live.leg.shape) : null;
-      const age = vehicle ? vehicle.age_seconds : Infinity;
-      // No fix, off its own shape, or past the server's 120s cut (defensive).
-      if (!proj || proj.distanceSq > MAX_PROJECTION_DISTSQ_DEG || age > LIVE_STALE_HIDE_SECONDS) {
-        _hideVehicleIcon(iconEl, tripId);
-        continue;
+      if (vehicle) {
+        const proj = nearestPointOnShape(vehicle.lat, vehicle.lon, live.leg.shape);
+        // Off its own shape: a wrong trip match or a GPS glitch, not a position.
+        if (proj && proj.distanceSq <= MAX_PROJECTION_DISTSQ_DEG) {
+          _liveLastFix.set(tripId, { proj, ageAtReceipt: vehicle.age_seconds, receivedAt });
+        } else {
+          _liveLastFix.delete(tripId);
+        }
+      } else if (!degraded) {
+        _liveLastFix.delete(tripId);
       }
-      // Negative age (clock skew) lands in the fresh band.
-      const opacity = age <= LIVE_STALE_DIM_SECONDS ? 1 : LIVE_DIM_OPACITY;
-      const { svgX, svgY } = _latLonToSvgCoords(proj, live);
-      _setVehiclePosition(iconEl, svgX, svgY, opacity);
-      const progress = legFraction(live, proj);
-      _liveLastProgress.set(tripId, progress);
-      _applyStopStates(tripId, progress);
+      _applyLastFix(tripId);
     }
+  }
+
+  // An exception while applying a poll must not become an unhandled
+  // rejection on every interval tick.
+  function _pollLiveVehiclesSafely() {
+    _pollLiveVehicles().catch((err) => console.error('[live] applying /live_vehicles failed', err));
   }
 
   // Poll now (first paint shouldn't wait 30s), then every 30s. Idempotent.
@@ -809,16 +878,17 @@
     clearInterval(_livePollTimerId);
     _livePollTimerId = null;
     if (_liveCurrentTripIds.length === 0) return;
-    _pollLiveVehicles();
-    _livePollTimerId = setInterval(_pollLiveVehicles, LIVE_POLL_INTERVAL_MS);
+    _pollLiveVehiclesSafely();
+    _livePollTimerId = setInterval(_pollLiveVehiclesSafely, LIVE_POLL_INTERVAL_MS);
   }
 
   // Idempotent: the same trips with the timer already running is a no-op —
   // no extra immediate poll, no timer restart.
   function startLivePolling(tripIds) {
     const next = [...new Set(tripIds)].sort();
-    if (_livePollTimerId !== null && next.join(',') === _liveCurrentTripIds.join(',')) return;
-    if (next.join(',') !== _liveCurrentTripIds.join(',')) _liveLastProgress = new Map();
+    const changed = next.join(',') !== _liveCurrentTripIds.join(',');
+    if (!changed && _livePollTimerId !== null) return;
+    if (changed) _liveLastFix = new Map();
     _liveCurrentTripIds = next;
     _liveGeneration++;
     startLiveTimer();
@@ -842,7 +912,9 @@
 
   // Same namespace pattern as icons.js's window.TransitIcons.
   window.TransitAI = {
-    nearestPointOnShape, startLivePolling, stopLivePolling, _handleVisibilityChange, _testPass10Projection,
+    nearestPointOnShape, startLivePolling, stopLivePolling, _handleVisibilityChange,
+    // Pure helpers, exposed for webui/tests/live_timeline.test.mjs.
+    _liveLegLayout: liveLegLayout, _classifyStops: classifyStops, _minutesUntil: minutesUntil,
   };
 
   // ── Page switch ─────────────────────────────────────────────
@@ -1385,8 +1457,9 @@
 
   // ══ Station timeline (results page) ═════════════════════════
   // Inline SVG built through DOM APIs (no markup strings), like icons.js.
-  // The vehicle icon rests on the first leg's origin (Pass 9); the Pass 10
-  // live poll (above the page switch) moves it — no timers or polling here.
+  // The vehicle icon rests on the first leg's origin; the live poll (the
+  // "Live vehicles" section, above the page switch) moves it, so this
+  // section only draws -- it owns no timers or polling.
 
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const MODE_VAR = { bus: '--mode-bus', tram: '--mode-tram', rail: '--mode-rail' };
@@ -1568,11 +1641,11 @@
     }
 
     // One icon per leg the live poll can place. The first leg's icon is the
-    // Pass 9 placeholder (always shown, resting on the origin); later legs'
+    // static placeholder (always shown, resting on the origin); later legs'
     // icons rest hidden on their first stop and appear only with a live fix.
     // Each pollable leg is registered in _liveLegs for _pollLiveVehicles().
     function drawVehicles() {
-      const y = TL_BASELINE - r - 3 - TL_VEHICLE_SIZE / 2; // icon centre, same spot as Pass 9
+      const y = TL_BASELINE - r - 3 - TL_VEHICLE_SIZE / 2; // icon centre, just above the line
       // Per leg, its stops' timeline x in order: [{x, stop, nodeIndex}, ...].
       const legStops = route.legs.map(() => []);
       nodes.forEach((node, i) => node.legRefs.forEach((legIndex, k) => {
@@ -1663,9 +1736,10 @@
       svg.append(svgEl('line', { x1: TL_PAD, y1: TL_BASELINE, x2: width - TL_PAD, y2: TL_BASELINE, class: 'timeline-line' }));
       nodes.forEach((node, i) => drawNode(node, i, spacing));
       drawVehicles();
-      // A re-render (resize) rebuilds every node: restore stop states from the
-      // last poll rather than leaving them blank for up to 30s.
-      for (const [tripId, progress] of _liveLastProgress) _applyStopStates(tripId, progress);
+      // A re-render (resize) rebuilds every icon and node: put each leg's icon
+      // and stop states back from its last fix rather than leaving the icon at
+      // its rest spot for up to 30s.
+      for (const tripId of _liveLegs.keys()) _applyLastFix(tripId);
       drawLabels(width);
 
       // One Tab stop; arrows move the active stop (aria-activedescendant).
@@ -1736,7 +1810,7 @@
       contextPill.removeAttribute('title');
       contextPill.textContent = '';
       const route = routes[activeRouteIndex];
-      const delta = route ? minutesUntil(route.leave_by, new Date()) : null;
+      const delta = route ? minutesUntil(route, new Date()) : null;
       if (delta === null) return;
       const [, label, tone] = CONTEXT_PILL_RULES.find(([max]) => delta <= max);
       const low = route.confidence === 'low';
@@ -1864,53 +1938,4 @@
     load();
   }
 
-  // ---- Pass 10 tests ----
-  // Runs automatically only with ?pass10_test=1; otherwise call
-  // TransitAI._testPass10Projection() from the console.
-
-  function _testPass10Projection() {
-    // Surfers Paradise -> Broadbeach, roughly along the G:link corridor.
-    const shape = [
-      [-28.0005, 153.4295],
-      [-28.0100, 153.4300],
-      [-28.0230, 153.4310],
-      [-28.0330, 153.4300],
-    ];
-    const last = shape.length - 1;
-    const [a, b] = [shape[1], shape[2]]; // the middle segment, index 1
-    const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-    const d = 0.001;
-    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
-    const perp = [-(b[1] - a[1]) / len, (b[0] - a[0]) / len]; // unit normal to a->b
-
-    const start = nearestPointOnShape(shape[0][0], shape[0][1], shape);
-    const end = nearestPointOnShape(shape[last][0], shape[last][1], shape);
-    const onMid = nearestPointOnShape(mid[0], mid[1], shape);
-    const offMid = nearestPointOnShape(mid[0] + d * perp[0], mid[1] + d * perp[1], shape);
-
-    const checks = [
-      [start && start.t === 0 && start.segmentIndex === 0 && start.distanceSq < 1e-12,
-        'vehicle on shape[0]: t=0, segmentIndex=0, distanceSq≈0'],
-      [end && end.t === 1 && end.segmentIndex === last - 1 && end.distanceSq < 1e-12,
-        'vehicle on last point: t=1, segmentIndex=length-2, distanceSq≈0'],
-      [onMid && Math.abs(onMid.t - 0.5) < 1e-9 && onMid.segmentIndex === 1 && onMid.distanceSq < 1e-12,
-        'vehicle at middle-segment midpoint: t≈0.5, segmentIndex=1, distanceSq≈0'],
-      [offMid && Math.abs(offMid.t - 0.5) < 1e-9 && offMid.segmentIndex === 1
-        && Math.abs(offMid.distanceSq - d * d) < d * d * 1e-6,
-        'vehicle offset perpendicular by d: t≈0.5, distanceSq≈d²'],
-      [nearestPointOnShape(-28.01, 153.43, []) === null
-        && nearestPointOnShape(-28.01, 153.43, [shape[0]]) === null
-        && nearestPointOnShape(NaN, 153.43, shape) === null,
-        'degenerate inputs (empty shape, 1-point shape, NaN lat) return null'],
-    ];
-
-    let passed = 0;
-    for (const [ok, message] of checks) {
-      console.assert(ok, message);
-      if (ok) passed++;
-    }
-    console.log(`Pass 10 projection tests: ${passed}/${checks.length} passed`);
-  }
-
-  if (window.location.search.includes('pass10_test=1')) _testPass10Projection();
 })();

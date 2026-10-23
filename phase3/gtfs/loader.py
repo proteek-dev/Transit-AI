@@ -70,6 +70,7 @@ class GTFSData:
         self.route_meta = None             # route_id -> {route_short_name, route_long_name, route_type}
         self.stop_name_by_id = None        # stop_id -> stop_name
         self.trip_headsign_by_id = None    # trip_id -> trip_headsign or None
+        self.max_departure_seconds: int | None = None  # latest departure in the snapshot, secs past service-day midnight (can exceed 86400)
 
     def load(self, use_categorical_dtypes: bool = False):
         bucket, fs = _get_env()
@@ -577,6 +578,10 @@ class GTFSData:
 
         self.route_stop_departures = route_stop_departures
         self.route_trip_stops = route_trip_stops
+        # Bounds how far past midnight a service day's trips run, so routing
+        # only searches the previous service day when its 24:00+ trips can
+        # still reach the query window (see routing._service_days).
+        self.max_departure_seconds = int(merged['departure_seconds'].max()) if len(merged) else 0
 
         self.route_meta = {
             row.route_id: {

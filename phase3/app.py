@@ -96,7 +96,7 @@ def _swap_origin_dest() -> None:
 
 # ── Prediction wiring ────────────────────────────────────────────────────────
 
-def _predict_leg(trip: dict, dest_stop_ids: list[str], search_departure_after: datetime, updates: dict):
+def _predict_leg(trip: dict, dest_stop_ids: list[str], updates: dict):
     """Enrich + predict_delay() one leg's trip. Returns (trip, pred, raw_update), or None on failure."""
     try:
         enriched = prediction.enrich_trip_with_dest_stop(trip, dest_stop_ids)
@@ -108,7 +108,8 @@ def _predict_leg(trip: dict, dest_stop_ids: list[str], search_departure_after: d
                 'timestamp': raw_update['timestamp'],
                 'stop_id': raw_update['stop_id'],
             }
-        pred = prediction.predict_delay(enriched, search_departure_after, live_delay=live_delay)
+        # Scheduled arrival, not search time -- matches training's scheduled_arrival_dt.
+        pred = prediction.predict_delay(enriched, enriched['dest_arrival_time'], live_delay=live_delay)
     except Exception as e:
         st.warning(f'Could not predict this leg ({trip.get("trip_id")}): {e}')
         return None
@@ -123,7 +124,7 @@ def _predict_journey_legs(journey: dict, updates: dict) -> list:
     leg's prediction failed.
     """
     return [
-        _predict_leg(leg['trip'], leg['dest_stop_ids'], leg['search_departure_after'], updates)
+        _predict_leg(leg['trip'], leg['dest_stop_ids'], updates)
         for leg in journey['legs']
     ]
 
@@ -283,7 +284,7 @@ if results:
     # `if not trips:` gate is gone, that branch is live), which would
     # otherwise duplicate every entry already covered by `trips`.
     direct_journeys = [
-        gtfs_data._direct_journey(trip, dest_stop_ids, departure_after)
+        gtfs_data._direct_journey(trip, dest_stop_ids)
         for trip in trips[:CANDIDATE_POOL_SIZE]
     ]
     transfer_only_journeys = [j for j in transfer_journeys if j['num_transfers'] >= 1]

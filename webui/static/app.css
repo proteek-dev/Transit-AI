@@ -1202,12 +1202,12 @@ body[data-page="search"] .footer {
   fill: var(--text-secondary);
 }
 
-/* Static glow — never animated (Pass 10 moves the icon, not this). */
+/* Static glow — never animated (the live poll moves the icon, not this). */
 .timeline-vehicle {
   filter: drop-shadow(0 0 3px color-mix(in srgb, currentColor 55%, transparent));
 }
 
-/* Pass 10 live vehicle: the <g> around .timeline-vehicle. app.js sets
+/* Live vehicle: the <g> around .timeline-vehicle. app.js sets
    transform, --vehicle-opacity and --vehicle-tween (CSS_TWEEN_MS) inline.
    Linear, not eased: the vehicle covers a real path at roughly constant
    speed. */
@@ -1230,8 +1230,8 @@ body[data-page="search"] .footer {
   }
 }
 
-/* Pass 11 stop state from the live bus's progress along its leg. app.js
-   sets the state-* class and --next-color (the leg's mode) on each node <g>;
+/* Stop state from the live bus's progress along its leg. app.js sets the
+   state-* class (state-${StopState}) and --next-color (the leg's mode) on each node <g>;
    only intermediate .timeline-stop dots restyle. fill-box keeps the pulse
    scaling around the dot itself, not the SVG's origin. */
 .timeline-node.state-passed .timeline-stop {

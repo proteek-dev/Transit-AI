@@ -23,12 +23,14 @@ from zoneinfo import ZoneInfo
 
 import boto3
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+# typing.TypedDict can't be a FastAPI response model before Python 3.12 (local dev is 3.9).
+from typing_extensions import TypedDict
 
-from webui.live_trams import fetch_tram_vehicle_positions
+from webui.live_trams import GuardedFeed, VehiclePosition, tram_feed
 
 logger = logging.getLogger('uvicorn.error')
 
@@ -474,16 +476,21 @@ def _parse_departure(departure: str | None) -> datetime:
     return parsed
 
 
-def _predict_leg(trip: dict, dest_stop_ids: list[str], search_departure_after: datetime) -> tuple[dict, dict] | None:
+def _predict_leg(trip: dict, dest_stop_ids: list[str]) -> tuple[dict, dict] | None:
     """Enrich + predict_delay() one leg. live_delay is always None, as in the
     archived backend, so real predictions only come back Medium/Low
     confidence. Returns None on failure so one bad leg doesn't fail the request.
+
+    The model's time features come from the leg's scheduled arrival, as in
+    training (scheduled_arrival_dt) -- not the search time, which for a later
+    leg is just the previous arrival + connection and can sit across a peak
+    boundary from the trip itself.
     """
     import prediction
 
     try:
         enriched = prediction.enrich_trip_with_dest_stop(trip, dest_stop_ids)
-        pred = prediction.predict_delay(enriched, search_departure_after, live_delay=None)
+        pred = prediction.predict_delay(enriched, enriched['dest_arrival_time'], live_delay=None)
     except Exception as e:
         logger.warning('[webui] /routes could not predict leg (trip_id=%r): %s', trip.get('trip_id'), e)
         return None
@@ -496,7 +503,7 @@ def _predict_journey_legs(journey: dict) -> list[tuple[dict, dict]] | None:
     """
     legs = []
     for leg in journey['legs']:
-        result = _predict_leg(leg['trip'], leg['dest_stop_ids'], leg['search_departure_after'])
+        result = _predict_leg(leg['trip'], leg['dest_stop_ids'])
         if result is None:
             return None
         legs.append(result)
@@ -627,6 +634,10 @@ def _serialize_journey(
         'transfer_count': journey['num_transfers'],
         # Additive journey-level fields (Session 40); the fields above are unchanged.
         'leave_by': (first_departure - LEAVE_BY_BUFFER).strftime('%H:%M'),
+        # Absolute instant of leave_by, so the client's countdown doesn't depend
+        # on the viewer's device timezone (e.g. a phone on NSW daylight time
+        # near the border). GTFS times here are naive Brisbane wall-clock.
+        'leave_by_epoch': int((first_departure - LEAVE_BY_BUFFER).replace(tzinfo=BRISBANE_TZ).timestamp()),
         'predicted_delay_minutes': int(round(last_delay)) if last_delay is not None else None,
         'confidence': weakest.lower(),
     }
@@ -668,7 +679,7 @@ def _find_ranked_routes(
         max_results=CANDIDATE_POOL_SIZE,
     )
     direct_journeys = [
-        gtfs_data._direct_journey(trip, dest_stop_ids, departure_after) for trip in trips[:CANDIDATE_POOL_SIZE]
+        gtfs_data._direct_journey(trip, dest_stop_ids) for trip in trips[:CANDIDATE_POOL_SIZE]
     ]
     # find_multi_leg_trips() runs its own depth-0 direct check too -- keep only
     # num_transfers >= 1 so those aren't double-counted (same filter as app.py).
@@ -723,8 +734,42 @@ def routes(
         raise HTTPException(status_code=503, detail=f'Routing/prediction unavailable: {e}')
 
 
+LIVE_COMBINED_FAILURE_TTL_SECONDS = 20
+
+
+def _fetch_combined_positions(now: float) -> dict[str, VehiclePosition]:
+    # Bare `import live_gtfs` (phase3/ is on sys.path), not phase3.live_gtfs:
+    # same module object, so the same 60s cache, as phase3's own callers.
+    import live_gtfs
+
+    return live_gtfs.fetch_vehicle_positions()
+
+
+# phase3's combined VehiclePositions fetch has its own 60s cache but a 30s
+# timeout, raises on failure and has no lock; the guard keeps a slow or down
+# feed to one request thread, not the pool. A failure degrades /live_vehicles
+# to tram-only (flagged `degraded`) rather than a 500.
+_combined_feed = GuardedFeed(_fetch_combined_positions, name='combined VehiclePositions',
+                             cache_ttl_seconds=0, failure_ttl_seconds=LIVE_COMBINED_FAILURE_TTL_SECONDS)
+
+
+class LiveVehicle(TypedDict):
+    lat: float
+    lon: float
+    timestamp: int
+    age_seconds: int  # >= 0: a fix stamped slightly ahead of the server clock counts as fresh
+
+
+class LiveVehiclesResponse(TypedDict):
+    vehicles: dict[str, LiveVehicle]
+    fetched_at: int
+    # True while either feed's latest fetch failed: a trip missing from
+    # `vehicles` may then be an outage, not a vehicle that isn't reporting.
+    degraded: bool
+
+
 @app.get('/live_vehicles')
-def live_vehicles(trip_ids: Optional[str] = Query(None)) -> dict:
+def live_vehicles(response: Response, trip_ids: Optional[str] = Query(None)) -> LiveVehiclesResponse:
     """Latest position for each requested trip_id, from the combined SEQ
     VehiclePositions feed plus the tram-only feed (the combined one has no
     trams). Trips with no position, or one older than
@@ -736,17 +781,13 @@ def live_vehicles(trip_ids: Optional[str] = Query(None)) -> dict:
     if len(requested) > LIVE_VEHICLES_MAX_TRIP_IDS:
         raise HTTPException(status_code=400, detail=f'max {LIVE_VEHICLES_MAX_TRIP_IDS} trip_ids per request')
 
+    # Live positions: never cache at the edge or in the browser.
+    response.headers['Cache-Control'] = 'no-store'
     now = int(time.time())
 
-    import live_gtfs
-
-    # phase3's fetcher raises on failure; degrade to tram-only rather than 500.
-    try:
-        combined = live_gtfs.fetch_vehicle_positions()
-    except Exception:
-        logger.exception('[webui] /live_vehicles: combined VehiclePositions fetch failed -- continuing without it')
-        combined = {}
-    trams = fetch_tram_vehicle_positions()
+    combined_result = _combined_feed.get()
+    tram_result = tram_feed.get()
+    combined, trams = combined_result.vehicles, tram_result.vehicles
 
     # The combined feed is authoritative; a trip_id in both is unexpected.
     collisions = combined.keys() & trams.keys()
@@ -762,7 +803,7 @@ def live_vehicles(trip_ids: Optional[str] = Query(None)) -> dict:
         vehicle = merged.get(trip_id)
         if vehicle is None:
             continue
-        age_seconds = now - vehicle['timestamp']
+        age_seconds = max(0, now - vehicle['timestamp'])
         if age_seconds > LIVE_VEHICLE_MAX_AGE_SECONDS:
             continue
         vehicles[trip_id] = {
@@ -772,4 +813,8 @@ def live_vehicles(trip_ids: Optional[str] = Query(None)) -> dict:
             'age_seconds': age_seconds,
         }
 
-    return {'vehicles': vehicles, 'fetched_at': now}
+    return {
+        'vehicles': vehicles,
+        'fetched_at': now,
+        'degraded': not (combined_result.ok and tram_result.ok),
+    }

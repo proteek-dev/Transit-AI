@@ -6,7 +6,7 @@ training_metadata.json), and the in-process cache so each artifact is loaded
 at most once per process. Falls back to training.py's _train_and_save_model()
 (imported lazily, inside _load_model_impl(), to avoid a circular import --
 training.py itself imports MODEL_DIR/MODEL_PATH/etc. from this module) when
-no saved model is found anywhere.
+no saved model is found anywhere and MODEL_ALLOW_TRAIN=1 (see ALLOW_TRAIN_ENV).
 
 FEATURE_COLS/CATEGORICAL_COLS also live here: the one piece of schema both
 training.py (fitting) and inference.py (build_features) must agree on
@@ -16,7 +16,9 @@ defining -- and risking drifting -- their own copy.
 from __future__ import annotations
 
 import json
+import logging
 import os
+from datetime import datetime
 from pathlib import Path
 
 import joblib
@@ -44,7 +46,23 @@ FEATURE_COLS = ['route_id', 'stop_id', 'mode', 'stop_sequence',
                 'hour_of_day', 'day_of_week', 'is_weekend', 'is_peak']
 CATEGORICAL_COLS = ['route_id', 'stop_id', 'mode', 'day_of_week']
 
+logger = logging.getLogger(__name__)
+
 _cache: dict = {}
+
+# A serving process (webui, Streamlit) must never overwrite the S3 model of
+# record or start a full training run just because one S3 read failed at
+# startup -- a transient error there would otherwise push a stale local model
+# over the source of truth, or train on the web box. Both side effects of
+# _load_model_impl()'s fallback are therefore opt-in: pipeline/02_train_model*.sh
+# set MODEL_ALLOW_TRAIN=1, and mirroring a locally trained model to S3 needs
+# MODEL_ALLOW_S3_PUBLISH=1.
+ALLOW_TRAIN_ENV = 'MODEL_ALLOW_TRAIN'
+ALLOW_S3_PUBLISH_ENV = 'MODEL_ALLOW_S3_PUBLISH'
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name) == '1'
 
 
 def _get_env():
@@ -65,22 +83,22 @@ def _s3_model_paths() -> dict:
 
 
 def _download_model_from_s3() -> bool:
-    """Download the saved model files from S3 into MODEL_DIR. Returns True on success."""
-    try:
-        fs = config.get_s3_filesystem()
-        s3_paths = _s3_model_paths()
-        if not all(fs.exists(p) for p in s3_paths.values()):
-            return False
-
-        MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        fs.get(s3_paths['model'], str(MODEL_PATH))
-        fs.get(s3_paths['categories'], str(CATEGORIES_PATH))
-        fs.get(s3_paths['metadata'], str(TRAINING_METADATA_PATH))
-        print(f"Downloaded model files from s3://{_s3_model_prefix()}/")
-        return True
-    except Exception as e:
-        print(f'Could not load model from S3 ({e}) — will try local files instead.')
+    """Download the saved model files from S3 into MODEL_DIR. True on success,
+    False if the files aren't all in S3; an S3 error (credentials, network)
+    propagates so the caller can tell "unreachable" from "absent".
+    """
+    fs = config.get_s3_filesystem()
+    s3_paths = _s3_model_paths()
+    if not all(fs.exists(p) for p in s3_paths.values()):
+        logger.warning('Model files not all present in s3://%s/', _s3_model_prefix())
         return False
+
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    fs.get(s3_paths['model'], str(MODEL_PATH))
+    fs.get(s3_paths['categories'], str(CATEGORIES_PATH))
+    fs.get(s3_paths['metadata'], str(TRAINING_METADATA_PATH))
+    print(f"Downloaded model files from s3://{_s3_model_prefix()}/")
+    return True
 
 
 def _upload_model_to_s3() -> None:
@@ -95,15 +113,32 @@ def _upload_model_to_s3() -> None:
 def _load_model_impl() -> xgb.XGBRegressor:
     """S3 first (source of truth for Streamlit Cloud, which has no local model
     files), then local files (local dev fallback), training only if neither
-    is available.
+    is available AND MODEL_ALLOW_TRAIN=1 (see ALLOW_TRAIN_ENV above).
     """
-    have_model = _download_model_from_s3()
+    s3_error = None
+    try:
+        have_model = _download_model_from_s3()
+    except Exception as e:
+        logger.exception('Could not load model from s3://%s/ -- trying local files', _s3_model_prefix())
+        s3_error, have_model = e, False
     if not have_model:
         have_model = MODEL_PATH.exists() and CATEGORIES_PATH.exists() and TRAINING_METADATA_PATH.exists()
         if have_model:
-            # Locally trained but not yet mirrored to S3 (e.g. first Cloud deploy prep) — upload now.
-            _upload_model_to_s3()
+            logger.warning(
+                'Serving local model from %s (written %s), not the S3 model of record',
+                MODEL_DIR, datetime.fromtimestamp(MODEL_PATH.stat().st_mtime).isoformat(timespec='seconds'),
+            )
+            if _env_flag(ALLOW_S3_PUBLISH_ENV):
+                # Locally trained but not yet mirrored to S3 (e.g. first Cloud deploy prep) — upload now.
+                _upload_model_to_s3()
     if not have_model:
+        if not _env_flag(ALLOW_TRAIN_ENV):
+            where = (f'S3 unreachable ({s3_error!r}) and no model in {MODEL_DIR}' if s3_error is not None
+                     else f'No model found in s3://{_s3_model_prefix()}/ or {MODEL_DIR}')
+            raise RuntimeError(
+                f'{where} -- refusing to train in-process. '
+                f'Run pipeline/02_train_model.sh, or set {ALLOW_TRAIN_ENV}=1 to train here.'
+            ) from s3_error
         from ml.training import _train_and_save_model
         _train_and_save_model()
 

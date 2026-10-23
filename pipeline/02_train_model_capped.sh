@@ -95,7 +95,7 @@ log "  staging: ${STAGING_DIR}"
 # 'latest' and training would write straight into phase3/model/latest/.
 log "STEP 2/3: Training model into staging (phase3/prediction.py)"
 
-MODEL_SUBDIR_OVERRIDE="$STAGING_SUBDIR" python3 -u phase3/prediction.py >> "$LOG" 2>&1 &
+MODEL_ALLOW_TRAIN=1 MODEL_SUBDIR_OVERRIDE="$STAGING_SUBDIR" python3 -u phase3/prediction.py >> "$LOG" 2>&1 &
 RETRAIN_PID=$!
 heartbeat "$RETRAIN_PID" "Retrain" &
 HB_PID=$!

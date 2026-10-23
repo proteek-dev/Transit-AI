@@ -9,7 +9,8 @@ so every route/stop/trip id seen here is already ferry-free.
 from __future__ import annotations
 
 import bisect
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from typing import NamedTuple
 
 from gtfs.loader import GTFSData, _parse_gtfs_time, load_gtfs_data
 
@@ -64,13 +65,59 @@ def _find_trips_core(
     departure_after: datetime,
     window_minutes: int = 60,
 ) -> list[dict]:
-    """Same-day trip search — no fallback. See find_trips() for the public entry point."""
+    """Trip search over every service day that can depart in the window (see
+    _service_days) — no fallback. See find_trips() for the public entry point.
+    """
     data = load_gtfs_data()
-    query_date = departure_after.date()
-    day_midnight = datetime(query_date.year, query_date.month, query_date.day)
     window_end = departure_after + timedelta(minutes=window_minutes)
+    trips = []
+    for service_date, day_midnight in _service_days(data, departure_after, window_end):
+        trips.extend(_find_trips_on_service_day(
+            data, origin_stop_ids, dest_stop_ids, departure_after, window_end, service_date, day_midnight,
+        ))
+    trips.sort(key=lambda t: t['origin_departure_time'])
+    return trips
 
-    active_service_ids = data.active_service_ids(query_date)
+
+class ServiceDay(NamedTuple):
+    date: date
+    midnight: datetime  # GTFS times on this day's calendar count from here
+
+
+def _service_days(data: GTFSData, departure_after: datetime, window_end: datetime) -> list[ServiceDay]:
+    """Service days whose trips can depart in [departure_after, window_end].
+    GTFS times count from the service day's midnight, so besides the query
+    date this is:
+      - the previous day, while its 24:00+ trips can still reach
+        departure_after -- a 00:30 search must check yesterday's calendar for
+        its "24:30" trips, they're not on today's;
+      - the next day, when the window runs past midnight -- a 23:40 search's
+        window reaches tomorrow's 00:15 trips, which only tomorrow's calendar has.
+    """
+    query_date = departure_after.date()
+    today = datetime(query_date.year, query_date.month, query_date.day)
+    yesterday = today - timedelta(days=1)
+    tomorrow = today + timedelta(days=1)
+    days = [ServiceDay(query_date, today)]
+    max_seconds = data.max_departure_seconds
+    if max_seconds is None or (departure_after - yesterday).total_seconds() <= max_seconds:
+        days.insert(0, ServiceDay(yesterday.date(), yesterday))
+    if window_end >= tomorrow:
+        days.append(ServiceDay(tomorrow.date(), tomorrow))
+    return days
+
+
+def _find_trips_on_service_day(
+    data: GTFSData,
+    origin_stop_ids: list[str],
+    dest_stop_ids: list[str],
+    departure_after: datetime,
+    window_end: datetime,
+    service_date,
+    day_midnight: datetime,
+) -> list[dict]:
+    """_find_trips_core() for one service day's calendar and clock origin."""
+    active_service_ids = data.active_service_ids(service_date)
     trips_today = data.trips[data.trips['service_id'].isin(active_service_ids)]
     if trips_today.empty:
         return []
@@ -300,7 +347,7 @@ def _expand_route_frontier(
 _INDEX_UNRESOLVED = object()  # sentinel: the fast index has no data for this route/stop -- caller must fall back to the pandas path
 
 
-def _any_route_reaches_dest(data, from_stops, to_stops, query_date, search_departure_after, window_minutes):
+def _any_route_reaches_dest(data, from_stops, to_stops, search_departure_after, window_minutes):
     """Mirrors find_trips()'s own non-empty gate (any route, any trip, from
     any of from_stops to any of to_stops, sequence-ordered, within window, on
     an active service) -- NOT scoped to one route_id.
@@ -317,39 +364,66 @@ def _any_route_reaches_dest(data, from_stops, to_stops, query_date, search_depar
     happens to run a week later -- confirmed by differential testing against
     the old code on a real case (Southport -> Beenleigh, route VLBD-4999).
     """
-    active = data.active_service_ids(query_date)
-    day_midnight = datetime(query_date.year, query_date.month, query_date.day)
-    window_start = (search_departure_after - day_midnight).total_seconds()
-    window_end = window_start + window_minutes * 60
     to_stop_set = set(to_stops)
+    window_end_dt = search_departure_after + timedelta(minutes=window_minutes)
 
     routes_here = set()
     for sid in from_stops:
         routes_here |= data.stop_to_routes.get(sid, set())
+    indexed_routes = [
+        (data.route_stop_departures[route_id], data.route_trip_stops[route_id])
+        for route_id in routes_here
+        if data.route_stop_departures.get(route_id) and data.route_trip_stops.get(route_id)
+    ]
 
-    for route_id in routes_here:
-        stop_departures = data.route_stop_departures.get(route_id)
-        trip_stops = data.route_trip_stops.get(route_id)
-        if not stop_departures or not trip_stops:
-            continue
-        for sid in from_stops:
-            entries = stop_departures.get(sid)
-            if not entries:
-                continue
-            idx = bisect.bisect_left(entries, (window_start,))
-            for dep_sec, trip_id, seq, service_id in entries[idx:]:
-                if dep_sec > window_end:
-                    break
-                if service_id not in active:
-                    continue
-                trip_map = trip_stops.get(trip_id)
-                if not trip_map:
-                    continue
-                for dsid in to_stop_set:
-                    dest_entry = trip_map.get(dsid)
-                    if dest_entry and dest_entry[0] > seq:
-                        return True
+    for day in _service_days(data, search_departure_after, window_end_dt):
+        active = data.active_service_ids(day.date)
+        window_start = (search_departure_after - day.midnight).total_seconds()
+        window_end = (window_end_dt - day.midnight).total_seconds()
+        for stop_departures, trip_stops in indexed_routes:
+            for sid in from_stops:
+                hits = _reaching_departures(stop_departures, trip_stops, sid, to_stop_set, active,
+                                            window_start, window_end)
+                if next(hits, None) is not None:
+                    return True
     return False
+
+
+class LegHit(NamedTuple):
+    """One index-found departure that reaches a destination stop. Times are
+    seconds past its service day's midnight."""
+    dep_sec: int
+    trip_id: str
+    origin_stop_id: str
+    origin_seq: int
+    dest_stop_id: str
+    dest_seq: int
+    arr_sec: int
+
+
+def _reaching_departures(stop_departures, trip_stops, from_stop, to_stop_set, active, window_start, window_end):
+    """Yield, earliest first, each departure from `from_stop` within
+    [window_start, window_end] on an active service whose trip later visits
+    one of `to_stop_set`. Shared by _any_route_reaches_dest() and
+    _lookup_leg_trip() so the two can't drift apart.
+    """
+    entries = stop_departures.get(from_stop)
+    if not entries:
+        return
+    idx = bisect.bisect_left(entries, (window_start,))
+    for dep_sec, trip_id, seq, service_id in entries[idx:]:
+        if dep_sec > window_end:
+            return
+        if service_id not in active:
+            continue
+        trip_map = trip_stops.get(trip_id)
+        if not trip_map:
+            continue
+        for dsid in to_stop_set:
+            dest_entry = trip_map.get(dsid)
+            if dest_entry and dest_entry[0] > seq:
+                yield LegHit(dep_sec, trip_id, from_stop, seq, dsid, dest_entry[0], dest_entry[1])
+                break
 
 
 def _lookup_leg_trip(
@@ -385,37 +459,28 @@ def _lookup_leg_trip(
 
     to_stop_set = set(to_stops)
 
-    def _search(query_date, search_departure_after):
-        active = data.active_service_ids(query_date)
-        day_midnight = datetime(query_date.year, query_date.month, query_date.day)
-        window_start = (search_departure_after - day_midnight).total_seconds()
-        window_end = window_start + window_minutes * 60
-
-        best = None  # (dep_sec, trip_id, origin_stop_id, origin_seq, dest_stop_id, dest_seq, arr_sec)
-        for sid in from_stops:
-            entries = stop_departures.get(sid)
-            if not entries:
-                continue
-            idx = bisect.bisect_left(entries, (window_start,))
-            for dep_sec, trip_id, seq, service_id in entries[idx:]:
-                if dep_sec > window_end:
-                    break
-                if best is not None and dep_sec >= best[0]:
-                    break  # sorted ascending -- nothing further here can beat the current best
-                if service_id not in active:
-                    continue
-                trip_map = trip_stops.get(trip_id)
-                if not trip_map:
-                    continue
-                for dsid in to_stop_set:
-                    dest_entry = trip_map.get(dsid)
-                    if dest_entry and dest_entry[0] > seq:
-                        best = (dep_sec, trip_id, sid, seq, dsid, dest_entry[0], dest_entry[1])
-                        break
-        return best, day_midnight
+    def _search(search_departure_after):
+        """Earliest departure, by wall clock, across every service day that
+        reaches the window. Returns (LegHit, its service day's midnight)."""
+        search_window_end = search_departure_after + timedelta(minutes=window_minutes)
+        best, best_midnight = None, None
+        for day in _service_days(data, search_departure_after, search_window_end):
+            active = data.active_service_ids(day.date)
+            window_start = (search_departure_after - day.midnight).total_seconds()
+            window_end = (search_window_end - day.midnight).total_seconds()
+            for sid in from_stops:
+                # Each stop's hits come earliest first, so only the first can be the best.
+                hit = next(_reaching_departures(stop_departures, trip_stops, sid, to_stop_set, active,
+                                                window_start, window_end), None)
+                if hit is not None and (
+                    best is None
+                    or day.midnight + timedelta(seconds=hit.dep_sec) < best_midnight + timedelta(seconds=best.dep_sec)
+                ):
+                    best, best_midnight = hit, day.midnight
+        return best, best_midnight
 
     query_date = departure_after.date()
-    best, day_midnight = _search(query_date, departure_after)
+    best, day_midnight = _search(departure_after)
 
     fallback_schedule = False
     if best is None:
@@ -424,9 +489,9 @@ def _lookup_leg_trip(
             # Only attempt the day-shift if NO route at all serves this stop
             # pair in this window on this date -- matching find_trips()'s
             # real trigger condition exactly (see _any_route_reaches_dest).
-            if not _any_route_reaches_dest(data, from_stops, to_stops, query_date, departure_after, window_minutes):
+            if not _any_route_reaches_dest(data, from_stops, to_stops, departure_after, window_minutes):
                 fb_departure_after = departure_after + timedelta(days=7)
-                best, day_midnight = _search(fb_departure_after.date(), fb_departure_after)
+                best, day_midnight = _search(fb_departure_after)
                 fallback_schedule = best is not None
 
     if best is None:
@@ -515,7 +580,6 @@ def _resolve_chain(
             'board_stop_name': trip['origin_stop_name'],
             'alight_stop_name': trip['dest_stop_name'],
             'dest_stop_ids': to_stops,
-            'search_departure_after': next_departure_after,
         })
 
         next_departure_after = trip['dest_arrival_time'] + timedelta(minutes=min_connection)
@@ -532,7 +596,7 @@ def _resolve_chain(
     }
 
 
-def _direct_journey(trip: dict, dest_stop_ids: list[str], departure_after: datetime) -> dict:
+def _direct_journey(trip: dict, dest_stop_ids: list[str]) -> dict:
     """Wrap a single find_trips() result in the same journey shape find_multi_leg_trips() returns."""
     total_minutes = int((trip['dest_arrival_time'] - trip['origin_departure_time']).total_seconds() // 60)
     return {
@@ -541,7 +605,6 @@ def _direct_journey(trip: dict, dest_stop_ids: list[str], departure_after: datet
             'board_stop_name': trip['origin_stop_name'],
             'alight_stop_name': trip['dest_stop_name'],
             'dest_stop_ids': dest_stop_ids,
-            'search_departure_after': departure_after,
         }],
         'transfer_points': [],
         'total_minutes': total_minutes,
@@ -584,7 +647,7 @@ def find_multi_leg_trips(
     # Depth 0: direct trips on a route serving both origin and destination.
     if origin_routes & dest_routes:
         for trip in find_trips(origin_stop_ids, dest_stop_ids, departure_after, window_minutes):
-            journeys.append(_direct_journey(trip, dest_stop_ids, departure_after))
+            journeys.append(_direct_journey(trip, dest_stop_ids))
 
     if len(journeys) >= max_results:
         return sorted(journeys, key=lambda j: j['total_minutes'])[:max_results]
